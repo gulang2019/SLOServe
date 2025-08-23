@@ -1,0 +1,21 @@
+import argparse
+
+def add_dyserve_args(parser: argparse.ArgumentParser):
+    parser.add_argument('--model', type = str, required = True)
+    parser.add_argument('--program', type = str, required= True)
+    parser.add_argument('--dtype', type = str, choices = ['fp32', 'fp16', 'float16', 'float32'], default = 'fp16')
+    parser.add_argument('--backend', type = str, choices = ['vllm'], default = 'vllm')
+    parser.add_argument('--num_gpus', type = int, default = None)
+    parser.add_argument('--seed', type = int, default = 1)
+    parser.add_argument('--draft_model', type = str, default = None)
+    parser.add_argument('--draft_decode_length', type = int, default = 5)
+    parser.add_argument('--debug', action = 'store_true')
+    parser.add_argument('--profile', action = 'store_true')
+    parser.add_argument('--window_size', type = float, default = 0.01)
+    parser.add_argument('--enable_adaws', action = 'store_true')
+    parser.add_argument('--sch_budget', type = float, default = 10)
+    parser.add_argument('--spec_step', type = int, default = 0)
+    parser.add_argument('--batch_strategy', type = str, default = None)
+    parser.add_argument('--use_cuda_graph', action = 'store_true')
+    parser.add_argument('--cache_type', type = str, choices = ['linear', 'tree'], default = 'linear')
+    parser.add_argument('--block_size', type = int, default = 16)
