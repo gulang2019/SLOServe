@@ -151,7 +151,7 @@ class RequestInstance:
 
 @dataclass
 class ModelState:
-    model: ModelImpl 
+    model: ModelImpl
     req_states: Dict[int, RequestInstance] = field(default_factory=dict)
     n_blocks: int = 0
     

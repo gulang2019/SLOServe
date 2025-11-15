@@ -5,7 +5,6 @@
 #include <sstream>
 #include <tuple>
 #include <chrono>
-#include <assert.h>
 #include "promax_spec_sch.h"
 
 // Assuming the Request struct is already defined
@@ -21,12 +20,11 @@
 //     Request(int id, bool is_new_req, float ddl, int input_length, float profit, int mem, int tpot_idx)
 //         : id(id), is_new_req(is_new_req), ddl(ddl), input_length(input_length), profit(profit), mem(mem), tpot_idx(tpot_idx) {}
 // };
-
+const int repeat = 3;
 int main(int argc, char** argv) {
     const char* filename = "error.in";
     if (argc == 2)
         filename = argv[1];
-    std::cout << "file:" << filename << ":";
     std::ifstream infile(filename);
     if (!infile) {
         std::cerr << "Error opening file" << std::endl;
@@ -70,14 +68,16 @@ int main(int argc, char** argv) {
     // Read n_avail, current_time, and num_requests
     infile >> n_avail >> current_time >> num_requests;
 
+    int n_new_req = 0, n_old_req = 0;
     // Read each request
     for (int i = 0; i < num_requests; ++i) {
-        std::string id;
-        int input_length, mem, tpot_idx;
+        int id, input_length, mem, tpot_idx;
         bool is_new_req;
-        double ddl, profit;
+        float ddl, profit;
         infile >> id >> is_new_req >> ddl >> input_length >> profit >> mem >> tpot_idx;
         requests.emplace_back(id, is_new_req, ddl, input_length, profit, mem, tpot_idx);
+        n_new_req += is_new_req;
+        n_old_req += 1 - is_new_req;
     }
 
     // Close the file
@@ -104,43 +104,37 @@ int main(int argc, char** argv) {
     //               << " " << req.tpot_idx << "\n";
     // }
 
-    PromaxScheduler scheduler(false);
-
-    // scheduler.set_sd_planner(tpots, 
-    //     hardware_params, 
-    //     false, 
-    //     spec_decode_alpha, 
-    //     max_spec_decode_size,
-    //     false);
-    
-    scheduler.set_ar_planner(
-        tpots, 
+    AdmCtrlScheduler scheduler;
+    scheduler.set_sd_planner(tpots, 
         hardware_params, 
-        false
-    );
-
-    // assert(false);
+        false,
+        spec_decode_alpha, 
+        max_spec_decode_size,
+        false);
 
     bool feasible;
-    std::vector<std::string> acc_ids;
+    std::vector<int> acc_ids;
     std::vector<Batch> accepted_batches;
     std::tie(feasible, acc_ids, accepted_batches) = scheduler.schedule(requests, n_avail, current_time, false);
-    std::cout << "feasible: " << feasible  << std::endl;
-    // for (auto& batch: accepted_batches) {
-    //     std::cout << batch << std::endl;
-    // }
+    // std::cout << "feasible: " << feasible  << std::endl;
     // std::cout << "acc: ";
     // for (auto id: acc_ids) {
     //     std::cout << id << ",";
     // }
-    // std::cout << std::endl;
+    std::cout << std::endl;
 
-    // auto start = std::chrono::high_resolution_clock::now();
-    // std::tie(feasible, acc_ids, accepted_batches) = scheduler.schedule(requests, n_avail, current_time, false);
-    // auto end = std::chrono::high_resolution_clock::now();
-    // std::chrono::duration<double> duration = end - start;
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    for (int i = 0; i < repeat; i++){
+        std::tie(feasible, acc_ids, accepted_batches) = scheduler.schedule(requests, n_avail, current_time, false);
+    }
 
-    // std::cout << duration.count() << std::endl;
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    std::chrono::duration<double> duration = (end - start);
+
+    std::cout << n_old_req << "," << n_new_req << "," << duration.count() / repeat;
+    // std::cout << "finish in " << duration.count() << "seconds" << std::endl;
 
     return 0;
 }

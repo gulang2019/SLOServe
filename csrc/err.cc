@@ -1,7 +1,6 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <string>
 #include <sstream>
 #include <tuple>
 #include <chrono>
@@ -65,7 +64,7 @@ int main(int argc, char** argv) {
     hardware_params = parse_vector(line);
 
     // Read spec_decode_alpha and max_spec_decode_size
-    infile >> spec_decode_alpha >> max_spec_decode_size;
+    // infile >> spec_decode_alpha >> max_spec_decode_size;
 
     // Read n_avail, current_time, and num_requests
     infile >> n_avail >> current_time >> num_requests;
@@ -84,27 +83,27 @@ int main(int argc, char** argv) {
     infile.close();
 
     // Debug output
-    // std::cout << "Tpots: ";
-    // for (double t : tpots) {
-    //     std::cout << t << " ";
-    // }
-    // std::cout << "\nHardware Params: ";
-    // for (double h : hardware_params) {
-    //     std::cout << h << " ";
-    // }
-    // std::cout << "\nSpec Decode Alpha: " << spec_decode_alpha
-    //           << "\nMax Spec Decode Size: " << max_spec_decode_size
-    //           << "\nAvailable Memory: " << n_avail
-    //           << "\nCurrent Time: " << current_time
-    //           << "\nRequests:\n";
+    std::cout << "Tpots: ";
+    for (double t : tpots) {
+        std::cout << t << " ";
+    }
+    std::cout << "\nHardware Params: ";
+    for (double h : hardware_params) {
+        std::cout << h << " ";
+    }
+    std::cout << "\nSpec Decode Alpha: " << spec_decode_alpha
+              << "\nMax Spec Decode Size: " << max_spec_decode_size
+              << "\nAvailable Memory: " << n_avail
+              << "\nCurrent Time: " << current_time
+              << "\nRequests:\n";
 
-    // for (const auto& req : requests) {
-    //     std::cout << req.id << " " << req.is_new_req << " " << req.ddl << " "
-    //               << req.input_length << " " << req.profit << " " << req.mem
-    //               << " " << req.tpot_idx << "\n";
-    // }
+    for (const auto& req : requests) {
+        std::cout << req.id << " " << req.is_new_req << " " << req.ddl << " "
+                  << req.input_length << " " << req.profit << " " << req.mem
+                  << " " << req.tpot_idx << "\n";
+    }
 
-    PromaxScheduler scheduler(false);
+    AdmCtrlScheduler scheduler("edf", false);
 
     // scheduler.set_sd_planner(tpots, 
     //     hardware_params, 
@@ -124,7 +123,7 @@ int main(int argc, char** argv) {
     bool feasible;
     std::vector<std::string> acc_ids;
     std::vector<Batch> accepted_batches;
-    std::tie(feasible, acc_ids, accepted_batches) = scheduler.schedule(requests, n_avail, current_time, false);
+    std::tie(feasible, acc_ids, accepted_batches) = scheduler.schedule(requests, n_avail, current_time, true);
     std::cout << "feasible: " << feasible  << std::endl;
     // for (auto& batch: accepted_batches) {
     //     std::cout << batch << std::endl;

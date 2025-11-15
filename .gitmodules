@@ -1,0 +1,24 @@
+[submodule "3rdparty/vllm"]
+	path = 3rdparty/vllm
+	url = git@github.com:vllm-project/vllm.git
+[submodule "3rdpartys/sglang"]
+	path = 3rdpartys/sglang
+	url = https://github.com/sgl-project/sglang.git
+[submodule "3rdpartys/DistServe"]
+	path = 3rdpartys/DistServe
+	url = https://github.com/LLMServe/DistServe.git
+[submodule "3rdpartys/TensorRT-LLM"]
+	path = 3rdpartys/TensorRT-LLM
+	url = https://github.com/NVIDIA/TensorRT-LLM.git
+[submodule "3rdpartys/Mooncake"]
+	path = 3rdpartys/Mooncake
+	url = https://github.com/kvcache-ai/Mooncake.git
+[submodule "3rdpartys/splitwise"]
+	path = 3rdpartys/splitwise
+	url = https://github.com/mutinifni/splitwise-sim.git
+[submodule "3rdpartys/qlm"]
+	path = 3rdpartys/qlm
+	url = https://github.com/QLM-project/QLM.git
+[submodule "3rdparty/ai-dynamo"]
+	path = 3rdparty/ai-dynamo
+	url = https://github.com/ai-dynamo/dynamo.git

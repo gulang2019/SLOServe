@@ -4,11 +4,12 @@
 #include <vector> 
 #include <iostream>
 #include <memory>
+#include <string>
 
 #define MAX_BS 16384
 
 struct Request{
-    int id; 
+    std::string id; 
     bool is_new_req; 
     double ddl;
     int input_length;
@@ -16,7 +17,7 @@ struct Request{
     int mem;
     int tpot_idx;
     
-    Request(int id, 
+    Request(std::string id, 
     bool is_new_req, 
     double ddl, 
     int input_length, 
@@ -33,11 +34,11 @@ struct Request{
 };
 
 struct ReqBatch {
-    int id; 
+    std::string id;     
     bool is_prefill;
     int n;
     ReqBatch(
-        int id, bool is_prefill, int n
+        std::string id, bool is_prefill, int n
     ): id(id), is_prefill(is_prefill), n(n) {}
 };
 
@@ -45,6 +46,23 @@ struct Batch {
     std::vector<ReqBatch> req_batches;
     int prefill_bs;
     int next = 1;
+
+    int batch_size() const {
+        int n = 0;
+        for (auto& req_batch: req_batches) {
+            n += req_batch.n;
+        }
+        return n;
+    }
+    
+    int max_decode_size() const {
+        int max_decode_size = 0;
+        for (auto& req_batch: req_batches) {
+            if (req_batch.is_prefill) continue;
+            max_decode_size = std::max(max_decode_size, req_batch.n);
+        }
+        return max_decode_size;
+    }
 };
 
 // struct Batch {
@@ -103,7 +121,7 @@ public:
     //     const std::vector<Request>& reqs
     // );
     size_t n_tiers() const {return tpots.size();}
-    friend class PromaxScheduler;
+    friend class AdmCtrlScheduler;
 };
 
 class SDBatchPlanner: public BatchPlanner{
@@ -150,7 +168,9 @@ public:
     ) override;
 };
 
-class PromaxScheduler {
+class AdmCtrlScheduler {
+protected:
+    std::string mode;
     bool continuous = false;
     bool _verbose;
 
@@ -158,25 +178,48 @@ class PromaxScheduler {
 
     void _batch_impl(
         const std::vector<Request>& reqs,
-        const std::vector<bool>& is_accepted, 
+        const std::vector<bool>& is_accepted,
         std::vector<Batch>& batches
     );
 
+    bool _check_slo_violation(
+        const std::vector<Request>& reqs,
+        const std::vector<bool>& is_accepted,
+        const std::vector<Batch>& batches,
+        double current_time
+    );
+
+
     std::tuple<bool, std::vector<bool>, 
-        std::vector<Batch> > _admission_control(
+        std::vector<Batch> > _admission_control_fcfs(
+        std::vector<Request>& reqs,
+        const int M,
+        double current_time
+    );
+
+    std::tuple<bool, std::vector<bool>, 
+        std::vector<Batch> > _admission_control_dp(
+        std::vector<Request>& reqs,
+        const int M,
+        double current_time
+    );
+
+    std::tuple<bool, std::vector<bool>, 
+        std::vector<Batch> > _admission_control_edf(
         std::vector<Request>& reqs,
         const int M,
         double current_time
     );
 
 public: 
-    PromaxScheduler() = default;
+    AdmCtrlScheduler(): mode("fcfs"), continuous(false) {}
     
-    PromaxScheduler(
-        bool continuous
-    ): continuous(continuous) {}
+    AdmCtrlScheduler(
+        std::string mode,
+        bool continuous = false
+    ): mode(mode), continuous(continuous) {}
 
-    PromaxScheduler& set_ar_planner(
+    AdmCtrlScheduler& set_ar_planner(
         std::vector<double>& tpots,
         std::vector<double>& hardware_params,
         bool fixed_bs
@@ -187,7 +230,7 @@ public:
         return *this;
     }
 
-    PromaxScheduler& set_sd_planner(
+    AdmCtrlScheduler& set_sd_planner(
         std::vector<double>& tpots,
         std::vector<double>& hardware_params,
         bool fixed_bs,
