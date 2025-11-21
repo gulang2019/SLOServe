@@ -5,7 +5,7 @@
 #include <tuple>
 #include <chrono>
 #include <assert.h>
-#include "promax_spec_sch.h"
+#include "adm_ctrl.h"
 
 // Assuming the Request struct is already defined
 // struct Request {
@@ -67,16 +67,25 @@ int main(int argc, char** argv) {
     // infile >> spec_decode_alpha >> max_spec_decode_size;
 
     // Read n_avail, current_time, and num_requests
-    infile >> n_avail >> current_time >> num_requests;
+    std::string mode;
+    infile >> n_avail >> current_time >> num_requests >> mode;
 
     // Read each request
     for (int i = 0; i < num_requests; ++i) {
-        std::string id;
-        int input_length, mem, tpot_idx;
-        bool is_new_req;
-        double ddl, profit;
-        infile >> id >> is_new_req >> ddl >> input_length >> profit >> mem >> tpot_idx;
-        requests.emplace_back(id, is_new_req, ddl, input_length, profit, mem, tpot_idx);
+        Request req;
+        infile >> req.id \
+            >> req.is_new_req \
+            >> req.ddl \ 
+            >> req.input_length \
+            >> req.n_computed_tokens \
+            >> req.profit \
+            >> req.mem \
+            >> req.tpot_idx \
+            >> req.prefill_mem \
+            >> req.prefill_device_id \
+            >> req.decode_device_id \
+            >> req.prefill_only;
+        requests.push_back(req);
     }
 
     // Close the file
@@ -95,6 +104,7 @@ int main(int argc, char** argv) {
               << "\nMax Spec Decode Size: " << max_spec_decode_size
               << "\nAvailable Memory: " << n_avail
               << "\nCurrent Time: " << current_time
+              << "\nMode: " << mode
               << "\nRequests:\n";
 
     for (const auto& req : requests) {
@@ -103,7 +113,7 @@ int main(int argc, char** argv) {
                   << " " << req.tpot_idx << "\n";
     }
 
-    AdmCtrlScheduler scheduler("edf", false);
+    AdmCtrlScheduler scheduler(mode, false);
 
     // scheduler.set_sd_planner(tpots, 
     //     hardware_params, 

@@ -35,54 +35,62 @@ BatchPlanner::BatchPlanner(
     const char* name, 
     const std::vector<double>& tpots,
     const std::vector<double>& hardware_params,
-    bool fixed_bs, bool continuous
-): name(name), hardware_params(hardware_params), tpots(tpots), continuous(continuous) {
-    assert(hardware_params.size() % 3 == 0);
-    for (size_t i = 0; i < tpots.size()-1; ++i) 
-        assert(tpots[i] <= tpots[i+1]);
-    max_bs = fixed_bs? time_to_batch(tpots[0]):MAX_BS;
-}
-
-double BatchPlanner::batch_to_time(int n, size_t decode_steps) {
-    assert(n >= 0);
-    double t = 0;
-    for (int i = 0; i < hardware_params.size(); i += 3){
+    bool fixed_bs, size_t max_bs, bool continuous
+): name(name), hardware_params(hardware_params), tpots(tpots), max_bs(max_bs), fixed_bs(fixed_bs), continuous(continuous) {
+    assert(hardware_params.size() % 5 == 0);
+    std::cout << "BatchPlanner name: " << name << std::endl;
+    std::cout << "T = max(" << std::endl;
+    for (size_t i = 0, profile = 0; i + 4 < hardware_params.size(); i += 5, ++profile) {
         double k1 = hardware_params[i];
         double k2 = hardware_params[i+1];
-        double b = hardware_params[i+2];
-        t = std::max(k1 * n + k2 * decode_steps + b, t);
+        double k3 = hardware_params[i+2];
+        double k4 = hardware_params[i+3];
+        double b  = hardware_params[i+4];
+        std::cout << k1 << " * n_tokens"
+                  << " + " << k2 << " * n_reqs"
+                  << " + " << k3 << " * n_past_tokens"
+                  << " + " << k4 << " * decode_steps"
+                  << " + " << b << ","
+                  << std::endl;
+    }
+    std::cout << ")" << std::endl;
+    for (size_t i = 0; i < tpots.size()-1; ++i) 
+    assert(tpots[i] <= tpots[i+1]);
+    max_bs = fixed_bs? time_to_batch(tpots[0]):max_bs;
+    std::cout << "max BS: " << max_bs << std::endl;
+    std::cout << "fixed BS: " << fixed_bs << std::endl;
+    std::cout << "continuous: " << continuous << std::endl;
+}
+
+double BatchPlanner::batch_to_time(int n_tokens, size_t n_reqs, size_t n_past_tokens, size_t decode_steps) {
+    assert(n_tokens >= 0);
+    double t = 0;
+    for (int i = 0; i < hardware_params.size(); i += 5){
+        double k1 = hardware_params[i];
+        double k2 = hardware_params[i+1];
+        double k3 = hardware_params[i+2];
+        double k4 = hardware_params[i+3];
+        double b = hardware_params[i+4];
+        t = std::max(k1 * n_tokens + k2 * n_reqs + k3 * n_past_tokens + k4 * decode_steps + b, t);
     }
     return t;
 }
 
-int BatchPlanner::time_to_batch(double t, size_t decode_steps) {
-    if (batch_to_time(0, decode_steps) > t) return 0;
+int BatchPlanner::time_to_batch(double t, size_t n_reqs, size_t n_past_tokens, size_t decode_steps) {
+    if (batch_to_time(0, n_reqs, n_past_tokens, decode_steps) > t) return 0;
     double bs = 16384;
-    for (int i = 0; i < hardware_params.size(); i += 3){
+    for (int i = 0; i < hardware_params.size(); i += 5){
         double k1 = hardware_params[i];
         double k2 = hardware_params[i+1];
-        double b = hardware_params[i+2];
-        bs = std::min((t - b - k2 * decode_steps) / k1, bs);
+        double k3 = hardware_params[i+2];
+        double k4 = hardware_params[i+3];
+        double b = hardware_params[i+4];
+        bs = std::min((t - b - k2 * n_reqs - k3 * n_past_tokens - k4 * decode_steps) / k1, bs);
     }
     // std::cout << "time2batch, t:" << t << ", decode_steps:" << decode_steps << std::endl;
     assert(bs > 0);
     return int(bs);
 }
-
-// std::vector<Batch> BatchPlanner::plan_decode_only(
-//     const std::vector<Request>& reqs
-// ) {
-//     int max_prefill_tokens;
-//     double elasped_time;
-//     std::vector<Batch> batches;
-//     std::tie(max_prefill_tokens, elasped_time, batches) = plan(
-//         INFINITE_TIME, reqs
-//     );
-//     assert(max_prefill_tokens >= 0);
-//     assert(batches.size());
-//     batches.back().next = -batches.size() + 1;
-//     return batches; 
-// }
 
 std::tuple<int, double, std::vector<Batch> > 
     SDBatchPlanner::plan(
@@ -213,54 +221,39 @@ struct ReqDDLCMP{
 std::tuple<int, double, std::vector<Batch> > 
     ARBatchPlanner::plan(
     double t,
-    const std::vector<Request>& reqs,
+    const std::vector<Request>& reqs, // requests doing decode
     bool decode_only,
     double finish_time
 ) {
-    // if (decode_only) {
-    //     std::cout << "Here!" << std::endl;
-    // }
     // 1. find the request with the tighest tpot;
+    // std::cout << "ARBatchPlanner::plan, t: " << t << ", reqs: " << reqs.size() << ", decode_only: " << decode_only << ", finish_time: " << finish_time << std::endl;
+    // std::cout << "max BS: " << max_bs << std::endl;
+    // std::cout << "fixed BS: " << fixed_bs << std::endl;
+    // std::cout << "continuous: " << continuous << std::endl;
+    // std::cout << "ARBatchPlanner::plan" << std::endl;
+
     if (not reqs.size()){
-        Batch batch;
-        batch.prefill_bs = time_to_batch(t);
-        if (batch.prefill_bs) 
-            return {batch.prefill_bs, batch_to_time(batch.prefill_bs), {batch}};
-        return {0, 0., {}};
+        auto bs = time_to_batch(t);
+        bs = std::min(bs, max_bs);
+        if (!bs) return {0, 0., {}};
+        auto batch_time = batch_to_time(bs);
+        size_t n_batch = std::floor(t / batch_time);
+        std::vector<Batch> batches;
+        for (size_t i = 0; i < n_batch; i++) {
+            Batch batch;
+            batch.prefill_bs = bs;
+            batches.push_back(batch);
+        }
+        return {bs * n_batch, batch_time * n_batch, batches};
     }
 
-    // int lowest_tpot_idx = tpots.size();
-    // for (auto& req: reqs) 
-    // lowest_tpot_idx = std::min(lowest_tpot_idx, req.tpot_idx);
-    // double tightest_tpot = 100;
-    // for (auto& req: reqs)
-    //     tightest_tpot = std::min(tightest_tpot, tpots[req.tpot_idx]);
-    // double overhead = batch_to_time(1);
+    size_t n_decode_steps = 1;
+    size_t n_reqs = reqs.size();
+    size_t n_past_tokens = 0;
+    for (auto& req: reqs) 
+        n_past_tokens += std::max(req.n_computed_tokens, req.input_length);
 
-    // int min_tokens_required = 0;
-    // for (auto& req: reqs) {
-    //     min_tokens_required += (int)std::floor(t / tpots[req.tpot_idx]);
-    // }
-    // int n_batches = 0;
-    // int max_tokens = 0;
-    // for (int cur_n_batches = std::max((int)std::floor(t / tightest_tpot), 1); 
-    //         cur_n_batches <= std::floor(t / overhead); cur_n_batches ++) {
-    //     double per_batch_time = std::min(t / cur_n_batches, tightest_tpot);
-    //     auto n_tokens = time_to_batch(per_batch_time) * cur_n_batches;
-    //     if (n_tokens >= std::max(min_tokens_required, max_tokens)) {
-    //         n_batches = cur_n_batches;
-    //         max_tokens = n_tokens;
-    //     }
-    // }
-
-    // if (n_batches == 0) {
-    //     return {0, 0., {}};
-    // }
-
-    // size_t n_batches = int(std::floor(t / tpots[lowest_tpot_idx]));
-    // std::cout << "plan t:" << t << ", lowest_tpot_idx:" << lowest_tpot_idx << ",reqs:";
-    // for (auto& req: reqs) std::cout << req.id << ",";
-    // std::cout << "#batch:" << n_batches << std::endl;
+    
     std::priority_queue<ReqDDL, std::vector<ReqDDL>, ReqDDLCMP> req_ddls; 
     for (auto& req: reqs) 
         req_ddls.push(ReqDDL(req.id, tpots[req.tpot_idx], std::max(req.ddl - finish_time, 0.0) + tpots[req.tpot_idx]));
@@ -274,9 +267,10 @@ std::tuple<int, double, std::vector<Batch> >
     
     std::vector<Batch> batches;
     while (ddl <= t) {
-        int bs = time_to_batch(std::min(t, req_ddls.top().ddl) - ddl);
+        int bs = time_to_batch(std::min(t, req_ddls.top().ddl) - ddl, n_reqs, n_past_tokens, n_decode_steps);
+        bs = std::min(bs, max_bs);
         if (!bs) break;
-        double batch_time = batch_to_time(bs);
+        double batch_time = batch_to_time(bs, n_reqs, n_past_tokens, n_decode_steps);
         ddl += batch_time;
         elasped_time = ddl;
         batches.push_back({});
@@ -307,31 +301,6 @@ std::tuple<int, double, std::vector<Batch> >
         for (auto& req_ddl: new_req_ddls) 
             req_ddls.push(req_ddl);
     }
-
-    // double per_batch_time = std::min(t / n_batches, tightest_tpot);
-    // int bs = time_to_batch(per_batch_time);
-    // per_batch_time = batch_to_time(bs);
-    // assert(bs > 0);
-    // int max_prefill_tokens = bs * n_batches;
-    // std::vector<Batch> batches(n_batches);
-    // double elasped_time = n_batches;
-    // for (auto& b: batches) b.prefill_bs = bs;
-    // double cur_time = per_batch_time;
-    // for (auto& b: batches) {
-    //     // cur_time <= req_ddls.top().ddl
-    //     while (b.prefill_bs and 
-    //         req_ddls.top().ddl < cur_time) {
-    //         auto req_ddl = req_ddls.top();
-    //         req_ddls.pop();
-    //         b.req_batches.push_back(ReqBatch(req_ddl.id, false, 1));
-    //         b.prefill_bs --;
-    //         max_prefill_tokens --;
-    //         req_ddl.ddl += req_ddl.tpot;
-    //         req_ddls.push(req_ddl);
-    //         assert(req_ddl.ddl >= cur_time);
-    //     }
-    //     cur_time += per_batch_time;
-    // }
 
     if (decode_only) {
         std::unordered_map<std::string, int> rid2id;
@@ -636,8 +605,8 @@ std::tuple<bool, std::vector<bool>,
                     timer("decode");
 
                     // the decode cannot be served;
-                    if (std::get<1>(planner->plan(INFINITE_TIME, acc_reqs)) == 0.) 
-                        continue;                     
+                    // if (std::get<1>(planner->plan(INFINITE_TIME, acc_reqs)) == 0.) 
+                    //     continue;                     
 
                     states.push_back(s);
                     timer("finish inner");
@@ -714,7 +683,7 @@ bool AdmCtrlScheduler::_check_slo_violation(
 
     double t = current_time;
     for (auto& batch: batches) {
-        t += planner->batch_to_time(batch.batch_size(), batch.max_decode_size());
+        t += batch.estimated_time;
         for (auto& req_batch: batch.req_batches) {
             assert(request_info_map.count(req_batch.id));
             request_info_map[req_batch.id].scheduled_tokens.push_back({t, req_batch.n});
@@ -861,6 +830,7 @@ std::tuple<bool, std::vector<std::string>, std::vector<Batch> > AdmCtrlScheduler
         for (double h : planner->hardware_params) {
             std::cout << h << " ";
         }
+        std::cout << "fixed_bs: " << planner->fixed_bs << std::endl;
         std::cout << "max_bs: " << planner->max_bs << std::endl;
         std::cout << "\nAvailable Memory: " << M
                 << "\nCurrent Time: " << current_time
@@ -905,6 +875,7 @@ std::tuple<bool, std::vector<std::string>, std::vector<Batch> > AdmCtrlScheduler
     timer("admission_control");
 
     if (not is_feasible) {
+       
         std::vector<Request> reqs_new;
         std::vector<int> old_req_ids;
         is_accepted.clear();
@@ -952,6 +923,20 @@ std::tuple<bool, std::vector<std::string>, std::vector<Batch> > AdmCtrlScheduler
 
     if (!continuous)
         _batch_impl(reqs, is_accepted, batches);
+
+
+    std::unordered_map<std::string, int> n_past_tokens_map;
+    for (auto& req: reqs) {
+        n_past_tokens_map[req.id] = req.n_computed_tokens;
+    }
+    for (auto& batch: batches) {
+        int n_past_tokens = 0;
+        for (auto& req_batch: batch.req_batches) {
+            n_past_tokens += n_past_tokens_map[req_batch.id];
+        }
+        batch.estimated_time = planner->batch_to_time(batch.batch_size(), batch.req_batches.size(), n_past_tokens, batch.max_decode_size());
+    }
+
 
     if (_verbose) {
         std::cout << "schedules" << std::endl;
@@ -1063,6 +1048,9 @@ std::tuple<bool, std::vector<bool>,
         else {
             is_accepted.push_back(true);
             acc_req_fn(state, req, state);
+            if (not is_valid_fn(state)) {
+                break;
+            }
         }
     }
 
