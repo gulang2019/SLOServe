@@ -228,9 +228,9 @@ def get_energy_events(csv_path: str) -> List[Dict[str, Any]]:
                 "event_type": "energy",
                 "device_id": device_id,
                 "timestamp": float(row["ts"]),
-                "energy": float(row[j_col]),
-                "power": float(row[w_col]),
-                "mhz": float(row[mhz_col]),
+                "energy": float(row.get(j_col, 0)),
+                "power": float(row.get(w_col, 0)),
+                "mhz": float(row.get(mhz_col, 0)),
             })
     return energy_events
 
@@ -726,7 +726,7 @@ def build_problems(
         routing_policy = 'lightest_first'
         routing_kwargss = [{"enable_rerouting": False,
                             "enable_rescheduling": True}]
-    elif 'auto_scaling_resch' in routing_policy:
+    elif 'disagg_auto_scaling' in routing_policy:
         _args = routing_policy.split('-')
         if len(_args) == 2:
             _, feature = _args
@@ -734,11 +734,12 @@ def build_problems(
         elif len(_args) == 3:
             _, feature, threshold = _args
             threshold = float(threshold)
-        routing_kwargss = [{"enable_rescheduling": True,
-                            "enable_rerouting": False,
+        routing_kwargss = [{"enable_rescheduling": 'resch' in routing_policy,
+                            "enable_rerouting": True,
                             "model_path": "auto_scaling_model.json",
                             "model_key": feature,
-                            "threshold": threshold}]
+                            "threshold": threshold,
+                            "max_decode_batch_size": max_decode_batch_size}]
     elif 'auto_scaling' in routing_policy:
         _args = routing_policy.split('-')
         if len(_args) == 2:
@@ -747,7 +748,7 @@ def build_problems(
         elif len(_args) == 3:
             _, feature, threshold = _args
             threshold = float(threshold)
-        routing_kwargss = [{"enable_rescheduling": False,
+        routing_kwargss = [{"enable_rescheduling": 'resch' in routing_policy,
                             "enable_rerouting": False,
                             "model_path": "auto_scaling_model.json",
                             "model_key": feature,
@@ -831,8 +832,12 @@ def run(
     overwrite: bool,
     slo_routing_overhead: float,
     admission_mode: str,
-    scheduling_overhead: float
+    scheduling_overhead: float,
+    output_dir: str,
 ):
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+    
     model_name_easy = get_easy_name(model_name)
     global experiment_dir
     if 'bursty' in trace:
@@ -843,7 +848,7 @@ def run(
     else:
         _trace_name = trace
         burstiness_level = 0.0
-    experiment_dir = f"experiments/{model_name_easy}_{profit}_{_trace_name}_{window}_{admission_mode}_{burstiness_level}"
+    experiment_dir = f"{output_dir}/{model_name_easy}_{profit}_{_trace_name}_{window}_{admission_mode}_{burstiness_level}"
     import os
     os.makedirs(experiment_dir, exist_ok=True)
     
@@ -913,7 +918,7 @@ def run(
                 rec.stop()
             
             per_gpu, total = energy_meter.read()
-            if clients and int(clients.split(',')[0]) < 10:
+            if clients and (int(clients.split(',')[0]) < 10) and len(per_gpu) == problem.n_devices:
                 gpu_ids = [int(_) for _ in clients.split(',')][:problem.n_devices]
                 per_gpu = [per_gpu[i] for i in gpu_ids]
                 total = sum(per_gpu)
@@ -1035,23 +1040,24 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-7B-Instruct')
-    parser.add_argument('--ttft_slo_scales', type=float, default=[2.0], nargs='+')
-    parser.add_argument('--slo_tpots', type=float, default=[2.0], nargs='+')
+    parser.add_argument('--ttft_slo_scales', type=float, default=[2.0], nargs='+', help = 'list of relative ttft slo (defined as slowdown to zero-load ttft)')
+    parser.add_argument('--slo_tpots', type=float, default=[2.0], nargs='+', help = 'list of relative tpot slo (defined as absolute tpot per token in seconds)')
     parser.add_argument('--profit', type=str, default='constant', choices=['constant', 'weighted'])
-    parser.add_argument('--trace', type=str, nargs = '+', default=['azure_code_23'])
-    parser.add_argument('--window', type=str, default='0:1000')
-    parser.add_argument('--n_devices', type=int, default=[1,2,4,8], nargs='+')
-    parser.add_argument('--load_scales', type=float, default=[0.5,1.0,2.0,3.0,4.0], nargs='+')
-    parser.add_argument('--router_ports', type=str, default='8001:4')
-    parser.add_argument('--clients', type=str, default=None)
+    parser.add_argument('--trace', type=str, nargs = '+', default=['azure_code_23'], help = 'list of traces to run LENGTH:ARRIVAL [ARRIVAL:LENGTH ...]')
+    parser.add_argument('--window', type=str, default='0:1000', help = 'window of trace to run (inclusive)')
+    parser.add_argument('--n_devices', type=int, default=[1,2,4,8], nargs='+', help = 'list of number of devices to run')
+    parser.add_argument('--load_scales', type=float, default=[0.5,1.0,2.0,3.0,4.0], nargs='+', help = 'list of load scales (we rescale the arrival rate by load scale, higher load scale means higher query per second)')
+    parser.add_argument('--router_ports', type=str, default='8001:4', help = 'port of router to run (inclusive)')
+    parser.add_argument('--clients', type=str, default=None, help = 'clients to run (inclusive)')
     parser.add_argument('--run_all', action = 'store_true')
     # parser.add_argument('--scheduling_policies', type=str, default=SCHEDULING_POLICIES, nargs='+')
     # parser.add_argument('--routing_policies', type=str, default=ROUTING_POLICIES, nargs='+')
     parser.add_argument('--overwrite', action = 'store_true')
     parser.add_argument('--slo_routing_overhead', type=float, default=0.02)
-    parser.add_argument('--admission_mode', type=str, default='arrival', choices=['arrival', 'anytime'])
-    parser.add_argument('--policies', type=str, default=[':'.join([a,b]) for a, b in product(ROUTING_POLICIES, SCHEDULING_POLICIES)], nargs='+')
-    parser.add_argument('--scheduling_overhead', type=float, default=0.003)
+    parser.add_argument('--admission_mode', type=str, default='arrival', choices=['arrival', 'anytime'], help = 'arrival: instant decision at arrival, anytime: admission can be made anytime.')
+    parser.add_argument('--policies', type=str, default=[':'.join([a,b]) for a, b in product(ROUTING_POLICIES, SCHEDULING_POLICIES)], nargs='+', help = 'list of policies to run (routing_policy:scheduling_policy [routing_policy:scheduling_policy ...])')
+    parser.add_argument('--scheduling_overhead', type=float, default=0.003, help = 'scheduling overhead per token in seconds')
+    parser.add_argument('--output_dir', type=str, default='experiments', help = 'output directory')
     args = parser.parse_args()
     
     if not args.run_all:
@@ -1083,6 +1089,7 @@ if __name__ == '__main__':
                 slo_routing_overhead = args.slo_routing_overhead,
                 admission_mode = args.admission_mode,
                 scheduling_overhead = args.scheduling_overhead,
+                output_dir = args.output_dir,
             )
         exit(0)
     

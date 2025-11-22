@@ -41,6 +41,7 @@ class Event:
 class Energy(Event):
     energy: float
     power: float
+    mhz: float
     
 @dataclass(kw_only=True)
 class EngineStep(Event):
@@ -64,7 +65,9 @@ class Batch(Event):
     num_scheduled_tokens: Dict[str, int]
     elapsed: float
     scheduling_overhead: float
+    between_batch_time: float
     estimated_time: float = 0
+    output_processing_elapsed: float
     
     
     @property
@@ -1551,8 +1554,8 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
         'extra_metrics': {
                 'average_effective_tokens_ratio': float(calc_num_effective_tokens(all_events, reqs, window_size = 1.0)),
                 'average_n_active_servers': float(calc_n_active_servers(all_events, window_size = 1.0)),
-                'max_num_reqs': float(np.max(num_reqs_series)),
-                'max_num_reqs_under_slo': float(np.max(num_reqs_series - num_violations)),
+                # 'max_num_reqs': float(np.max(num_reqs_series)),
+                # 'max_num_reqs_under_slo': float(np.max(num_reqs_series - num_violations)),
                 'rejection_rate': rejection_rate,
             }
         
@@ -2720,8 +2723,17 @@ def analyze_energy_consumption():
 
 
 if __name__ == '__main__':
-    analyze_energy_consumption()
+    event_file = 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_chat_23_3978:4579_anytime_0.0/slosserve-edf_auto_scaling_resch-all_mock-0.12_1.0_4_anytime_3.0_0.025.events.jsonl'
+    events, reqs = analyze_events(event_file)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    calc_n_active_servers(events, ax = ax, label = "Active Servers", color = "tab:blue")
+    fig.savefig('active_servers_by_time.png', dpi=300, bbox_inches='tight')
+    # fig.savefig('active_servers_by_time.pdf', dpi=300, bbox_inches='tight')
+    print('Saved active_servers_by_time.png')
+    # print('Saved active_servers_by_time.pdf')
     exit(0)
+    # analyze_energy_consumption()
+    # exit(0)
     # analyze_high_load_delay()
     # draw_bs_comparison()
     # exit(0)

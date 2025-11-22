@@ -24,11 +24,7 @@ except ImportError:
 
 # NEW: Ray
 import ray
-
-from vllm.v1.engine.async_llm import AsyncLLM
-from vllm.sampling_params import SamplingParams
-from vllm.outputs import RequestOutput
-from vllm.inputs import TokensPrompt
+from asyncio import Queue
 
 from motivation.bench_api_server import Problem
 from motivation.common import PerfModel
@@ -45,33 +41,38 @@ routing_loop_task: asyncio.Task | None = None
 # =========================
 # Ray Actor: one replica/process
 # =========================
-@ray.remote(num_gpus=1)
+@ray.remote
 class EngineWorker:
-    def __init__(self, model_name: str, mock_connector: bool):
+    def __init__(self, model_name: str, mock_connector: bool, mock_engine: bool = False):
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.config import CompilationConfig, KVTransferConfig
         from vllm.v1.engine.async_llm import AsyncLLM
 
-        # One model replica per actor/process
-        engine_args = AsyncEngineArgs(
-            model=model_name,
-            enable_chunked_prefill=True,
-            enable_expert_parallel=False,
-            max_num_batched_tokens=16384,
-            data_parallel_size=1,  # single replica in this process
-            max_num_seqs=512,
-            long_prefill_token_threshold=16384,
-            compilation_config=CompilationConfig(
-                cudagraph_mode='FULL_AND_PIECEWISE',
-            ),
-            scheduler_cls='vllm.v1.core.sched.scheduler_adm_ctrl.SchedulerAdmCtrl',
-            kv_transfer_config=(
-                KVTransferConfig(kv_connector='NixlConnector', kv_role='kv_both')
-                if not mock_connector else None
-            ),
-            # enable_prefix_caching = False
-        )
-        self.engine = AsyncLLM.from_engine_args(engine_args)
+        if not mock_engine:
+            # One model replica per actor/process
+            engine_args = AsyncEngineArgs(
+                model=model_name,
+                enable_chunked_prefill=True,
+                enable_expert_parallel=False,
+                max_num_batched_tokens=16384,
+                data_parallel_size=1,  # single replica in this process
+                max_num_seqs=512,
+                long_prefill_token_threshold=16384,
+                compilation_config=CompilationConfig(
+                    cudagraph_mode='FULL_AND_PIECEWISE',
+                ),
+                scheduler_cls='vllm.v1.core.sched.scheduler_adm_ctrl.SchedulerAdmCtrl',
+                kv_transfer_config=(
+                    KVTransferConfig(kv_connector='NixlConnector', kv_role='kv_both')
+                    if not mock_connector else None
+                ),
+                # enable_prefix_caching = False
+            )
+            self.engine = AsyncLLM.from_engine_args(engine_args)
+        else: 
+            from SLOsServe.router.mock_engine import MockEngine
+            self.engine = MockEngine(model_name, mock_connector)
+            
         self.is_ready = True
         
     async def wait_until_ready(self):
@@ -92,7 +93,7 @@ class EngineWorker:
         await self.engine.dump_profile_events(path)
 
     async def shutdown(self):
-        self.engine.shutdown()
+        await self.engine.shutdown()
 
     async def prefill_once(self, req_data: dict, request_id: str):
         """Prefill to first token (max_tokens=1). Return a single dict response."""
@@ -169,6 +170,7 @@ class EngineWorker:
                 'token_ids': completion.token_ids[n_tokens:],
             }
             chunks.append(chunk)
+            # print(f'[decode_stream] Chunk: {chunk}')
             n_tokens = len(completion.token_ids)
             text_len = len(completion.text)
 
@@ -180,6 +182,8 @@ class EngineWorker:
     async def abort_request(self, request_id: str):
         await self.engine.abort(request_id)
 
+    async def health_check(self) -> dict[str, Any]:
+        return await self.engine.health_check()
 # =========================
 # Helpers (engine RPC)
 # =========================
@@ -211,17 +215,23 @@ async def abort_request(client_idx: int, request_id: str):
     actor = engine_actors[client_idx]
     await actor.abort.remote(request_id)
 
-
 # =========================
 # Router & Request types
 # =========================
 class RequestState(Enum):
-    WAITING = 'waiting'
-    PREFILL_REJECTED = 'prefill_rejected'
-    PREFILL_FINISHED = 'prefill_finished'
-    DECODE_FINISHED = 'decode_finished'
-    TIMEOUT = 'timeout'
+    WAITING = 0
+    PREFILL_REJECTED = 1
+    PREFILL_REJECTED_WAITING = 2
+    PREFILL_FINISHED = 3
+    DECODE_REJECTED = 4
+    DECODE_REJECTED_WAITING = 5
+    DECODE_FINISHED = 6
+    TIMEOUT = 7
 
+    def __lt__(self, other):
+        if isinstance(other, RequestState):
+            return self.value < other.value
+        return NotImplemented
 
 @dataclass
 class ReqeustGroup:
@@ -252,6 +262,7 @@ class RequestInstance:
         self._group: ReqeustGroup | None = None
         
         self._state: dict[str, Any] = {}
+        self.kv_transfer_params: dict[str, Any] | None = None
     
     def fork(self):
         if self._group is None: 
@@ -264,7 +275,7 @@ class RequestInstance:
         return new_request
             
     def is_finished(self):
-        return self.state in [RequestState.DECODE_FINISHED, RequestState.TIMEOUT, RequestState.PREFILL_REJECTED]
+        return self.state in [RequestState.DECODE_FINISHED, RequestState.TIMEOUT, RequestState.PREFILL_REJECTED, RequestState.DECODE_REJECTED]
 
     def update_state(self, key: str, value: Any):
         self._state[key] = value
@@ -445,12 +456,27 @@ class Router(ABC):
 
     def run(self, waiting_requests: List[RequestInstance],
             running_requests: List[RequestInstance]):
+        '''
+        Run the router to decide the admission and device assignment for the waiting requests.
+        for every request in the waiting_requests, the router decide: 
+        request.admitted: bool
+        request.prefill_device_id: int
+        request.decode_device_id: int
+        the router is not required to make decisions, it can keep the request.admitted as None
+        '''
         raise NotImplementedError
 
     def update(self, request: RequestInstance, new_state: RequestState):
+        '''
+        Optional update for the router to keep track of the request state.
+        '''
         pass
 
     def update_json(self, request_json: dict, i: int):
+        '''
+        Optional update for the config passed to the i-th engine.
+        For example, in KV disagg router, the config is updated for P devices to allow large batch size limit.
+        '''
         return request_json
 
 class AutoScalingRouter(Router):
@@ -646,6 +672,79 @@ class DisaggregatedRouter(Router):
                 new_request_json['scheduling_kwargs']['long_prefill_token_threshold'] = 4096
         return new_request_json
 
+class DisaggregatedLCRouter(AutoScalingRouter):
+    def __init__(self, n_devices: int, router_kwargs: str):
+        super().__init__(n_devices, router_kwargs)
+        if isinstance(router_kwargs, str):
+            router_kwargs = json.loads(router_kwargs)
+        assert isinstance(router_kwargs, dict)
+        self.n_devices = n_devices
+        self.max_decode_batch_size = router_kwargs['max_decode_batch_size']
+
+    def run(self, waiting_requests: List[RequestInstance],
+            running_requests: List[RequestInstance]):
+        stats = self.load_stat.get_stat()
+        for request in waiting_requests:
+            if time.time() > request.payload['vllm_xargs']['prefill_ddl']:
+                request.admitted = False
+                continue
+            
+            if request.get_state('fall_back', False):
+                request.admitted = False
+                continue
+            
+            assert request.state in [RequestState.WAITING, RequestState.PREFILL_REJECTED_WAITING, RequestState.DECODE_REJECTED_WAITING]
+            
+            if request.decode_device_id == -1: 
+                request.decode_device_id = self.n_devices
+            
+            request.admitted = True
+
+            if request.state < RequestState.PREFILL_FINISHED:
+                device_to_try = request.prefill_device_id + 1
+                logger.info(f"AutoScalingRouter: device_to_try = {device_to_try}")
+                best_device = (-1, 1.0)
+                while device_to_try < self.n_devices:
+                    rejection_prob, pred = self.calc_rejection_prob(stats[device_to_try], request)
+                    if not pred:
+                        best_device = (device_to_try, rejection_prob)
+                        break
+                    if rejection_prob < best_device[1]:
+                        best_device = (device_to_try, rejection_prob)
+                    device_to_try += 1
+                if device_to_try == self.n_devices:
+                    request.update_state('fall_back', True)
+                    if self.fallback_policy == 'reject':
+                        request.admitted = False
+                        continue
+                logger.info(f"AutoScalingRouter: best_device = {best_device}")
+                
+                assert self.fallback_policy == 'best'
+                request.prefill_device_id = best_device[0]
+                request.rejection_prob = best_device[1]
+                stat = stats[request.prefill_device_id]
+                request.admission_stat = asdict(stat)
+                
+                stat.waiting_size += 1
+                stat.n_considered += 1
+                stat.rejection_rate = (stat.rejection_rate * (stat.n_considered - 1) + request.rejection_prob) / stat.n_considered
+                stat.n_requests += 1
+            
+            assert request.state < RequestState.DECODE_FINISHED
+            
+            decode_device_to_try = request.decode_device_id - 1
+            while decode_device_to_try >= 0:
+                if stats[decode_device_to_try].n_requests < self.max_decode_batch_size:
+                    request.decode_device_id = decode_device_to_try
+                    break
+                decode_device_to_try -= 1
+            if decode_device_to_try == -1:
+                request.update_state('fall_back', True)
+                if self.fallback_policy == 'reject':
+                    request.admitted = False
+                    continue
+            stats[request.decode_device_id].n_requests += 1
+
 class DisaggregatedEDFRouter(Router):
     def __init__(self, n_devices: int, router_kwargs: str):
         import re
@@ -836,10 +935,12 @@ def create_router(t: str, n_devices: int, router_kwargs: str) -> Router:
         return SLOsServeRouter(n_devices, router_kwargs)
     elif t == 'renaming':
         return RenamingRouter(n_devices, router_kwargs)
+    elif 'disagg_auto_scaling' in t:
+        return DisaggregatedLCRouter(n_devices, router_kwargs)
     elif 'auto_scaling' in t:
         return AutoScalingRouter(n_devices, router_kwargs)
     elif t == 'round_robin_retry':
-        return AutoScalingRouter(n_devices, router_kwargs)
+        return AutoScalingRouter(n_devices, router_kwargs)        
     elif 'lightest_first' in t:
         return LightestFirstRouter(n_devices, router_kwargs)
     else:
@@ -916,7 +1017,7 @@ class RequestPool:
                  stat_window: float = 5):
         self.waiting_pool: List[RequestInstance] = []
         self.running_pool: List[RequestInstance] = []
-        self.changed_requests: List[RequestInstance] = []
+        self.changed_requests: set[RequestInstance] = set()
         self.window_size = window_size
         self.router = router
         self.clients = clients
@@ -1013,7 +1114,7 @@ class RequestPool:
     def update_req_state(self, request: RequestInstance, state: RequestState):
         self.router.update(request, state)
         request.state = state
-        self.changed_requests.append(request)
+        self.changed_requests.add(request)
 
     async def run_dummy_request(self, input_length: int,
                                 output_length: int,
@@ -1118,7 +1219,7 @@ class RequestPool:
             for event in events:
                 event['device_id'] = i
         return sum(stats, start = [])
-    
+
     async def routing_loop(self):
         next_load_statistics_time = time.time()
         get_load_statistics_task = None 
@@ -1180,7 +1281,6 @@ class RequestPool:
 
                     logger.debug(f"Request {request.request_id} not admitted due to , sending rejection")
                     await request.response_queue.put({"finish_reason": "rejected"})
-                    
                     await request.response_queue.put(None)
                     continue
                 logger.debug(f"Request {request.request_id} admitted, prefill_device_id={request.prefill_device_id}, decode_device_id={request.decode_device_id}")
@@ -1211,6 +1311,7 @@ class RequestPool:
             for request in self.changed_requests:
                 logger.debug(f"Request {request.request_id} state changed to {request.state}")
                 if request.state in [RequestState.PREFILL_REJECTED,
+                                     RequestState.DECODE_REJECTED,
                                      RequestState.DECODE_FINISHED,
                                      RequestState.TIMEOUT]:
                     finished_requests.append(request)
@@ -1265,7 +1366,7 @@ class RequestPool:
                 3. a request gets rejected after acceptance -> abort;
                 4. a request gets accepted but not first -> abort
                 """
-                
+                                
                 if request._group is not None \
                     and request._group.has_acceptance \
                     and not accepted_by_us:
@@ -1333,32 +1434,40 @@ class RequestPool:
                 await request.response_queue.put(None)
                 self.update_req_state(request, RequestState.DECODE_FINISHED)
             return
+        
+        if request.state < RequestState.PREFILL_FINISHED:
+            # Disaggregated path: prefill → kv → decode
+            self._profile_events.append({
+                "event_type": "dispatch-prefill",
+                "timestamp": time.time(),
+                "request_id": request.request_id,
+                "prefill_device_id": request.prefill_device_id,
+                "decode_device_id": request.decode_device_id,
+                "device_id": -1
+            })
 
-        # Disaggregated path: prefill → kv → decode
-        self._profile_events.append({
-            "event_type": "dispatch-prefill",
-            "timestamp": time.time(),
-            "request_id": request.request_id,
-            "prefill_device_id": request.prefill_device_id,
-            "decode_device_id": request.decode_device_id,
-            "device_id": -1
-        })
+            logger.debug(f"Request {request.request_id} sending to prefill device {request.prefill_device_id}")
+            request.payload['vllm_xargs']['prefill_ddl'] -= self.routing_overhead
+            response = await send_request_to_service_engine(request.prefill_device_id,
+                                                            request.payload,
+                                                            request.request_id)
+            request.payload['vllm_xargs']['prefill_ddl'] += self.routing_overhead
 
-        logger.debug(f"Request {request.request_id} sending to prefill device {request.prefill_device_id}")
-        request.payload['vllm_xargs']['prefill_ddl'] -= self.routing_overhead
-        response = await send_request_to_service_engine(request.prefill_device_id,
-                                                        request.payload,
-                                                        request.request_id)
-        request.payload['vllm_xargs']['prefill_ddl'] += self.routing_overhead
+            if response.get('finish_reason') == 'rejected':
+                logger.debug(f"Request {request.request_id} was rejected at prefill stage")
+                self.update_req_state(request, RequestState.PREFILL_REJECTED)
+                if self.enable_rescheduling:
+                    self.update_req_state(request, RequestState.PREFILL_REJECTED_WAITING)
+                    self.waiting_pool.append(request)
+                else:
+                    await request.response_queue.put(None)
+                return
+            kv_transfer_params = response.get('kv_transfer_params', {})
+            request.kv_transfer_params = kv_transfer_params
+            self.update_req_state(request, RequestState.PREFILL_FINISHED)
 
-        if response.get('finish_reason') == 'rejected':
-            logger.debug(f"Request {request.request_id} was rejected at prefill stage")
-            self.update_req_state(request, RequestState.PREFILL_REJECTED)
-            await request.response_queue.put(None)
-            return
-
-        self.update_req_state(request, RequestState.PREFILL_FINISHED)
-
+        assert request.state < RequestState.DECODE_FINISHED
+        
         self._profile_events.append({
             "event_type": "dispatch-decode",
             "timestamp": time.time(),
@@ -1368,8 +1477,8 @@ class RequestPool:
             "device_id": -1
         })
 
-        kv_transfer_params = response.get('kv_transfer_params', {})
-        if kv_transfer_params:
+        
+        if request.kv_transfer_params:
             logger.debug(f"Request {request.request_id} updating kv_transfer_params for decode")
             request.payload["kv_transfer_params"] = kv_transfer_params
             if self.mock_connector:
@@ -1390,13 +1499,17 @@ class RequestPool:
             if data['finish_reason'] == 'rejected':
                 logger.debug(f"Request {request.request_id} was rejected at prefill stage")
                 is_rejected = True
-
-        if is_rejected and self.enable_rescheduling:
-            self.waiting_pool.append(request)
-            self.update_req_state(request, RequestState.WAITING)
-            logger.debug(f"Request {request.request_id} waiting for rescheduling")
+                
+        
+        if is_rejected:
+            self.update_req_state(request, RequestState.DECODE_REJECTED)
+            if self.enable_rescheduling:
+                self.update_req_state(request, RequestState.DECODE_REJECTED_WAITING)
+                self.waiting_pool.append(request)
+                logger.debug(f"Request {request.request_id} waiting for rescheduling")
+            else:
+                await request.response_queue.put(None)
         else:
-            self.update_req_state(request, RequestState.DECODE_FINISHED)
             await request.response_queue.put(None)
             self.update_req_state(request, RequestState.DECODE_FINISHED)
             logger.debug(f"Request {request.request_id} finished decode (disaggregated)")
@@ -1432,6 +1545,14 @@ app = FastAPI(lifespan=lifespan)
 # =========================
 # Endpoints
 # =========================
+@app.get('/health_check')
+async def health_check():
+    for actor in engine_actors:
+        status = await actor.health_check.remote()
+        if not status['loop_task_done']:
+            return JSONResponse(status_code=500, content=status)
+    return JSONResponse(status_code=200, content={'status': 'ok'})
+
 @app.post("/v1/completions")
 async def handle_completions(request: Request):
     if request_pool is None:
@@ -1558,13 +1679,14 @@ def parse_args():
     parser.add_argument("--router", type=str, default="slo")
     parser.add_argument("--router_kwargs", type=str, default="{}")
     parser.add_argument("--clients", type=str, default=None)
-    parser.add_argument("--enable_rerouting", action="store_true", default=False)
-    parser.add_argument("--enable_rescheduling", action="store_true", default=False)
-    parser.add_argument("--admission_mode", type=str, default="anytime")
+    parser.add_argument("--enable_rerouting", action="store_true", default=False, help="enable rerouting of a rejected request")
+    parser.add_argument("--enable_rescheduling", action="store_true", default=False, help="enable rescheduling after a request's P phase finishes")
+    parser.add_argument("--admission_mode", type=str, default="anytime", help="admission mode: anytime or arrival, arrival: instant decision at arrival, anytime: admission can be made anytime.")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--mock_connector", action="store_true", default=False)
+    parser.add_argument("--mock_connector", action="store_true", default=False, help="use mock connector to simulate the network latency")
     parser.add_argument("--ray_address", type=str, default=None)  # NEW: allow Ray cluster connect
-    parser.add_argument("--stat_window", type=float, default=0.5)
+    parser.add_argument("--stat_window", type=float, default=0.5, help="stat window for collecting load statistics from backend engine (used for load prediction)")
+    parser.add_argument("--mock_engine", action="store_true", default=False, help="use mock engine to simulate the model inference")
     return parser.parse_args()
 
 
@@ -1583,14 +1705,11 @@ def start_engine(clients: list):
     global engine_actors
     engine_actors = []
     for _ in range(n_devices):
-        actor = EngineWorker.options(num_gpus=1).remote(args.model_name, args.mock_connector)
+        if args.mock_engine:
+            actor = EngineWorker.remote(args.model_name, args.mock_connector, mock_engine=True)
+        else:
+            actor = EngineWorker.options(num_gpus=1).remote(args.model_name, args.mock_connector)
         engine_actors.append(actor)
-    
-    pending = [a.wait_until_ready.remote() for a in engine_actors]
-    while pending:
-        ready, pending = ray.wait(pending, num_returns=1)
-
-    logger.info(f'Engine actors started: {len(engine_actors)} replicas for clients: {clients}')
 
 
 if __name__ == "__main__":
@@ -1601,7 +1720,7 @@ if __name__ == "__main__":
     logger.info(f"Starting API server on {args.host}:{args.port} with router={args.router} and clients={args.clients}")
     if args.clients:
         start_engine(clients)
-
+    logger.info(f"Engine started: {engine_actors}")
     router = create_router(args.router, len(clients), args.router_kwargs)
     load_stat = LoadStat(max_window=args.stat_window, n_devices=len(clients))
     request_pool = RequestPool(args.window_size, router, clients,

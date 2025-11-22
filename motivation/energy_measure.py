@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # energy_meter_demo.py
-# Records per-GPU final energy (J). Works with NVML energy counter if available,
-# otherwise integrates power in a background thread.
-
 import time
 import threading
 from typing import List, Tuple, Optional
 import time, threading, csv
+import logging
 # Optional: cupy for the demo workload. If unavailable, we'll fall back.
 try:
     import cupy as cp
@@ -14,6 +12,9 @@ try:
     HAS_CUPY = True
 except Exception:
     HAS_CUPY = False
+
+
+logger = logging.getLogger(__name__)
 
 class EnergyMeter:
     """
@@ -55,12 +56,40 @@ class EnergyMeter:
         self._final_snapshot = None
         self._start_time = time.time()
         self._end_time = None
+        self._running = False
 
-        self._init_backend()
+        # Try to init a real telemetry backend; on failure we fall back to dummy mode.
+        try:
+            self._init_backend()
+        except RuntimeError:
+            self._nvml = None
+            self._rocm = None
+
+        if self._nvml is None and self._rocm is None:
+            logger.warning(
+                "EnergyMeter: no NVML/ROCm backend available; "
+                "energy measurements will be disabled and read() will return zeros."
+            )
+            self._handles = []
+            self._uuids = []
+            self._last_freqs_MHz = []
+            self._energy_J = []
+            self._start_counters = None
+            # Dummy snapshot used by read()/stop()
+            self._final_snapshot = ([], 0.0)
+            return
+
         self._choose_devices()
         self._last_freqs_MHz = [None for _ in self._handles]
         if not self._handles:
-            raise RuntimeError("No GPUs detected for energy measurement.")
+            logger.warning(
+                "EnergyMeter: no GPUs detected; "
+                "energy measurements will be disabled and read() will return zeros."
+            )
+            self._energy_J = []
+            self._start_counters = None
+            self._final_snapshot = ([], 0.0)
+            return
         # Prime frequency cache if supported
         if self._handles:
             try:
@@ -134,6 +163,7 @@ class EnergyMeter:
     def __enter__(self):
         self.start()
         return self
+    
     def __exit__(self, exc_type, exc, tb):
         self.stop()
 
@@ -156,8 +186,7 @@ class EnergyMeter:
             return
         except Exception:
             self._rocm = None
-
-        raise RuntimeError("No supported GPU telemetry backend found (NVML/ROCm).")
+        # If we reach here, both NVML and ROCm backends are unavailable.
 
     def _shutdown_backend(self):
         if self._nvml is not None:
@@ -352,6 +381,9 @@ class EnergyHistoryRecorder:
     def start(self):
         # init CSV
         if self.csv_path:
+            import os
+            if os.path.exists(self.csv_path):
+                os.remove(self.csv_path)
             self._fh = open(self.csv_path, "w", newline="")
             headers = ["ts"] + \
                       [f"J_gpu{i}" for i,_ in enumerate(self.meter.uuids)] + ["J_total"] + \
