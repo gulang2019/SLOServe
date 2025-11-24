@@ -32,6 +32,7 @@ python -m SLOsServe.router.api_server_ray --help
 Example: 
 ```sh
 # launch the router & server, the parameter here is not important.
+# the mock_engine and mock_connector flags are important for emulation.
 python -m SLOsServe.router.api_server_ray --stat_window 2 \
     --host 0.0.0.0 \
     --port 8000 \
@@ -44,13 +45,15 @@ python -m SLOsServe.router.api_server_ray --stat_window 2 \
 
 
 ## Step 3: Run benchmark.
-# run benchmark
-# single server 
 ```sh
 python motivation/bench_api_server.py --help
 ```
 
 ```sh
+# run on 4 devices, clients 0,1,2,3 (the value of the number is not important, but the total counts should be greator than 4), round-robin router, slosserve-edf scheduler, 
+# sharegpt_code as length pattern, azure_chat_23 as arrival pattern, request 3978 to request 4100 
+# tpot slo 25ms, ttft slo 3 x zero_load, routing slo 50 ms (for the overhead).
+# output directory experiments_mock 
 python motivation/bench_api_server.py --overwrite \
   --n_devices 4 \
   --policies round_robin:slosserve-edf \
@@ -64,34 +67,19 @@ python motivation/bench_api_server.py --overwrite \
   --model_name Qwen/Qwen2.5-7B-Instruct \
   --port 8000 --clients 0,1,2,3 --output_dir experiments_mock
 
- python motivation/bench_api_server.py --overwrite \
-  --n_devices 4 \
-  --policies round_robin:slosserve-edf \
-  --load_scales 1.0 \
-  --slo_tpots 0.025 \
-  --ttft_slo_scales 3.0 \
-  --window 3978:4100 \
+# run with a grid of experiment.
+python motivation/bench_api_server.py --overwrite \
+  --n_devices 1 2 3 4 \
+  --policies  round_robin:slosserve-edf  round_robin:vllm round_robin:sarathi\
+  --load_scales 1.0 2.0 3.0 \
+  --slo_tpots 0.025 0.05 \
+  --ttft_slo_scales 3.0 10.0 \
+  --window 3978:4800 \
   --trace sharegpt_code:azure_chat_23 \
   --profit constant --admission_mode anytime \
   --overwrite --slo_routing_overhead 0.05 --scheduling_overhead 0.005\
   --model_name Qwen/Qwen2.5-7B-Instruct \
   --port 8000 --clients 0,1,2,3 --output_dir experiments_mock
-
-
-python motivation/bench_api_server.py --overwrite \
-  --n_devices 1 \
-  --policies round_robin:slosserve-edf \
-  --load_scales 1.0 \
-  --slo_tpots 0.025 \
-  --ttft_slo_scales 3.0 \
-  --window 3978:4579 \
-  --trace sharegpt_code:azure_chat_23 \
-  --profit constant --admission_mode anytime \
-  --overwrite --slo_routing_overhead 0.05 --scheduling_overhead 0.002\
-  --model_name Qwen/Qwen2.5-7B-Instruct \
-  --port 8000 --clients 0
-
-
 ```
 
 ## Step 4. end to end evaluation
