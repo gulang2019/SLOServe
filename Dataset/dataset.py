@@ -8,8 +8,8 @@ import numpy as np
 import pandas as pd 
 import math
 import random
-dotenv.load_dotenv()
-DATASET_DIR = os.getenv('DATASET_DIR')
+# dotenv.load_dotenv()
+DATASET_DIR = 'assets/datasets'
 
 print(f'DATASET_DIR:{DATASET_DIR}')
 

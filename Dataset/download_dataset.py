@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 
 tokenizer = AutoTokenizer.from_pretrained('deepseek-ai/DeepSeek-R1')
 
-DATASET_DIR = os.path.expanduser('~/assets/datasets')
+DATASET_DIR = 'assets/datasets'
 
+os.makedirs(DATASET_DIR, exist_ok=True)
 
 def download_dataset(dataset_name: str): 
     logger.info(f"Starting download for dataset: {dataset_name}")
@@ -94,10 +95,10 @@ def download_dataset(dataset_name: str):
         logger.info(f"Finished processing all requests for {dataset_name}.")
     elif dataset_name in ['azure_code', 'azure_chat', 'azure_chat_23', 'azure_code_23']:
         url = {
-            'azure_code': '/u/gulang/assets/datasets/AzureLLMInferenceTrace_code_1week.csv',
-            'azure_chat': '/u/gulang/assets/datasets/AzureLLMInferenceTrace_conv_1week.csv',
-            'azure_chat_23': '/u/gulang/workspace/SLOsServe/Dataset/AzureLLMInferenceTrace_conv.csv',
-            'azure_code_23': '/u/gulang/workspace/SLOsServe/Dataset/AzureLLMInferenceTrace_code.csv'
+            'azure_code': 'https://azurepublicdatasettraces.blob.core.windows.net/azurellminfererencetrace/AzureLLMInferenceTrace_code_1week.csv',
+            'azure_chat': 'https://azurepublicdatasettraces.blob.core.windows.net/azurellminfererencetrace/AzureLLMInferenceTrace_conv_1week.csv',
+            'azure_chat_23': 'https://raw.githubusercontent.com/Azure/AzurePublicDataset/refs/heads/master/data/AzureLLMInferenceTrace_conv.csv',
+            'azure_code_23': 'https://raw.githubusercontent.com/Azure/AzurePublicDataset/refs/heads/master/data/AzureLLMInferenceTrace_code.csv'
         }
         logger.info(f"Downloading CSV from {url[dataset_name]}")
         '''
@@ -110,7 +111,7 @@ def download_dataset(dataset_name: str):
         import pandas as pd
         from datetime import datetime
         df = pd.read_csv(url[dataset_name])
-        # df = df.iloc[:100000]
+        df = df.iloc[:100000]
         logger.info(f"Loaded CSV with {len(df)} rows.")
         # Robustly parse timestamps with or without microseconds
         def parse_timestamp(x):
@@ -349,12 +350,12 @@ if __name__ == '__main__':
         'azure_chat', 
         'azure_chat_23',
         'azure_code_23',
-        'sharegpt_chat',
-        'sharegpt_code',
-        'burstgpt',
-        'humaneval',
-        'arxiv_summary',
-        'deepseek-r1'
+        # 'sharegpt_chat',
+        # 'sharegpt_code',
+        # 'burstgpt',
+        # 'humaneval',
+        # 'arxiv_summary',
+        # 'deepseek-r1'
     ]
     
     logger.info(f"Starting parallel download of {len(datasets_to_download)} datasets...")
@@ -367,5 +368,6 @@ if __name__ == '__main__':
                 future.result()
             except Exception as e:
                 logger.error(f"Dataset download failed: {e}")
+            
     
     logger.info("All dataset downloads completed!")
