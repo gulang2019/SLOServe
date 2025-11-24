@@ -44,11 +44,10 @@ routing_loop_task: asyncio.Task | None = None
 @ray.remote
 class EngineWorker:
     def __init__(self, model_name: str, mock_connector: bool, mock_engine: bool = False):
-        from vllm.engine.arg_utils import AsyncEngineArgs
-        from vllm.config import CompilationConfig, KVTransferConfig
-        from vllm.v1.engine.async_llm import AsyncLLM
-
         if not mock_engine:
+            from vllm.engine.arg_utils import AsyncEngineArgs
+            from vllm.config import CompilationConfig, KVTransferConfig
+            from vllm.v1.engine.async_llm import AsyncLLM
             # One model replica per actor/process
             engine_args = AsyncEngineArgs(
                 model=model_name,
