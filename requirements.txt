@@ -2,3 +2,4 @@ pybind11==3.0.1
 datasets==4.0.0
 matplotlib
 scikit-learn
+transformers==4.57.1

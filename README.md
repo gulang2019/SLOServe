@@ -1,6 +1,8 @@
 ## Step 1: Setup
 
 ```sh
+git submodule update --init
+
 conda create --name sloserve python=3.10  -y
 conda activate sloserve
 
@@ -13,6 +15,7 @@ cd csrc
 python3 -m pip install -e . --no-build-isolation
 cd -
 ```
+> Trouble shooting 1 ImportError:..._C.abi3.so: undefined symbol... : Comment out import vllm._C in SLOServe/3rdparty/vllm/vllm/platforms/cuda.py:18
 
 ```sh
 # download traces
