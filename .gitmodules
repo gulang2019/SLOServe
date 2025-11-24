@@ -1,6 +1,6 @@
 [submodule "3rdparty/vllm"]
 	path = 3rdparty/vllm
-	url = https://github.com/gulang2019/SLOServe.git
+	url = https://github.com/gulang2019/vllm-private.git
 [submodule "3rdpartys/sglang"]
 	path = 3rdpartys/sglang
 	url = https://github.com/sgl-project/sglang.git

@@ -382,7 +382,8 @@ def fit_ours():
         # "experiments/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4579_anytime/slosserve-edf_auto_scaling_resch-all-0.15_1.5_4_anytime_3.0_0.025.admission_history.jsonl",
         # "experiments/Qwen-7B_constant_azure_chat_23:azure_code_23_3978:4579_anytime/slosserve-edf_auto_scaling_resch-all_chat-1.0_0.9_1_anytime_5.0_0.1.admission_history.jsonl"
         # "experiments/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4579_anytime/slosserve-edf_auto_scaling-all-0.07_1.5_4_anytime_3.0_0.025.admission_history.jsonl"
-        "experiments/Qwen-7B_constant_azure_chat_23:azure_code_23_3978:4579_anytime/slosserve-edf_auto_scaling_resch-all_chat-1.0_0.9_1_anytime_5.0_0.1.admission_history.jsonl"
+        # "experiments/Qwen-7B_constant_azure_chat_23:azure_code_23_3978:4579_anytime/slosserve-edf_auto_scaling_resch-all_chat-1.0_0.9_1_anytime_5.0_0.1.admission_history.jsonl",
+        "experiments_mock/Qwen-7B_constant_sharegpt_code:azure_chat_23_3978:5978_anytime_0.0/slosserve-edf_round_robin_1.0_1_anytime_3.0_0.025.admission_history.jsonl"
     ]
     TEST_PATH = "experiments/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4579_anytime/slosserve-edf_auto_scaling-all-0.10_1.5_4_anytime_3.0_0.025.admission_history.jsonl"
     # TEST_PATH = "experiments/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4579_anytime/slosserve-edf_auto_scaling_resch-all-0.05_1.5_4_anytime_3.0_0.025.events.jsonl"
@@ -391,11 +392,14 @@ def fit_ours():
     # TEST_PATH = "experiments/Qwen-7B_constant_sharegpt_code:azure_code_23_3979:4579_anytime/slosserve-edf_auto_scaling-load_slo_req-1.0_1.2_1_anytime_3.0_0.025.admission_history.jsonl"
     # TEST_PATH = TRAIN_PATHS[-1]
     # TEST_PATH = "experiments/Qwen-7B_constant_azure_chat_23:azure_chat_23_601:1202_anytime/slosserve-edf_auto_scaling-all-0.12_4.0_4_anytime_5.0_0.1.0.admission_history.jsonl"
+    TEST_PATH = "experiments_mock/Qwen-7B_constant_sharegpt_code:azure_chat_23_3978:4100_anytime_0.0/slosserve-edf_auto_scaling_resch-all_chat-0.015_1.0_4_anytime_3.0_0.025.admission_history.jsonl"
+    TEST_PATH = "experiments_mock/Qwen-7B_constant_sharegpt_code:azure_chat_23_3978:5978_anytime_0.0/slosserve-edf_round_robin_1.0_1_anytime_3.0_0.025.admission_history.jsonl"
     TARGET = "slo_violation"
     
     # REQUEST_FEATURES = []
     SLO_FEATURES = ["past_utilization", "future_utilization", "rejection_rate"]
     LOAD_FEATURES = ["n_requests", "input_length", "prefill_ddl", "running_size", "waiting_size"]
+    PREDICTOR_NAME = "all_mock"
 
     # df = load_json_or_jsonl([TEST_PATH])
     # y_prob = df['rejection_prob']
@@ -407,13 +411,14 @@ def fit_ours():
     # fit(TRAIN_PATHS, REQUEST_FEATURES + SLO_FEATURES + LOAD_FEATURES, TARGET, "load_slo_req", threshold)
     # fit(TRAIN_PATHS, LOAD_FEATURES, TARGET, "load", threshold)
     # fit(TRAIN_PATHS, LOAD_FEATURES + SLO_FEATURES, TARGET, "all_chat", threshold)
-    fit(TRAIN_PATHS, LOAD_FEATURES + SLO_FEATURES, TARGET, "all_chat_per_device", threshold, per_device = True)
+    fit(TRAIN_PATHS, LOAD_FEATURES + SLO_FEATURES, TARGET, PREDICTOR_NAME, threshold, per_device = False)
     fig, ax = plt.subplots(figsize=(6, 6), tight_layout=True)
     # eval_auto_scaling("load_slo_req", TEST_PATH, TARGET, ax = ax, do_threshold_labeling = True)
     # eval_auto_scaling("load_slo", TEST_PATH, TARGET, ax = ax, do_threshold_labeling = True, label = "Load & SLO Features")
     # eval_auto_scaling("load", TEST_PATH, TARGET, ax = ax, do_threshold_labeling = False, label = "Load Features")
-    eval_auto_scaling("all", TEST_PATH, TARGET, ax = ax, do_threshold_labeling = True, label = "All")
-    eval_auto_scaling("all_chat", TEST_PATH, TARGET, ax = ax, do_threshold_labeling = False, label = "All+")
+    eval_auto_scaling(PREDICTOR_NAME, TEST_PATH, TARGET, ax = ax, do_threshold_labeling = False, label = "In-domain")
+    eval_auto_scaling('all', TEST_PATH, TARGET, ax = ax, do_threshold_labeling = False, label = "Out-of-domain")
+    # eval_auto_scaling("all_chat", TEST_PATH, TARGET, ax = ax, do_threshold_labeling = False, label = "All+")
     
     # eval_auto_scaling("load", TEST_PATH, TARGET, ax = ax, do_threshold_labeling = True, label = "Load & Req. Features Only")
     ax.set_xlim(0, 1)
@@ -422,23 +427,34 @@ def fit_ours():
     print(f'Saved auto_scaling_fpr_fnr.png')
     plt.close()
 
-def main(name = 'vllm+'):
-    # === Configuration ===
-    TRAIN_PATHS = [
-        f"experiments/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4579_anytime/qlm+_round_robin_1.5_1_anytime_3.0_0.025.admission_history.jsonl",
-    ]
-    TEST_PATH = f"experiments/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4579_anytime/qlm+_round_robin_1.5_1_anytime_3.0_0.025.admission_history.jsonl"
-    # TEST_PATH = "experiments/Qwen-7B_constant_azure_chat_23:azure_chat_23_601:1202_anytime/slosserve-edf_auto_scaling-all-0.12_4.0_4_anytime_5.0_0.1.0.admission_history.jsonl"
-    TARGET = "slo_violation"
-    REQUEST_FEATURES = ["running_size", "waiting_size", "input_length", "output_length", "prefill_ddl"]
-    SLO_FEATURES = ["past_utilization", "future_utilization", "rejection_rate"]
-    LOAD_FEATURES = ["n_requests"]
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", type=str, default="vllm+", help="name of the model")
+    parser.add_argument("--test_only", 'store_true', default=False, help="only test the model")
+    return parser.parse_args()
 
-    threshold = 0.1
-    fit(TRAIN_PATHS, REQUEST_FEATURES + SLO_FEATURES + LOAD_FEATURES, TARGET, f"load_slo_req-{name}", threshold)
-    fit(TRAIN_PATHS, LOAD_FEATURES + SLO_FEATURES, TARGET, f"load_slo-{name}", threshold)
-    fit(TRAIN_PATHS, LOAD_FEATURES + REQUEST_FEATURES, TARGET, f"load_reqs_{name}", threshold)
-    fit(TRAIN_PATHS, LOAD_FEATURES, TARGET, f"load_{name}", threshold)
+def main():
+    # === Configuration ===
+    args = parse_args()
+    name = args.name
+    if not args.test_only:
+        TRAIN_PATHS = [
+            f"experiments/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4579_anytime/qlm+_round_robin_1.5_1_anytime_3.0_0.025.admission_history.jsonl",
+        ]
+        # TEST_PATH = "experiments/Qwen-7B_constant_azure_chat_23:azure_chat_23_601:1202_anytime/slosserve-edf_auto_scaling-all-0.12_4.0_4_anytime_5.0_0.1.0.admission_history.jsonl"
+        TARGET = "slo_violation"
+        REQUEST_FEATURES = ["running_size", "waiting_size", "input_length", "output_length", "prefill_ddl"]
+        SLO_FEATURES = ["past_utilization", "future_utilization", "rejection_rate"]
+        LOAD_FEATURES = ["n_requests"]
+
+        threshold = 0.1
+        fit(TRAIN_PATHS, REQUEST_FEATURES + SLO_FEATURES + LOAD_FEATURES, TARGET, f"load_slo_req-{name}", threshold)
+        fit(TRAIN_PATHS, LOAD_FEATURES + SLO_FEATURES, TARGET, f"load_slo-{name}", threshold)
+        fit(TRAIN_PATHS, LOAD_FEATURES + REQUEST_FEATURES, TARGET, f"load_reqs_{name}", threshold)
+        fit(TRAIN_PATHS, LOAD_FEATURES, TARGET, f"load_{name}", threshold)
+    
+    TEST_PATH = f"experiments_mock/Qwen-7B_constant_sharegpt_code:azure_chat_23_3978:4100_anytime_0.0/slosserve-edf_auto_scaling_resch-all_chat-0.015_1.0_4_anytime_3.0_0.025.events.jsonl"
     
     fig, ax = plt.subplots(figsize=(5, 5), tight_layout=True)
     # eval_auto_scaling("load_slo_req", TEST_PATH, TARGET, ax = ax)
