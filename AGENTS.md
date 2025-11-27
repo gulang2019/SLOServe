@@ -36,3 +36,4 @@
 ## Security & Configuration Tips
 - Avoid committing downloaded traces or experiment outputs; use `.gitignore` for local artifacts.
 - GPU/port usage: check availability before launching services (`lsof -Pn -iTCP:<port>`). Set `CUDA_VISIBLE_DEVICES` explicitly in scripts when sharing machines.
+- If you are unsure about a change, pause and ask the maintainer before making invasive edits.

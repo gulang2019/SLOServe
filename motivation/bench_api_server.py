@@ -13,6 +13,11 @@ import uuid
 import random
 import httpx
 import pandas as pd
+from emulator_config import (
+    USE_FIX_PD_BSZ,
+    PREFILL_MAX_BATCH_TOKENS,
+    DECODE_MAX_BATCH_TOKENS,
+)
 
 from motivation.events_analysis import analyze_events, analyze_slo_violation
 from motivation.auto_scaling import eval_auto_scaling
@@ -470,8 +475,8 @@ async def main(problem: Problem, endpoint: str, clients: str):
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{endpoint}/dump_profile_events",
-            json={"filename": filename, "admission_filename": admission_filename, "timeout": 30.0},
-            timeout=30.0
+            json={"filename": filename, "admission_filename": admission_filename, "timeout": 300.0},
+            timeout=300.0
         )
         response.raise_for_status()
         
@@ -649,15 +654,32 @@ def build_problems(
             'allow_rejection': True
         })
     elif scheduling_policy == 'sarathi':
-        scheduling_kwargss.append({
-            'scheduling_policy': 'vllm-sarathi',
-            'max_num_batched_tokens': max_num_batched_tokens_vllm,
-            'long_prefill_token_threshold': max_num_batched_tokens_vllm,
-            'max_num_seqs': 512,
-            'enable_chunked_prefill': True,
-            'enable_admission': False,
-            'allow_rejection': False,
-        })
+        if USE_FIX_PD_BSZ:
+            # Use fixed prefill/decode batch caps when emulator_config requests it,
+            # independent of SLO-derived batch sizes.
+            prefill_only_max_num_batched_tokens = PREFILL_MAX_BATCH_TOKENS
+            decode_max_num_batched_tokens = DECODE_MAX_BATCH_TOKENS
+            scheduling_kwargss.append({
+                'scheduling_policy': 'vllm-sarathi',
+                'max_num_batched_tokens': prefill_only_max_num_batched_tokens,
+                'prefill_only_max_num_batched_tokens': prefill_only_max_num_batched_tokens,
+                'decode_max_num_batched_tokens': decode_max_num_batched_tokens,
+                'long_prefill_token_threshold': prefill_only_max_num_batched_tokens,
+                'max_num_seqs': 512,
+                'enable_chunked_prefill': True,
+                'enable_admission': False,
+                'allow_rejection': False,
+            })
+        else:
+            scheduling_kwargss.append({
+                'scheduling_policy': 'vllm-sarathi',
+                'max_num_batched_tokens': max_num_batched_tokens_vllm,
+                'long_prefill_token_threshold': max_num_batched_tokens_vllm,
+                'max_num_seqs': 512,
+                'enable_chunked_prefill': True,
+                'enable_admission': False,
+                'allow_rejection': False,
+            })
         
     elif scheduling_policy == 'sarathi+':
         scheduling_kwargss.append({

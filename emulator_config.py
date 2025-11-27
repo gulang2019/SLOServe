@@ -1,0 +1,7 @@
+USE_FIX_PD_BSZ = True
+
+# Fixed batch-size caps used when USE_FIX_PD_BSZ is True.
+# PREFILL_MAX_BATCH_TOKENS applies when all requests are in prefill,
+# DECODE_MAX_BATCH_TOKENS applies when any decode is present.
+PREFILL_MAX_BATCH_TOKENS = 2048
+DECODE_MAX_BATCH_TOKENS = 64

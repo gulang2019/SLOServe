@@ -3,3 +3,7 @@ datasets==4.0.0
 matplotlib
 scikit-learn
 transformers==4.57.1
+fastapi
+httpx
+ray
+uvicorn

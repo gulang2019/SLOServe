@@ -68,7 +68,7 @@ class EngineWorker:
                 # enable_prefix_caching = False
             )
             self.engine = AsyncLLM.from_engine_args(engine_args)
-        else: 
+        else:
             from SLOsServe.router.mock_engine import MockEngine
             self.engine = MockEngine(model_name, mock_connector)
             
@@ -1066,7 +1066,7 @@ class RequestPool:
     def reset(self):
         self.waiting_pool = []
         self.running_pool = []
-        self.changed_requests = []
+        self.changed_requests = set()
         self.request_id = 0
         self._profile_events = []
         self.enable_rerouting = False
