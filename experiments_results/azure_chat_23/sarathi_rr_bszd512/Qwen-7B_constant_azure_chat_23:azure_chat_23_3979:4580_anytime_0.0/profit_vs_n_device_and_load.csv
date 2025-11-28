@@ -1,0 +1,2 @@
+load_scale,n_device,scheduling_policy,routing_policy,profit,ttft_slo_scale,slo_tpot,slo_violation_rate,event_file,energy_consumption,per_gpu_energy_consumption,scheduling_overhead,burstiness_level,average_effective_tokens_ratio,average_n_active_servers,rejection_rate
+1.0,1,sarathi,round_robin,0.0,3.0,0.025,0.9883527454242929,experiments_results/sarathi_rr_bszd512/Qwen-7B_constant_azure_chat_23:azure_chat_23_3979:4580_anytime_0.0/sarathi_round_robin_1.0_1_anytime_3.0_0.025.events.jsonl,0.0,[],0.05,0.0,0.02377784469716511,1.0,0.0

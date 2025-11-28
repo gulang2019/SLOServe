@@ -1,0 +1,1523 @@
+INFO:SLOsServe.router.api_server:Starting API server on 0.0.0.0:8000 with router=round_robin and clients=mock0
+2025-11-27 23:01:51,066	INFO worker.py:2023 -- Started a local Ray instance.
+/Users/lizhouzi/miniforge3/envs/slosserve/lib/python3.10/site-packages/ray/_private/worker.py:2062: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+INFO:SLOsServe.router.api_server:Engine started: [Actor(EngineWorker, bb08f843ac22bbf0fe100a1501000000)]
+INFO:SLOsServe.router.api_server:Creating router of type round_robin with 1 devices and kwargs: {"max_decode_batch_size":32}
+INFO:SLOsServe.router.api_server:Start up time: 2.0056331157684326 seconds
+INFO:     Started server process [59384]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+[36m(EngineWorker pid=59434)[0m Using blocking ray.get inside async actor. This blocks the event loop. Please use `await` on object ref with asyncio.gather if you want to yield execution to the event loop instead.
+[36m(EngineWorker pid=59434)[0m INFO:SLOsServe.router.mock_engine:MockEngineCore created: Actor(MockEngineCore, 467c1f870a5b3cbe90621fa501000000)
+[36m(EngineWorker pid=59434)[0m INFO:SLOsServe.router.mock_engine:MockEngine started: Actor(MockEngineCore, 467c1f870a5b3cbe90621fa501000000)
+INFO:SLOsServe.router.api_server:existing clients: ['mock0'], new clients: ['0']
+INFO:SLOsServe.router.api_server:Updated clients: ['0']
+DATASET_DIR:assets/datasets
+clients:  ['mock0'] n_devices:  1
+[36m(EngineWorker pid=59434)[0m INFO 11-27 23:01:56 [__init__.py:241] Automatically detected platform cpu.
+[36m(MockEngineCore pid=59432)[0m INFO 11-27 23:02:02 [scheduler_adm_ctrl.py:188] SchedulerAdmCtrl::init
+[36m(MockEngineCore pid=59432)[0m init kv cache manager, enable_caching:  True
+[36m(MockEngineCore pid=59432)[0m [AdmCtrlScheduler] setting ARBatchPlanner with tpots: 0  and hardware_params: 5.1e-05 1.69e-05 8e-08 0 0.014 max BS: 16384, fixed_bs: 0
+[36m(MockEngineCore pid=59432)[0m BatchPlanner name: ARBatchPlanner
+[36m(MockEngineCore pid=59432)[0m T = max(
+[36m(MockEngineCore pid=59432)[0m 5.1e-05 * n_tokens + 1.69e-05 * n_reqs + 8e-08 * n_past_tokens + 0 * decode_steps + 0.014,
+[36m(MockEngineCore pid=59432)[0m )
+[36m(MockEngineCore pid=59432)[0m max BS: 16384
+[36m(MockEngineCore pid=59432)[0m fixed BS: 0
+[36m(MockEngineCore pid=59432)[0m continuous: 0
+[36m(MockEngineCore pid=59432)[0m INFO 11-27 23:02:02 [scheduler_adm_ctrl.py:329] fetching perf model for model_name: Qwen/Qwen2.5-7B-Instruct and length_pattern: default
+[36m(MockEngineCore pid=59432)[0m INFO 11-27 23:02:02 [scheduler_adm_ctrl.py:330] perf model hardware_params (k1,k2,k3,k4,b): [5.1e-05, 1.69e-05, 8e-08, 0, 0.014]
+[36m(MockEngineCore pid=59432)[0m INFO 11-27 23:02:02 [scheduler_adm_ctrl.py:331] updating slosserve scheduler with TPOT: 0.0 and hardware_params: [5.1e-05, 1.69e-05, 8e-08, 0, 0.014]
+[36m(MockEngineCore pid=59432)[0m INFO 11-27 23:02:02 [scheduler_adm_ctrl.py:345] Timer: <vllm.v1.core.sched.scheduler_adm_ctrl.DefaultTimer object at 0x17852a620>
+[36m(MockEngineCore pid=59432)[0m kv cache manager initialized <vllm.v1.core.kv_cache_manager.KVCacheManager object at 0x179033340>
+[36m(pid=59432)[0m INFO 11-27 23:02:00 [__init__.py:241] Automatically detected platform cpu.
+[36m(MockEngineCore pid=59432)[0m [MockEngineCore] batch_id=0, stats=None, n_arrived_reqs=0, n_finished_reqs=0, n_rejected_reqs=0
+[36m(MockEngineCore pid=59432)[0m [MockEngineCore] batch_id=100, stats=None, n_arrived_reqs=0, n_finished_reqs=0, n_rejected_reqs=0
+[36m(MockEngineCore pid=59432)[0m [MockEngineCore] batch_id=200, stats=None, n_arrived_reqs=0, n_finished_reqs=0, n_rejected_reqs=0
+[36m(MockEngineCore pid=59432)[0m [MockEngineCore] batch_id=300, stats=None, n_arrived_reqs=0, n_finished_reqs=0, n_rejected_reqs=0
+clients:  ['0'] n_devices:  1
+INFO:     127.0.0.1:64423 - "POST /update_clients HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Creating router of type round_robin with 1 devices and kwargs: {'enable_rerouting': False, 'enable_rescheduling': False}
+INFO:SLOsServe.router.api_server:RequestPool:[update_config]: {'enable_rerouting': False, 'enable_rescheduling': False} round_robin, Enable Rerouting: False, Enable Rescheduling: False
+INFO:SLOsServe.router.api_server:Updated router: <__main__.RoundRobinRouter object at 0x12fb21d20>
+[36m(EngineWorker pid=59435)[0m Using blocking ray.get inside async actor. This blocks the event loop. Please use `await` on object ref with asyncio.gather if you want to yield execution to the event loop instead.
+INFO:SLOsServe.router.api_server:Updated config for 0th client=0
+[36m(EngineWorker pid=59435)[0m INFO 11-27 23:02:13 [__init__.py:241] Automatically detected platform cpu.
+INFO:     127.0.0.1:64423 - "POST /update_config HTTP/1.1" 200 OK
+[36m(EngineWorker pid=59435)[0m INFO:SLOsServe.router.mock_engine:MockEngineCore created: Actor(MockEngineCore, d654efd53d00f5779c48765b01000000)
+[36m(EngineWorker pid=59435)[0m INFO:SLOsServe.router.mock_engine:MockEngine started: Actor(MockEngineCore, d654efd53d00f5779c48765b01000000)
+[36m(pid=gcs_server)[0m [2025-11-27 23:02:20,235 E 59388 412757] (gcs_server) gcs_server.cc:303: Failed to establish connection to the event+metrics exporter agent. Events and metrics will not be exported. Exporter agent status: RpcError: Running out of retries to initialize the metrics agent. rpc_code: 14
+[33m(raylet)[0m [2025-11-27 23:02:21,036 E 59424 413058] (raylet) main.cc:979: Failed to establish connection to the metrics exporter agent. Metrics will not be exported. Exporter agent status: RpcError: Running out of retries to initialize the metrics agent. rpc_code: 14
+[36m(EngineWorker pid=59435)[0m [2025-11-27 23:02:21,864 E 59435 413354] core_worker_process.cc:837: Failed to establish connection to the metrics exporter agent. Metrics will not be exported. Exporter agent status: RpcError: Running out of retries to initialize the metrics agent. rpc_code: 14
+[2025-11-27 23:02:21,963 E 59384 413109] core_worker_process.cc:837: Failed to establish connection to the metrics exporter agent. Metrics will not be exported. Exporter agent status: RpcError: Running out of retries to initialize the metrics agent. rpc_code: 14
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m INFO 11-27 23:02:18 [scheduler_adm_ctrl.py:188] SchedulerAdmCtrl::init
+[36m(MockEngineCore pid=59428)[0m init kv cache manager, enable_caching:  True
+[36m(MockEngineCore pid=59428)[0m [AdmCtrlScheduler] setting ARBatchPlanner with tpots: 0  and hardware_params: 5.1e-05 1.69e-05 8e-08 0 0.014 max BS: 16384, fixed_bs: 0
+[36m(MockEngineCore pid=59428)[0m BatchPlanner name: ARBatchPlanner
+[36m(MockEngineCore pid=59428)[0m T = max(
+[36m(MockEngineCore pid=59428)[0m 5.1e-05 * n_tokens + 1.69e-05 * n_reqs + 8e-08 * n_past_tokens + 0 * decode_steps + 0.014,
+[36m(MockEngineCore pid=59428)[0m )
+[36m(MockEngineCore pid=59428)[0m max BS: 16384
+[36m(MockEngineCore pid=59428)[0m fixed BS: 0
+[36m(MockEngineCore pid=59428)[0m continuous: 0
+[36m(MockEngineCore pid=59428)[0m INFO 11-27 23:02:18 [scheduler_adm_ctrl.py:329] fetching perf model for model_name: Qwen/Qwen2.5-7B-Instruct and length_pattern: default
+[36m(MockEngineCore pid=59428)[0m INFO 11-27 23:02:18 [scheduler_adm_ctrl.py:330] perf model hardware_params (k1,k2,k3,k4,b): [5.1e-05, 1.69e-05, 8e-08, 0, 0.014]
+[36m(MockEngineCore pid=59428)[0m INFO 11-27 23:02:18 [scheduler_adm_ctrl.py:331] updating slosserve scheduler with TPOT: 0.0 and hardware_params: [5.1e-05, 1.69e-05, 8e-08, 0, 0.014]
+[36m(MockEngineCore pid=59428)[0m INFO 11-27 23:02:18 [scheduler_adm_ctrl.py:345] Timer: <vllm.v1.core.sched.scheduler_adm_ctrl.DefaultTimer object at 0x17fdea1a0>
+[36m(MockEngineCore pid=59428)[0m kv cache manager initialized <vllm.v1.core.kv_cache_manager.KVCacheManager object at 0x383932da0>
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=0, stats=None, n_arrived_reqs=0, n_finished_reqs=0, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m INFO 11-27 23:02:18 [scheduler_adm_ctrl.py:363] SchedulerAdmCtrl::reset
+[36m(MockEngineCore pid=59428)[0m init kv cache manager, enable_caching:  True
+[36m(MockEngineCore pid=59428)[0m [AdmCtrlScheduler] setting ARBatchPlanner with tpots: 0.025  and hardware_params: 5.55e-05 0 9e-08 0 0.019 max BS: 16384, fixed_bs: 0
+[36m(MockEngineCore pid=59428)[0m BatchPlanner name: ARBatchPlanner
+[36m(MockEngineCore pid=59428)[0m T = max(
+[36m(MockEngineCore pid=59428)[0m 5.55e-05 * n_tokens + 0 * n_reqs + 9e-08 * n_past_tokens + 0 * decode_steps + 0.019,
+[36m(MockEngineCore pid=59428)[0m )
+[36m(MockEngineCore pid=59428)[0m max BS: 16384
+[36m(MockEngineCore pid=59428)[0m fixed BS: 0
+[36m(MockEngineCore pid=59428)[0m continuous: 0
+[36m(MockEngineCore pid=59428)[0m INFO 11-27 23:02:18 [scheduler_adm_ctrl.py:498] fetching perf model for model_name: Qwen/Qwen2.5-7B-Instruct and length_pattern: azure_chat_23
+[36m(MockEngineCore pid=59428)[0m INFO 11-27 23:02:18 [scheduler_adm_ctrl.py:499] updating slosserve scheduler with TPOT: 0.025 and hardware_params: [5.55e-05, 0.0, 9e-08, 0, 0.019]
+[36m(MockEngineCore pid=59428)[0m INFO 11-27 23:02:18 [scheduler_adm_ctrl.py:513] Timer: <vllm.v1.core.sched.scheduler_adm_ctrl.DefaultTimer object at 0x17fde9a80>
+[36m(MockEngineCore pid=59428)[0m INFO 11-27 23:02:18 [scheduler_adm_ctrl.py:517] SchedulerAdmCtrl::reset SchedulerConfig(runner_type='generate', max_num_batched_tokens=2048, prefill_only_max_num_batched_tokens=2048, decode_max_num_batched_tokens=256, max_num_seqs=512, max_model_len=32768, max_num_partial_prefills=1, max_long_partial_prefills=1, long_prefill_token_threshold=2048, num_lookahead_slots=0, cuda_graph_sizes=[256], delay_factor=0.0, enable_chunked_prefill=True, is_multimodal_model=False, max_num_encoder_input_tokens=2048, encoder_cache_size=2048, preemption_mode=None, send_delta_data=False, policy='fcfs', chunked_prefill_enabled=True, disable_chunked_mm_input=False, scheduler_cls='vllm.v1.core.sched.scheduler_adm_ctrl.SchedulerAdmCtrl', disable_hybrid_kv_cache_manager=False, async_scheduling=False, scheduling_policy='vllm-sarathi', allow_rejection=False, slo_ttft_per_token=0.0001665, slo_ttft_constant=0.042, slo_tpot=0.025, scheduling_overhead=0.005, engine_id=0, queue_length_threshold=None, max_decoding_length=937, is_mock_connector=True, slosserve_token_headroom=1, admission_mode='anytime', length_pattern='azure_chat_23', model_name='Qwen/Qwen2.5-7B-Instruct', record_events=False), max_num_batched_tokens: 2048
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=100, stats=None, n_arrived_reqs=0, n_finished_reqs=0, n_rejected_reqs=0
+[36m(pid=59428)[0m INFO 11-27 23:02:17 [__init__.py:241] Automatically detected platform cpu.
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=200, stats=None, n_arrived_reqs=0, n_finished_reqs=0, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=300, stats=None, n_arrived_reqs=0, n_finished_reqs=0, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=400, stats=None, n_arrived_reqs=0, n_finished_reqs=0, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=500, stats=None, n_arrived_reqs=0, n_finished_reqs=0, n_rejected_reqs=0
+INFO:     127.0.0.1:64465 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64467 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64469 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64473 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64474 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64476 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=5, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=2, running_size=3, n_requests=5)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64478 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64481 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64482 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64484 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64488 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64489 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64491 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64493 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=10, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=13)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64495 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=600, stats=None, n_arrived_reqs=15, n_finished_reqs=1, n_rejected_reqs=0
+INFO:     127.0.0.1:64497 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64499 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64501 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64503 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=15, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=1, running_size=14, n_requests=17)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64505 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64507 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64509 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64511 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64513 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64516 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64517 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=20, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=1, running_size=18, n_requests=21)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64519 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64521 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64524 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64525 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64527 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64529 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=700, stats=None, n_arrived_reqs=31, n_finished_reqs=13, n_rejected_reqs=0
+INFO:     127.0.0.1:64532 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64533 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=25, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=4, running_size=17, n_requests=18)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64535 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64537 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64541 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64542 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64543 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64545 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64547 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=30, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=5, past_utilization=0, future_utilization=0, waiting_size=4, running_size=18, n_requests=23)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64549 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64553 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64554 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64557 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64559 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64562 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64563 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64565 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=35, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=0, running_size=22, n_requests=24)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=800, stats=None, n_arrived_reqs=46, n_finished_reqs=24, n_rejected_reqs=0
+INFO:     127.0.0.1:64567 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64569 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64571 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64577 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64579 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64581 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64584 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=40, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=23, n_requests=31)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64586 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64588 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64590 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64594 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=900, stats=None, n_arrived_reqs=59, n_finished_reqs=33, n_rejected_reqs=0
+INFO:     127.0.0.1:64597 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64598 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64601 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64602 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64604 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=45, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=5, past_utilization=0, future_utilization=0, waiting_size=0, running_size=26, n_requests=38)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64606 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64610 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64611 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64612 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64615 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64618 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64620 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=50, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=5, past_utilization=0, future_utilization=0, waiting_size=5, running_size=29, n_requests=42)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64622 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64624 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64626 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64628 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64630 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64632 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=55, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=3, running_size=33, n_requests=47)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64634 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64636 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64638 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64640 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=1000, stats=None, n_arrived_reqs=80, n_finished_reqs=44, n_rejected_reqs=0
+INFO:     127.0.0.1:64642 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=60, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=0, running_size=36, n_requests=53)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64645 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64646 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64648 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64650 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64652 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64654 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64656 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=65, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=3, running_size=36, n_requests=58)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64658 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64660 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64662 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64664 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64666 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=70, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=2, running_size=37, n_requests=63)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64669 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64670 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64673 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64674 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64676 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64678 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64680 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64682 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64684 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=75, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=6, past_utilization=0, future_utilization=0, waiting_size=7, running_size=36, n_requests=70)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64686 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64688 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64690 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=1100, stats=None, n_arrived_reqs=105, n_finished_reqs=59, n_rejected_reqs=0
+INFO:     127.0.0.1:64692 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64695 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64696 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64698 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64700 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=80, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=6, past_utilization=0, future_utilization=0, waiting_size=6, running_size=40, n_requests=76)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64703 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64704 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64707 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64708 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64710 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64712 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64714 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64716 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64718 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=85, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=84)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64720 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64722 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64724 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64726 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64728 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=90, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=15, running_size=32, n_requests=89)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64731 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64733 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64735 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64737 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=1200, stats=None, n_arrived_reqs=130, n_finished_reqs=82, n_rejected_reqs=0
+INFO:     127.0.0.1:64739 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64742 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64743 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=95, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=13, running_size=34, n_requests=94)]
+INFO:     127.0.0.1:64746 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64747 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64749 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64754 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64755 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64756 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64758 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64760 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=100, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=11, running_size=35, n_requests=101)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64762 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64764 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64766 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64768 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64770 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=105, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=14, running_size=34, n_requests=104)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64772 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64774 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64776 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64778 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64780 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64783 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64784 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64788 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64789 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64790 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=110, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=13, running_size=37, n_requests=110)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=1300, stats=None, n_arrived_reqs=153, n_finished_reqs=100, n_rejected_reqs=0
+INFO:     127.0.0.1:64792 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64794 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64796 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64799 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64800 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64802 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=115, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=15, running_size=42, n_requests=113)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64804 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64806 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64809 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64810 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64812 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64814 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=120, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=14, running_size=42, n_requests=118)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64817 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64819 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64821 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64823 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64825 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64827 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=1400, stats=None, n_arrived_reqs=172, n_finished_reqs=112, n_rejected_reqs=0
+INFO:     127.0.0.1:64829 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=125, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=16, running_size=45, n_requests=124)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64831 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64833 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64835 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64837 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64839 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64841 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64843 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=130, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=15, running_size=43, n_requests=129)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64846 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64848 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64850 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64854 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64855 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64857 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64859 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=135, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=16, running_size=42, n_requests=133)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=1500, stats=None, n_arrived_reqs=187, n_finished_reqs=129, n_rejected_reqs=0
+INFO:     127.0.0.1:64861 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64863 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64867 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64869 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64871 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64873 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64875 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64877 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64880 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64881 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=140, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=18, running_size=38, n_requests=139)]
+INFO:     127.0.0.1:64883 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64887 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64888 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64889 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64892 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64893 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64895 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64898 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64899 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=145, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=147)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64902 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64904 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=1600, stats=None, n_arrived_reqs=209, n_finished_reqs=149, n_rejected_reqs=0
+INFO:     127.0.0.1:64906 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64908 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64910 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64912 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64916 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64917 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=150, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=18, running_size=40, n_requests=152)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64919 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64921 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64923 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64925 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64927 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64929 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64931 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=155, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=18, running_size=42, n_requests=158)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64933 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64935 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64938 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64940 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64943 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64944 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=160, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=20, running_size=40, n_requests=159)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=1700, stats=None, n_arrived_reqs=226, n_finished_reqs=166, n_rejected_reqs=0
+INFO:     127.0.0.1:64947 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64951 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64954 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64956 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64959 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64961 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=165, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=17, running_size=32, n_requests=160)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64963 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64965 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64967 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64970 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64971 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64973 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64975 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=170, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=5, past_utilization=0, future_utilization=0, waiting_size=18, running_size=30, n_requests=167)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64977 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64979 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=1800, stats=None, n_arrived_reqs=241, n_finished_reqs=193, n_rejected_reqs=0
+INFO:     127.0.0.1:64981 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64983 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64985 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=175, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=18, running_size=30, n_requests=170)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64987 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64989 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64991 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64994 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64995 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64998 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:64999 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65002 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65003 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65005 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=180, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=18, running_size=30, n_requests=177)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65007 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65009 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m WARNING 11-27 23:03:17 [scheduler_adm_ctrl.py:1279] LONG SCHEDULING: [('allocate_slots_3->allocate_slots_3', 0.1367664337158203), ('kv_xfer->stateless_schedule_fn', 0.00011706352233886719), ('get_common_prefix_blocks->get_scheduler_output', 5.0067901611328125e-05), ('allocate_slots_3->allocate_memory_32', 1.4066696166992188e-05), ('failed_requests->get_common_prefix_blocks', 1.1920928955078125e-05), ('preempted_reqs->allocate_slots_3', 1.0013580322265625e-05), ('get_scheduler_output->end', 9.059906005859375e-06), ('START->kv_xfer', 4.0531158447265625e-06), ('stateless_schedule_fn->preempted_reqs', 3.0994415283203125e-06), ('allocate_memory_32->failed_requests', 1.1920928955078125e-06)], time: 0.13698697090148926, # waiting: 20, # running: 32
+INFO:     127.0.0.1:65011 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65013 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65015 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65017 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=185, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=185)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65019 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65021 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65024 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65025 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65027 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=1900, stats=None, n_arrived_reqs=263, n_finished_reqs=209, n_rejected_reqs=0
+INFO:     127.0.0.1:65029 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65031 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=190, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=0, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=187)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65033 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65035 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65037 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65039 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65041 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=195, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=17, running_size=36, n_requests=187)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65043 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65045 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65047 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65049 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=2000, stats=None, n_arrived_reqs=275, n_finished_reqs=226, n_rejected_reqs=0
+INFO:     127.0.0.1:65051 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65053 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=200, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=15, running_size=34, n_requests=192)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65055 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65057 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65059 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65061 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65063 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65066 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65067 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=205, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=195)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65069 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65071 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65073 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65076 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65077 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65079 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=210, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=14, running_size=33, n_requests=200)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=2100, stats=None, n_arrived_reqs=293, n_finished_reqs=245, n_rejected_reqs=0
+INFO:     127.0.0.1:65081 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65083 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65085 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65087 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65089 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65091 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=215, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=203)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65093 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65095 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65098 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65099 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65101 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65103 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65105 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=220, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=17, running_size=31, n_requests=207)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65107 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65109 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=2200, stats=None, n_arrived_reqs=308, n_finished_reqs=260, n_rejected_reqs=0
+INFO:     127.0.0.1:65112 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65113 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65116 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65117 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65119 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=225, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=212)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65121 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65123 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65125 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65127 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65129 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65131 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=230, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=5, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=214)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65133 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65135 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65137 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65139 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65141 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65143 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=235, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=218)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65145 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65148 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65149 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65152 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65155 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65156 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65158 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=240, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=5, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=225)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65160 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=2300, stats=None, n_arrived_reqs=329, n_finished_reqs=276, n_rejected_reqs=0
+INFO:     127.0.0.1:65163 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65165 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65168 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65171 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=245, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=226)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65173 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65175 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65179 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65181 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65183 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65185 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=250, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=230)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65187 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65189 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65191 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65193 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65195 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=255, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=234)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65198 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65199 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65201 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65204 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65205 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65207 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65210 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65211 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=260, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=6, past_utilization=0, future_utilization=0, waiting_size=17, running_size=36, n_requests=241)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65213 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=2400, stats=None, n_arrived_reqs=351, n_finished_reqs=295, n_rejected_reqs=0
+INFO:     127.0.0.1:65215 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65217 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65219 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65221 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=265, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=17, running_size=42, n_requests=246)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65223 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65226 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65227 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65229 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65231 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65233 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65236 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=270, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=252)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65238 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65240 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65242 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65244 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65247 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65248 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=275, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=257)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65250 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65252 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65254 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65256 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=2500, stats=None, n_arrived_reqs=373, n_finished_reqs=316, n_rejected_reqs=0
+INFO:     127.0.0.1:65258 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=280, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=263)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65260 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65262 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65264 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65268 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65269 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65272 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65273 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=285, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=266)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65275 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65277 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65279 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65281 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65283 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=290, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=16, running_size=41, n_requests=271)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65286 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65288 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65290 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65293 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65294 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=2600, stats=None, n_arrived_reqs=391, n_finished_reqs=336, n_rejected_reqs=0
+INFO:     127.0.0.1:65296 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65298 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=295, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=19, running_size=39, n_requests=278)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65302 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65303 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65304 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65306 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65308 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65310 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65312 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=300, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=281)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65316 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65317 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65319 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65322 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65323 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65325 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65327 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=2700, stats=None, n_arrived_reqs=410, n_finished_reqs=353, n_rejected_reqs=0
+INFO:     127.0.0.1:65329 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=305, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=287)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65331 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65334 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65337 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65339 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65341 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=310, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=13, running_size=41, n_requests=287)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65344 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65346 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65348 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65350 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65352 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=315, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=290)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65354 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65356 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65358 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65361 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65362 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65364 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=320, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=5, past_utilization=0, future_utilization=0, waiting_size=12, running_size=42, n_requests=295)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65366 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=2800, stats=None, n_arrived_reqs=425, n_finished_reqs=372, n_rejected_reqs=0
+INFO:     127.0.0.1:65368 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65371 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65372 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65375 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65377 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65379 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=325, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=15, running_size=40, n_requests=298)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65381 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65384 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65386 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65388 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65390 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65392 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=330, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=303)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65394 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65397 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=2900, stats=None, n_arrived_reqs=441, n_finished_reqs=390, n_rejected_reqs=0
+INFO:     127.0.0.1:65401 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65406 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65409 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65410 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65412 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=335, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=307)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65415 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65417 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65420 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65423 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65424 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65427 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=340, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=10, running_size=32, n_requests=314)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=3000, stats=None, n_arrived_reqs=452, n_finished_reqs=410, n_rejected_reqs=0
+INFO:     127.0.0.1:65429 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65431 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65433 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65435 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65437 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=345, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=316)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65439 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65441 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65444 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65445 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65447 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65449 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65451 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65453 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=350, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=9, running_size=33, n_requests=319)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65455 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65457 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65459 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=3100, stats=None, n_arrived_reqs=467, n_finished_reqs=426, n_rejected_reqs=0
+INFO:     127.0.0.1:65461 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65463 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=355, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=1, past_utilization=0, future_utilization=0, waiting_size=9, running_size=32, n_requests=325)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65465 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65467 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65470 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65471 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65473 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65476 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65477 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65479 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=360, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=6, past_utilization=0, future_utilization=0, waiting_size=9, running_size=34, n_requests=329)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65481 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65483 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65485 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65487 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65489 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=365, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=333)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65491 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65493 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65496 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65497 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65499 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65502 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65503 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65505 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=370, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=5, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=340)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=3200, stats=None, n_arrived_reqs=488, n_finished_reqs=441, n_rejected_reqs=0
+INFO:     127.0.0.1:65507 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65510 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65511 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65513 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m WARNING 11-27 23:04:09 [scheduler_adm_ctrl.py:1279] LONG SCHEDULING: [('get_common_prefix_blocks->get_scheduler_output', 0.20771479606628418), ('allocate_slots_3->allocate_slots_3', 0.00018668174743652344), ('kv_xfer->stateless_schedule_fn', 0.0001499652862548828), ('get_computed_blocks->allocate_slots_1', 3.600120544433594e-05), ('get_scheduler_output->end', 1.4066696166992188e-05), ('preempted_reqs->allocate_slots_3', 1.0013580322265625e-05), ('failed_requests->get_common_prefix_blocks', 6.198883056640625e-06), ('stateless_schedule_fn->preempted_reqs', 4.76837158203125e-06), ('START->kv_xfer', 3.814697265625e-06), ('allocate_slots_3->get_computed_blocks', 2.86102294921875e-06), ('allocate_slots_1->allocate_memory_38', 2.1457672119140625e-06), ('allocate_memory_38->failed_requests', 0.0)], time: 0.2081313133239746, # waiting: 10, # running: 38
+INFO:     127.0.0.1:65515 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65517 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65519 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65521 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=375, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=10, running_size=38, n_requests=346)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65523 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65525 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65527 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=3300, stats=None, n_arrived_reqs=506, n_finished_reqs=454, n_rejected_reqs=0
+INFO:     127.0.0.1:65531 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65532 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:65534 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49155 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49157 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=380, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=344)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49159 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49161 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49163 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49165 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49167 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49169 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=385, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=5, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=349)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49171 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49174 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49175 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49177 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49179 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49181 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49183 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=390, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=354)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49185 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49187 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49189 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49191 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49193 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=395, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=358)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49195 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=3400, stats=None, n_arrived_reqs=524, n_finished_reqs=470, n_rejected_reqs=0
+INFO:     127.0.0.1:49197 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49199 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49201 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49203 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49205 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49207 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=400, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=9, running_size=44, n_requests=362)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49209 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49211 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49214 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49215 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49217 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49219 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=405, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=367)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49221 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49223 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49225 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=3500, stats=None, n_arrived_reqs=540, n_finished_reqs=488, n_rejected_reqs=0
+INFO:     127.0.0.1:49228 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49229 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49231 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=410, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=371)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49234 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49235 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49238 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49239 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49242 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49244 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49246 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=415, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=2, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=374)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49248 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49250 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49252 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49255 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49256 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49258 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49260 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=420, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=379)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49262 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49264 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49266 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49268 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49270 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49272 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49274 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=425, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=5, past_utilization=0, future_utilization=0, waiting_size=9, running_size=50, n_requests=387)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=3600, stats=None, n_arrived_reqs=562, n_finished_reqs=504, n_rejected_reqs=0
+INFO:     127.0.0.1:49276 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49278 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49280 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49282 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49284 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49286 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=430, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=391)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49288 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49290 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49292 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49294 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49296 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49298 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=435, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=394)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49300 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49302 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49304 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49306 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49308 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=440, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=11, running_size=41, n_requests=398)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49310 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49312 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=3700, stats=None, n_arrived_reqs=585, n_finished_reqs=533, n_rejected_reqs=0
+INFO:     127.0.0.1:49315 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49316 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49318 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49320 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=445, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=3, past_utilization=0, future_utilization=0, waiting_size=0, running_size=0, n_requests=402)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49322 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49324 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49327 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49328 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49330 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49332 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Routing loop: routing_iter=450, load_statistics=[DeviceStat(device_id=0, rejection_rate=0.0, n_considered=4, past_utilization=0, future_utilization=0, waiting_size=10, running_size=44, n_requests=408)]
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49334 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49336 - "POST /v1/completions HTTP/1.1" 200 OK
+INFO:SLOsServe.router.api_server:Received /v1/completions request
+INFO:     127.0.0.1:49338 - "POST /v1/completions HTTP/1.1" 200 OK
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=3800, stats=None, n_arrived_reqs=601, n_finished_reqs=548, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=3900, stats=None, n_arrived_reqs=601, n_finished_reqs=566, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=4000, stats=None, n_arrived_reqs=601, n_finished_reqs=579, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=4100, stats=None, n_arrived_reqs=601, n_finished_reqs=596, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=4200, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=4300, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=4400, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=4500, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=4600, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=4700, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=4800, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=4900, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=5000, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=5100, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=5200, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=5300, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=5400, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=5500, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=5600, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=5700, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=5800, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=5900, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=6000, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=6100, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=6200, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=6300, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=6400, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=6500, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=6600, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=6700, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m 
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=6800, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=6900, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=7000, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=7100, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=7200, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=7300, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=7400, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=7500, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=7600, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=7700, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=7800, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=7900, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=8000, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=8100, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=8200, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=8300, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=8400, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=8500, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=8600, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=8700, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=8800, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=8900, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=9000, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=9100, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=9200, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=9300, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=9400, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=9500, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+INFO:SLOsServe.router.api_server:Dumping profile events to experiments_results/sarathi_rr_bszd256/Qwen-7B_constant_azure_chat_23:azure_chat_23_3979:4580_anytime_0.0/sarathi_round_robin_1.0_1_anytime_3.0_0.025.0.events.jsonl
+INFO:SLOsServe.router.api_server:Dumping profile events from client 0
+INFO:SLOsServe.router.api_server:Dumped 7117 events to experiments_results/sarathi_rr_bszd256/Qwen-7B_constant_azure_chat_23:azure_chat_23_3979:4580_anytime_0.0/sarathi_round_robin_1.0_1_anytime_3.0_0.025.0.events.jsonl, example: {'event_type': 'arrival-router', 'zero_load_ttft': 0.037421, 'device_id': -1, 'timestamp': 1764302548.539615, 'request_id': '5debdf7b-3333-4578-8959-f71c556e9330', 'prefill_ddl': 1764302548.7018778, 'profit': 1.0, 'prompt_tokens': 422, 'max_tokens': 115}
+INFO:SLOsServe.router.api_server:Dumped 601 admission history to experiments_results/sarathi_rr_bszd256/Qwen-7B_constant_azure_chat_23:azure_chat_23_3979:4580_anytime_0.0/sarathi_round_robin_1.0_1_anytime_3.0_0.025.0.events.jsonl
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=9600, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=9700, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=9800, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=9900, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=10000, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=10100, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=10200, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=10300, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=10400, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=10500, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=10600, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=10700, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=10800, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=10900, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=11000, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=11100, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=11200, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=11300, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=11400, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=11500, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=11600, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=11700, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=11800, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=11900, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=12000, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=12100, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=12200, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=12300, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=12400, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=12500, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=12600, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=12700, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=12800, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=12900, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=13000, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+INFO:     127.0.0.1:49358 - "POST /dump_profile_events HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [59384]
+[36m(pid=59431)[0m [2025-11-27 23:02:21,950 E 59431 413476] core_worker_process.cc:837: Failed to establish connection to the metrics exporter agent. Metrics will not be exported. Exporter agent status: RpcError: Running out of retries to initialize the metrics agent. rpc_code: 14[32m [repeated 5x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=13100, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=13200, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
+[36m(MockEngineCore pid=59428)[0m [MockEngineCore] batch_id=13300, stats=None, n_arrived_reqs=601, n_finished_reqs=601, n_rejected_reqs=0
