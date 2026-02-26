@@ -325,6 +325,23 @@ def download_dataset(dataset_name: str):
                     logger.info(f"Processed {idx} requests so far...")
                 requests.append(future.result())
         logger.info(f"Finished processing all requests for {dataset_name}.")
+    
+    elif dataset_name == "reasoning":
+        import tqdm
+        from datasets import load_dataset
+        ds = load_dataset("simplescaling/s1K")['train']
+        requests = []
+        for dp in tqdm.tqdm(ds):
+            prompt_len = len(tokenizer(dp['question']).input_ids)
+            reasoning_len = len(tokenizer(dp['thinking_trajectories'][0]).input_ids)
+            response_len = len(tokenizer(dp['attempt']).input_ids)
+            req = Request(
+                prompt = dp['question'],
+                input_length = prompt_len,
+                output_length = reasoning_len + response_len,
+                thinking_length=reasoning_len
+            )
+            requests.append(req)
     else: 
         logger.error(f'Dataset {dataset_name} not found')
         raise ValueError(f'Dataset {dataset_name} not found')
@@ -346,10 +363,11 @@ if __name__ == '__main__':
             logger.error(f"Failed to download {dataset_name}: {e}")
     
     datasets_to_download = [
-        'azure_code',
-        'azure_chat', 
-        'azure_chat_23',
-        'azure_code_23',
+        'reasoning'
+        # 'azure_code',
+        # 'azure_chat', 
+        # 'azure_chat_23',
+        # 'azure_code_23',
         # 'sharegpt_chat',
         # 'sharegpt_code',
         # 'burstgpt',
