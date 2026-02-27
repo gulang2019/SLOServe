@@ -228,6 +228,9 @@ class Requests:
     @staticmethod
     @lru_cache(maxsize=None)
     def load(name: str, max_tokens: int = None, window_start: int = 0, window_end: int = None): 
+        if window_start is not None: 
+            window_start = int(window_start)
+        if window_end is not None: window_end = int(window_end)
         path = os.path.join(DATASET_DIR, f'{name}.requests.pkl')
         with open(path, 'rb') as f:
             obj = pickle.load(f)
@@ -321,6 +324,15 @@ class ArrivalTimes:
     @staticmethod
     @lru_cache(maxsize=None)
     def load(name: str, load_scale: float = 1, window_start: int = 0, window_end: int = None):
+        use_timing = False 
+        if isinstance(window_start, str): 
+            if window_start.startswith('t'):
+                window_start = window_start[1:]
+                use_timing = True 
+        if not window_start is None:
+            window_start = int(window_start)
+        if not window_end is None:
+            window_end = int(window_end)
         if name.startswith('bursty'):
             burstiness_level = name.split('_')[1]
             traces = generate_bursty_trace(burstiness_level=float(burstiness_level))
@@ -332,7 +344,10 @@ class ArrivalTimes:
         # assert obj.name == name
             print(f'Loaded {name} from {path}')
             if window_end is not None:
-                obj.arrival_times = obj.arrival_times[window_start:window_end]
+                if use_timing:
+                    obj.arrival_times = [t for t in obj.arrival_times if (t >= window_start and t <= window_end)]
+                else:
+                    obj.arrival_times = obj.arrival_times[window_start:window_end]
         obj.set_load_scale(load_scale)
         return obj
     
