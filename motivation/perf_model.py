@@ -338,7 +338,10 @@ if __name__ == '__main__':
     #     'experiments/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4579_anytime/slosserve-edf_round_robin_1.0_5_anytime_3.0_0.025.events.jsonl'
     # ]
     gemma27b_filepaths = [
-        'experiments/Gemma-3-27B-IT_constant_azure_chat_23:azure_chat_23_600:1201_anytime/slosserve-edf_round_robin_0.5_1_anytime_5.0_0.1.events.jsonl',
+        # 'experiments/Gemma-3-27B-IT_constant_azure_chat_23:azure_chat_23_600:1201_anytime/slosserve-edf_round_robin_0.5_1_anytime_5.0_0.1.events.jsonl',
+        # "experiments/Gemma-3-27B-IT_constant_sharegpt_code:azure_code_23_3979:4580_anytime_0.0/slosserve-edf_round_robin_0.3_1_anytime_3.0_0.05.events.jsonl",
+        # "experiments/Gemma-3-27B-IT_constant_sharegpt_code:azure_code_23_3978:4580_anytime_0.0/slosserve-edf_round_robin_0.3_1_anytime_3.0_0.05.events.jsonl",
+        "experiments/Gemma-3-27B-IT_constant_sharegpt_code:azure_code_23_3978:4580_anytime_0.0/slosserve-edf_round_robin_0.3_1_anytime_3.0_0.05.events.jsonl"
         # 'experiments/Gemma-3-27B-IT_constant_arxiv_summary:burstgpt_GPT-4_Conversation log_400:600_anytime/slosserve-edf_round_robin_8.0_1_anytime_1.5_0.05.0.events.jsonl',
         # 'experiments/Gemma-3-27B-IT_constant_sharegpt_chat:azure_chat_23_600:1200_anytime/slosserve-edf_round_robin_0.5_1_anytime_1.5_0.05.events.jsonl',
         # 'experiments/Gemma-3-27B-IT_constant_sharegpt_code:azure_code_23_3979:4580_anytime/slosserve-edf_round_robin_0.4_1_anytime_3.0_0.05.events.jsonl'
@@ -347,15 +350,19 @@ if __name__ == '__main__':
    
     def predictor(batch: "Batch") -> float:
         return 6.565e-5 * batch.total_current_length + 8.00e-8 * batch.total_past_tokens + 1.3e-2
+    # def gemma27b_predictor(batch: "Batch") -> float:
+    #     return 7.1e-5 * batch.total_current_length + 3.82e-5 * batch.num_reqs + 9.380e-8 * batch.total_past_tokens + 1.8e-2
     def gemma27b_predictor(batch: "Batch") -> float:
-        return 7.1e-5 * batch.total_current_length + 3.82e-5 * batch.num_reqs + 9.380e-8 * batch.total_past_tokens + 1.8e-2
+        return (7.69e-5 * batch.total_current_length + 5.82e-5 * batch.num_reqs + 4.380e-8 * batch.total_past_tokens + 1.9e-2) * 0.8
+    def gemma27b_predictor(batch: "Batch") -> float:
+        return (3.62e-5 * batch.total_current_length + 3.31e-5 * batch.num_reqs + 5e-8 * batch.total_past_tokens + 4.86e-8 * batch.total_multiply + 1.76e-2)
     fig, ax = plt.subplots(figsize=(5, 5), tight_layout=True)
     fit_model(gemma27b_filepaths, predictor = 'linear', ax = ax, label = '27B (H200)')
     
-    fit_model(qwne7b_filepaths, predictor = 'linear', ax = ax, label = '7B (A100)')
-    ax.legend(fontsize=20, loc='upper left')
+    # fit_model(qwne7b_filepaths, predictor = 'linear', ax = ax, label = '7B (A100)')
+    # ax.legend(fontsize=20, loc='upper left')
     ax.plot([0, 0.1], [0, 0.1], 'k--', linewidth=2)
     ax.set_xlabel('Real Time (s)')
     ax.set_ylabel('Predicted Time (s)')
-    fig.savefig('figs/perf_model.png', dpi=200)
-    fig.savefig('figs/perf_model.pdf', dpi=200)
+    fig.savefig('figs/perf_model_27b.png', dpi=200)
+    fig.savefig('figs/perf_model_27b.pdf', dpi=200)

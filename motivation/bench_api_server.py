@@ -34,6 +34,7 @@ class Problem:
     arrival_pattern: str = 'azure_code_23'
     length_pattern: str = 'azure_code_23'
     window: str = '0:10'
+    perf_model_err: float = 1.0 # the factor between used performance model and real performance model.
     
     # runtime config
     load_scale: float = 1.0 
@@ -57,6 +58,8 @@ class Problem:
     # policies
     routing_policy: str = 'slo'
     routing_kwargs: dict = field(default_factory=lambda: {'hardware_params': [4.1e-5, 0, 1.3e-2], 'tpot': 0.05, 'device_mem': 16384, 'block_size': 16})
+    routing_overhead: float = -1.0
+    routing_fallback_policy: str = 'asap'
     
     scheduling_policy: str = 'vllm'
     scheduling_kwargs: dict = field(default_factory=lambda: {'max_num_seqs': 128, 'max_num_batched_tokens': 512, 'long_prefill_token_threshold': 256, 'enable_chunked_prefill': False, 'enable_admission': True, 'allow_rejection': True})
@@ -145,6 +148,7 @@ async def run_request(end_point: str,
                     zero_load_ttft: float,
                     ttft_slo_scale: float,
                     slo_routing_overhead: float,
+                    slo_tpot: float, 
                     expected_profit: float) -> Tuple[str, List[float]]:
         timestamps = []
         response_text = ""
@@ -166,6 +170,7 @@ async def run_request(end_point: str,
                 # 'prefill_ddl': arrival_time + ttft_slo,
                 'zero_load_ttft': zero_load_ttft,
                 'slo_ttft': zero_load_ttft * ttft_slo_scale + slo_routing_overhead,
+                'slo_tpot': slo_tpot,
                 'profit': expected_profit,
                 'request_id': request_id
             }
@@ -195,6 +200,10 @@ async def run_request(end_point: str,
                     obj = json.loads(payload_text)
                     if 'finish_reason' in obj:
                         is_rejected = obj['finish_reason'] and 'rejected' in obj['finish_reason']
+                        if obj['finish_reason'] == 'error':
+                            raise RuntimeError(obj.get('error', 'backend error'))
+                except RuntimeError:
+                    raise
                 except Exception as e:
                     if not 'done' in line.lower():
                         logger.error(f"Error parsing SSE line for request_id={request_id}: {e}, line: {line}")
@@ -203,8 +212,11 @@ async def run_request(end_point: str,
                 n_tokens = 1
                 if 'token_ids' in obj:
                     n_tokens = len(obj['token_ids'])
+                chunk_ts = obj.get('timestamp', None)
+                if not isinstance(chunk_ts, (int, float)):
+                    chunk_ts = None
                 for _ in range(n_tokens):
-                    timestamps.append(time.time())
+                    timestamps.append(float(chunk_ts) if chunk_ts is not None else time.time())
                 chunks.append(obj)
             logger.info(f"Streaming response finished: request_id={request_id}")
         # print(f'Request {request_id} finished with {len(timestamps)} timestamps IL: {input_length} OL: {output_length} .')
@@ -266,20 +278,20 @@ def ensure_prompts_present(requests: List[Request], model_name: str) -> None:
             requests[req_idx].prompt = decoded_batch[i]
 
 async def main(problem: Problem, endpoint: str, clients: str):
-    window_start, window_end = map(int, problem.window.split(':'))
-    
-    requests = Requests.load(problem.length_pattern, 
-                             window_start = window_start,
-                             window_end = window_end,
-                             max_tokens = get_model_max_tokens(problem.model_name))
+    window_start, window_end = problem.window.split(':')
     arrival_times = ArrivalTimes.load(problem.arrival_pattern, 
                                       problem.load_scale, 
                                       window_start = window_start, 
                                       window_end = window_end)
-    
+    print('arrival_times:', arrival_times.arrival_times[0], '->', arrival_times.arrival_times[-1])
+    requests = Requests.load(problem.length_pattern, 
+                            window_start = 0,
+                            window_end = len(arrival_times.arrival_times),
+                            max_tokens = get_model_max_tokens(problem.model_name))
     requests = requests.requests
     arrival_times = arrival_times.arrival_times
     arrival_times = [t - arrival_times[0] for t in arrival_times]
+    rps = len(arrival_times) / (arrival_times[-1] - arrival_times[0])
     
     from motivation.common import PerfModel
     perf_model = PerfModel.get_perf_model(problem.model_name, problem.length_pattern)
@@ -369,6 +381,7 @@ async def main(problem: Problem, endpoint: str, clients: str):
                                                     request.output_length + request.thinking_length,
                                                     zero_load_ttft = perf_model.get_zero_load_ttft(request.input_length, request.cached_length),
                                                     ttft_slo_scale = problem.ttft_slo_scale,
+                                                    slo_tpot = problem.slo_tpot,
                                                     slo_routing_overhead = problem.slo_routing_overhead,
                                                     expected_profit = problem.get_expected_profit(request.input_length)))
 
@@ -470,8 +483,8 @@ async def main(problem: Problem, endpoint: str, clients: str):
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{endpoint}/dump_profile_events",
-            json={"filename": filename, "admission_filename": admission_filename, "timeout": 30.0},
-            timeout=30.0
+            json={"filename": filename, "admission_filename": admission_filename, "timeout": 300.0},
+            timeout=300.0
         )
         response.raise_for_status()
         
@@ -489,6 +502,8 @@ async def main(problem: Problem, endpoint: str, clients: str):
             if event['event_type'] == 'batch':
                 event['req_ids'] = [backend_id_2_id(req_id) for req_id in event['req_ids']]
                 event['num_scheduled_tokens'] = {backend_id_2_id(req_id): num_scheduled_tokens for req_id, num_scheduled_tokens in event['num_scheduled_tokens'].items()}
+                if 'rejected_reqs' in event:
+                    event['rejected_reqs'] = [backend_id_2_id(req_id) for req_id in event['rejected_reqs']]
             if event['event_type'] == 'req_state':
                 event['ddl'] = apply_time_offsets(event['ddl'])
             if event['event_type'] == 'arrival':
@@ -505,7 +520,10 @@ async def main(problem: Problem, endpoint: str, clients: str):
                 estimated_batch_times[(event.get('device_id', 0), event['batch_id'])] = event['estimated_time']
         for event in events:
             if event['event_type'] == 'batch':
-                event['estimated_time'] = estimated_batch_times.get((event.get('device_id', 0), event['batch_id']), 0)
+                event['estimated_time'] = estimated_batch_times.get(
+                    (event.get('device_id', 0), event['batch_id']),
+                    event.get('estimated_time', 0),
+                )
         with open(filename, 'w') as f:
             json.dump(events, f, indent=4)
     
@@ -537,7 +555,10 @@ async def main(problem: Problem, endpoint: str, clients: str):
                                     slo_tpot = problem.slo_tpot, 
                                     slo_ttft_overhead = problem.slo_routing_overhead,
                                     prefix = problem.store_prefix, 
+                                    routing_overhead = problem.routing_overhead,
+                                    n_device = problem.n_devices,
                                     draw = True)
+    results['rps'] = rps
     if os.path.exists(admission_filename):
         with open(admission_filename, 'r') as f:
             admission_history = json.load(f)
@@ -581,17 +602,26 @@ def build_problems(
     experiment_dir: str,
     slo_routing_overhead: float = 0.08,
     admission_mode: str = 'arrival',
+    perf_model_err: float = 1.0,
+    routing_overhead: float = -1.0,
+    scheduling_overhead: float = 0.0,
+    routing_fallback_policy: str = "asap"
 ):
-    store_prefix = f'{experiment_dir}/{scheduling_policy}_{routing_policy}_{load_scale}_{n_device}_{admission_mode}_{ttft_slo_scale}_{slo_tpot}'
+    store_prefix = f'{experiment_dir}/{scheduling_policy}_{routing_policy}_{load_scale}_{n_device}_{admission_mode}_{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
     
-    window_start, window_end = map(int, window.split(':'))
     if ":" in trace: 
         requests_trace, arrival_times_trace = trace.split(":")
     else:
         requests_trace = trace
         arrival_times_trace = trace
-    requests = Requests.load(requests_trace, window_start = window_start, window_end = window_end, 
-                             max_tokens = get_model_max_tokens(model_name)).requests
+    
+    window_start, window_end = window.split(':')
+    arrival_times = ArrivalTimes.load(arrival_times_trace, 
+                                      load_scale, 
+                                      window_start = window_start, 
+                                      window_end = window_end)
+    requests = Requests.load(requests_trace, window_start = 0, window_end = len(arrival_times.arrival_times), 
+                            max_tokens = get_model_max_tokens(model_name)).requests
     
     average_input_length = np.mean([request.input_length for request in requests])
     average_output_length = np.mean([request.output_length for request in requests])
@@ -665,8 +695,8 @@ def build_problems(
             'long_prefill_token_threshold': max_num_batched_tokens_vllm,
             'max_num_seqs': 512,
             'enable_chunked_prefill': True,
-            'enable_admission': True,
-            'allow_rejection': True,
+            'enable_admission': False,
+            'allow_rejection': False,
             'scheduling_policy': 'vllm-sarathi+'
         })
     
@@ -677,8 +707,8 @@ def build_problems(
             'max_num_batched_tokens': max_num_batched_tokens_vllm,
             'max_num_seqs': 512,
             'long_prefill_token_threshold': max_num_batched_tokens_vllm,
-            'enable_admission': True,
-            'allow_rejection': True,
+            'enable_admission': False,
+            'allow_rejection': False,
             'scheduling_policy': 'vllm-edf',
         })
     elif scheduling_policy == 'qlm+':
@@ -697,8 +727,18 @@ def build_problems(
             'scheduling_policy': 'edf',
             'enable_admission': True,
             "allow_rejection": True,
-            "scheduling_overhead": 0.000,
-            "slosserve_token_headroom": 1
+            "scheduling_overhead": 0.005,
+            "slosserve_token_headroom": 1,
+            "max_num_batched_tokens": 4096
+        })
+        
+    elif scheduling_policy == 'atfc':
+        scheduling_kwargss.append({
+            'scheduling_policy': 'atfc',
+            'enable_admission': True,
+            "allow_rejection": True,
+            "scheduling_overhead": 0.005,
+            "max_num_batched_tokens": 4096
         })
 
     elif scheduling_policy == 'slosserve-dp':
@@ -709,15 +749,39 @@ def build_problems(
             "scheduling_overhead": 0.003,
             "slosserve_token_headroom": 1
         })
+        
+    elif scheduling_policy == 'slosserve-edf-fair':
+        scheduling_kwargss.append({
+            'scheduling_policy': 'edf',
+            'fifo_fair': True,
+            'enable_admission': True,
+            "allow_rejection": True,
+            "scheduling_overhead": 0.000,
+            "slosserve_token_headroom": 1
+        })
 
     for sch_kwargs in scheduling_kwargss:
         sch_kwargs['max_decoding_length'] = max_output_length
     
     routing_kwargss = []
-    if routing_policy == 'round_robin':
+    if 'round_robin' in routing_policy:
+        _args = routing_policy.split('-')
         routing_policy = 'round_robin'
+        n_group = 1
+        extra_kwargs = {}
+        if len(_args) >= 2:
+            n_group = int(_args[1])
+        if len(_args) >= 3:
+            assert _args[2] == 'disagg'
+            assert len(_args) >= 4
+            n_prefill_server_per_group = int(_args[3])
+            extra_kwargs = {
+                'n_group': n_group,
+                'is_pd_disagg': True, 
+                'n_prefill_per_group': n_prefill_server_per_group,
+            }
         routing_kwargss = [{"enable_rerouting": False,
-                            "enable_rescheduling": False}]
+                            "enable_rescheduling": False} | extra_kwargs]
     elif routing_policy == 'lightest_first':
         routing_policy = 'lightest_first'
         routing_kwargss = [{"enable_rerouting": False,
@@ -787,6 +851,72 @@ def build_problems(
             "enable_rerouting": True
         })
     
+    elif 'slosserve' in routing_policy:
+        # Supported forms:
+        # - slosserve
+        # - slosserve_<n_group>[_<n_lb>]
+        # - slosserve[_<n_group>[_<n_lb>]]_disagg_<n_prefill_per_group>
+        # Also accepts '-' as separator.
+        logger.info(f'parsing routing policy {routing_policy}')
+        normalized_policy = routing_policy.replace('-', '_')
+        _args = [x for x in normalized_policy.split('_') if x]
+        if not _args or _args[0] != 'slosserve':
+            raise ValueError(f"Invalid slosserve routing policy: {routing_policy}")
+
+        group_size = 1
+        n_lb = 1
+        extra_kwargs = {}
+
+        if 'disagg' in _args:
+            disagg_idx = _args.index('disagg')
+            numeric_prefix = _args[1:disagg_idx]
+            if len(numeric_prefix) >= 1:
+                group_size = int(numeric_prefix[0])
+            if len(numeric_prefix) >= 2:
+                n_lb = int(numeric_prefix[1])
+            if len(numeric_prefix) > 2:
+                raise ValueError(
+                    f"Too many numeric fields before disagg in routing policy: {routing_policy}"
+                )
+            if disagg_idx + 1 >= len(_args):
+                raise ValueError(
+                    f"Missing n_prefill_per_group in disagg routing policy: {routing_policy}"
+                )
+            if disagg_idx + 2 != len(_args):
+                raise ValueError(
+                    f"Unexpected trailing fields in disagg routing policy: {routing_policy}"
+                )
+            n_prefill_server_per_group = int(_args[disagg_idx + 1])
+            extra_kwargs = {
+                'is_pd_disagg': True,
+                'n_prefill_per_group': n_prefill_server_per_group,
+                'max_decode_bs': max_num_batched_tokens_vllm,
+                "enable_rerouting": True,
+            }
+        else:
+            numeric_fields = _args[1:]
+            if len(numeric_fields) >= 1:
+                group_size = int(numeric_fields[0])
+            if len(numeric_fields) >= 2:
+                n_lb = int(numeric_fields[1])
+            if len(numeric_fields) > 2:
+                raise ValueError(
+                    f"Too many numeric fields in slosserve routing policy: {routing_policy}"
+                )
+
+        routing_kwargss.append({
+            "max_decode_length": max_output_length,
+            "enable_rescheduling": True,
+            "enable_rerouting": False,
+            'device_mem': 1248576, # TODO: make it concrete. 
+            'block_size': 16, # TODO: make it concrete.
+            'model_name': model_name,
+            'tpot': slo_tpot,
+            'scheduling_overhead': scheduling_overhead,
+            'group_size': group_size,
+            'n_lb': n_lb
+            # 'routing_overhead': slo_routing_overhead
+        } | extra_kwargs)
     
     return [Problem(
         model_name = model_name,
@@ -809,6 +939,9 @@ def build_problems(
         scheduling_kwargs = scheduling_kwargs,
         store_prefix = store_prefix,
         admission_mode = admission_mode,
+        perf_model_err = perf_model_err,
+        routing_overhead = routing_overhead,
+        routing_fallback_policy = routing_fallback_policy
     ) for (scheduling_kwargs, routing_kwargs) in product(
         scheduling_kwargss, routing_kwargss)]
 
@@ -834,6 +967,9 @@ def run(
     admission_mode: str,
     scheduling_overhead: float,
     output_dir: str,
+    perf_model_errs: list[float],
+    routing_overhead: float,
+    routing_fallback_policy: str 
 ):
     import os
     os.makedirs(output_dir, exist_ok=True)
@@ -865,6 +1001,8 @@ def run(
     print(f"Experiment directory: {experiment_dir}")    
     print(f"admission_mode: {admission_mode}")
     print(f"scheduling_overhead: {scheduling_overhead}")
+    print(f'performance model errors: {perf_model_errs}')
+    print(f'routing fallback policy: {routing_fallback_policy}')
     print('--End of Problem Grid--')
     import os
     results = {}
@@ -872,12 +1010,12 @@ def run(
         print(f'Loading cached results from {experiment_dir}/results.jsonl')
         with open(f'{experiment_dir}/results.jsonl', 'r') as f:
             results = [json.loads(line) for line in f]
-            results = {(r['load_scale'], r['n_device'], r['scheduling_policy'], r['routing_policy'], r['ttft_slo_scale'], r['slo_tpot']): r for r in results}
+            results = {(r['load_scale'], r['n_device'], r['scheduling_policy'], r['routing_policy'], r['ttft_slo_scale'], r['slo_tpot'], r['perf_model_err']): r for r in results}
     else:
         results = {}
     
-    for ttft_slo_scale, slo_tpot, load_scale, n_device, policy in product(\
-        ttft_slo_scales, slo_tpots, load_scales, n_devices, policies):
+    for ttft_slo_scale, slo_tpot, load_scale, n_device, policy, perf_model_err in product(\
+        ttft_slo_scales, slo_tpots, load_scales, n_devices, policies, perf_model_errs):
         if ':' in policy:
             routing_policy, scheduling_policy = policy.split(':')
         else:
@@ -886,8 +1024,8 @@ def run(
         if n_device == 1 and 'disaggregated' in routing_policy:
             print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot} because n_device is 1 and routing policy is disaggregated')
             continue
-        if not overwrite and (load_scale, n_device, scheduling_policy, routing_policy, ttft_slo_scale, slo_tpot) in results:
-            print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot} because it already exists')
+        if not overwrite and (load_scale, n_device, scheduling_policy, routing_policy, ttft_slo_scale, slo_tpot, perf_model_err) in results:
+            print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot}, {perf_model_err} because it already exists')
             continue
         problems = build_problems(
             model_name,
@@ -903,9 +1041,13 @@ def run(
             experiment_dir,
             slo_routing_overhead,
             admission_mode,
+            perf_model_err,
+            routing_overhead,
+            scheduling_overhead = scheduling_overhead,
+            routing_fallback_policy=routing_fallback_policy
         )
         if not len(problems):
-            print(f'No problems found for {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot}')
+            logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
             continue
         run_results = []
         for problem in problems:
@@ -928,6 +1070,7 @@ def run(
         best_result = max(run_results, key = lambda x: x.profit)
         result = {
             'load_scale': load_scale,
+            'rps': best_result.results['rps'],
             'n_device': n_device,
             'scheduling_policy': scheduling_policy,
             'routing_policy': routing_policy,
@@ -935,6 +1078,8 @@ def run(
             'ttft_slo_scale': ttft_slo_scale,
             'slo_tpot': slo_tpot,
             'slo_violation_rate': 1 - best_result.results['slo_attainment_rate'],
+            'perf_model_err': perf_model_err,
+            
             'event_file': f'{problems[0].store_prefix}.events.jsonl',
             'energy_consumption': best_result.energy_consumption,
             'per_gpu_energy_consumption': best_result.per_gpu_energy_consumption,
@@ -949,7 +1094,7 @@ def run(
         pprint.pprint(result)
         print('--End of Result--')
         
-        results[(load_scale, n_device, scheduling_policy, routing_policy, ttft_slo_scale, slo_tpot)] = result
+        results[(load_scale, n_device, scheduling_policy, routing_policy, ttft_slo_scale, slo_tpot, perf_model_err)] = result
         with open(f'{experiment_dir}/results.jsonl', 'a') as f:
             f.write(json.dumps(result) + '\n')            
             
@@ -983,7 +1128,7 @@ def run(
         n_groups = len(df.groupby(other_features))
         ncols = min(3, n_groups)
         nrows = math.ceil(n_groups / ncols)
-        for ylabel in ['profit', 'slo_violation_rate']:
+        for ylabel in ['energy_est', 'slo_violation_rate']:
             fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows), squeeze=False)
             idx = 0
             for other_feature_values, group in df.groupby(other_features):
@@ -1058,11 +1203,19 @@ if __name__ == '__main__':
     parser.add_argument('--policies', type=str, default=[':'.join([a,b]) for a, b in product(ROUTING_POLICIES, SCHEDULING_POLICIES)], nargs='+', help = 'list of policies to run (routing_policy:scheduling_policy [routing_policy:scheduling_policy ...])')
     parser.add_argument('--scheduling_overhead', type=float, default=0.003, help = 'scheduling overhead per token in seconds')
     parser.add_argument('--output_dir', type=str, default='experiments', help = 'output directory')
+    parser.add_argument('--perf_model_err', type = float, default = [1.0], nargs = '+', help = 'list of performance model errors')
+    parser.add_argument('--routing_overhead', type = float, default = -1.0, help = "mocked overhead from at engine.")
+    parser.add_argument('--routing_fallback_policy', type = str, default = 'asap', choices = ['asap', 'reject'])
     args = parser.parse_args()
     
     if not args.run_all:
         clients = None
         if args.clients is not None:
+            if '-' in args.clients:
+                l, r = args.clients.split('-')
+                l = int(l)
+                r = int(r)
+                args.clients = ','.join(map(str, range(l, r+1)))
             if int(args.clients.split(',')[0]) < 10:
                 clients = args.clients
             elif ':' in args.clients:
@@ -1090,6 +1243,9 @@ if __name__ == '__main__':
                 admission_mode = args.admission_mode,
                 scheduling_overhead = args.scheduling_overhead,
                 output_dir = args.output_dir,
+                perf_model_errs = args.perf_model_err,
+                routing_overhead = args.routing_overhead,
+                routing_fallback_policy = args.routing_fallback_policy
             )
         exit(0)
     
@@ -1141,6 +1297,7 @@ if __name__ == '__main__':
                 'overwrite': args.overwrite,
                 'slo_routing_overhead': args.slo_routing_overhead,
                 'admission_mode': args.admission_mode,
+                'routing_overhead': args.routing_overhead,
             })
         p.start()
         running_jobs.append((p, clients_str, router))

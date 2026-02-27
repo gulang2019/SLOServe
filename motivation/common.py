@@ -1,9 +1,16 @@
 import copy
+import logging
+
+logger = logging.getLogger(__name__)
 
 class PerfModel:
     def __init__(self, hardware_params: list[float]):
         assert len(hardware_params) == 5
         self.hardware_params = copy.deepcopy(hardware_params)
+        self._online_average_delay = 0.0
+        self._online_spike_slack = 0.0
+        self._decay_factor = 0.95
+        self._update_cnt = 0
     
     def get_batch_time(self, num_tokens: list[tuple[int, int]]) -> float:
         num_reqs = len(num_tokens)
@@ -13,15 +20,27 @@ class PerfModel:
         return self.hardware_params[0] * num_tot_tokens \
             + self.hardware_params[1] * num_reqs \
             + self.hardware_params[2] * num_past_tokens + \
-            self.hardware_params[3] * num_decode_steps + self.hardware_params[4]
+            self.hardware_params[3] * num_decode_steps + self.hardware_params[4] + self._online_spike_slack
+    
+    def update(self, batch: list[tuple[int, int]], elapsed: float):
+        pass 
+        return 
+        estimated = self.get_batch_time(batch) - self._online_spike_slack
+        self._online_average_delay = self._decay_factor * (self._online_average_delay) + \
+            (1 - self._decay_factor) * (elapsed - estimated)
+        self._online_spike_slack = max(self._online_average_delay, 0.0)
+        if self._update_cnt % 100 == 0:
+            logger.info(f'[PerfModel::Update]: {self._online_average_delay=}, {self._online_spike_slack=}')
+        self._update_cnt += 1
+        return 
     
     def get_bs(self, t: float, num_reqs: int, num_past_tokens: int = 0, num_decode_steps: int = 1) -> int:
-        return int((t - self.hardware_params[4] \
+        return int((t - self.hardware_params[4] - self._online_spike_slack \
             - self.hardware_params[3] * num_decode_steps - self.hardware_params[2] * num_past_tokens\
             - self.hardware_params[1] * num_reqs) / (self.hardware_params[0]))
     
     def get_max_decode_batch_size(self, t: float, average_context_length: float = 0.0) -> int:
-        return int((t - self.hardware_params[4] - self.hardware_params[3]) / (self.hardware_params[0] + self.hardware_params[1] + self.hardware_params[2] * average_context_length))
+        return int((t - self.hardware_params[4] - self.hardware_params[3] - self._online_spike_slack) / (self.hardware_params[0] + self.hardware_params[1] + self.hardware_params[2] * average_context_length))
     
     @staticmethod
     def get_perf_model(model_name: str, task: str = 'default') -> 'PerfModel':
@@ -40,7 +59,9 @@ HW_PARAMS = {
         'arxiv_summary': [6.565e-05, 0.00, 8e-8, 0, 1.3e-02]}, # ChatBot
     'google/gemma-3-27b-it': {
         'default': [7.69e-5, 5.82e-5, 4.40e-8, 0, 1.9e-2],
-        'azure_chat_23': [7.1e-5, 3.82e-5, 9.380e-8, 0, 1.8e-2]
+        'azure_chat_23': [7.1e-5, 3.82e-5, 9.380e-8, 0, 1.8e-2],
+        'azure_code_23': [3.62e-5, 3.31e-5, 9.7e-8, 0.0, 0.0176],
+        'sharegpt_code': [3.62e-5, 3.31e-5, 9.7e-8, 0.0, 0.0176],
     },
     'meta-llama/Llama-3.1-70B': {
         'default': [6.2e-5, 3.7e-5, 5e-8, 0, 1.4e-2]

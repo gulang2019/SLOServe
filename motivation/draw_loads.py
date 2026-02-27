@@ -45,14 +45,19 @@ def visualize_load(arrival_times_name: str,
                    window: float,
                    load_scale: float = 1.0,
                    figname: str = 'figs/loads',
-                   slo_constant: float = 0.0):
+                   slo_constant: float = 0.0,
+                   auto_scaling_interval: float | None = None,
+                   prefill_ax = None, 
+                   decode_ax = None, 
+                   total_ax = None,
+                   mode: str = 'all'):
     
     arrival_times = ArrivalTimes.load(arrival_times_name, load_scale = load_scale).arrival_times
     requests = Requests.load(requests_name, max_tokens = 32768).requests
     requests = requests[window_start:window_end]
     arrival_times = arrival_times[:window_end - window_start]
-    arrival_times = [t - arrival_times[0] for t in arrival_times]
-    
+    # arrival_times = [t - arrival_times[0] for t in arrival_times]
+    print(f'arrivaltimes: {arrival_times[0]} -> {arrival_times[-1]}')
     print('Req/s:', len(requests) / (arrival_times[-1] - arrival_times[0]))
     
     # INSERT_YOUR_CODE
@@ -123,7 +128,8 @@ def visualize_load(arrival_times_name: str,
 
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(3, 1, figsize=(20, 10), sharex=True)
+    # fig, axes = plt.subplots(3, 1, figsize=(20, 10), sharex=True)
+    axes = [prefill_ax, decode_ax, total_ax]
     labels = ["Prefill", "Decode", "Total"]
     min_series = [min_prefill_servers, min_decode_servers, min_tot_servers]
     max_series = [max_prefill_servers, max_decode_servers, max_tot_servers]
@@ -148,30 +154,56 @@ def visualize_load(arrival_times_name: str,
         print("Warning: total_time is zero, cannot compute fraction of time.")
 
     for i, (ax, label) in enumerate(zip(axes, labels)):
+        if ax is None: continue 
         # Plot min servers as horizontal lines per window
         # Plot min servers as horizontal lines per window and connect with verticals
-        prev_we, prev_ms = None, None
-        for ws, we, ms in zip(window_starts, window_ends, min_series[i]):
-            ax.hlines(ms, ws, we, color='b', linewidth=2, label='min' if ws == window_starts[0] else "")
-            if prev_we is not None and prev_we == ws:  # connect contiguous intervals
-                ax.vlines(ws, prev_ms, ms, color='b', linewidth=2)
-            prev_we, prev_ms = we, ms
-        # Plot max servers as horizontal lines per window and connect with verticals
-        prev_we, prev_mx = None, None
-        for ws, we, mx in zip(window_starts, window_ends, max_series[i]):
-            ax.hlines(mx, ws, we, color='r', linewidth=2, linestyle="--", label='max' if ws == window_starts[0] else "")
-            if prev_we is not None and prev_we == ws:  # connect contiguous intervals
-                ax.vlines(ws, prev_mx, mx, color='r', linewidth=2, linestyle="--")
-            prev_we, prev_mx = we, mx
+        if mode in ['all', 'min']:
+            prev_we, prev_ms = None, None
+            for ws, we, ms in zip(window_starts, window_ends, min_series[i]):
+                ax.hlines(ms, ws, we, color='b', linewidth=2, label='min' if ws == window_starts[0] else "")
+                if prev_we is not None and prev_we == ws:  # connect contiguous intervals
+                    ax.vlines(ws, prev_ms, ms, color='b', linewidth=2)
+                prev_we, prev_ms = we, ms
+            
+        
+        if mode in ['all', 'max']:
+            # Plot max servers as horizontal lines per window and connect with verticals
+            prev_we, prev_mx = None, None
+            for ws, we, mx in zip(window_starts, window_ends, max_series[i]):
+                ax.hlines(mx, ws, we, color='black', linewidth=4, label='max' if ws == window_starts[0] else "")
+                if prev_we is not None and prev_we == ws:  # connect contiguous intervals
+                    ax.vlines(ws, prev_mx, mx, color='black', linewidth=4)
+                prev_we, prev_mx = we, mx
+            
+        import math
+        
+        if auto_scaling_interval is not None:
+            idx = 0
+            last_idx = 0
+            while idx < len(window_starts):
+                while idx < len(window_starts) and ((window_starts[idx] - window_starts[last_idx]) < auto_scaling_interval):
+                    idx += 1
+                if mode in ['all', 'max']:
+                    required_servers_max = math.ceil(max(max_series[i][last_idx:idx]))
+                    average_required_servers_max = math.ceil(np.mean(max_series[i][last_idx:idx]))
+                    ax.hlines( required_servers_max, window_starts[last_idx], window_starts[idx - 1], color = 'red')
+                    ax.hlines( average_required_servers_max, window_starts[last_idx], window_starts[idx - 1], color = 'red')
+                if mode in ['all', 'min']:
+                    required_servers_min = math.ceil(max(min_series[i][last_idx:idx]))
+                    average_required_servers_min = math.ceil(np.mean(min_series[i][last_idx:idx]))
+                    ax.hlines( required_servers_min, window_starts[last_idx], window_starts[idx - 1], color = 'blue')
+                    ax.hlines( average_required_servers_min, window_starts[last_idx], window_starts[idx - 1], color = 'blue')
+                last_idx = idx
 
-        ax.set_ylabel(f"{label} servers")
-        ax.legend(loc="upper right")
+        ax.set_ylabel(f"# Server Required", fontsize = 32)
+        # ax.legend(loc="upper right")
         ax.grid(True)
-    axes[-1].set_xlabel("Time")
+        ax.tick_params(axis='both', which='major', labelsize=24)
+        ax.set_xlabel("Time (s)", fontsize = 32)
 
     # fig.savefig(f'{fig_prefix}/loads-{model_name}-{slo_ttft}-{slo_tpot}-{window}.png')
-    fig.savefig(figname)
-    print(f'Saved {figname}')
+    # fig.savefig(figname)
+    # print(f'Saved {figname}')
     
     return {
         'ttft_slo_scale': ttft_slo_scale,
@@ -304,22 +336,85 @@ for model_name in [
     #     load_scale=0.1
     # )
     
-
+    fig, ax = plt.subplots(figsize = (18, 5), tight_layout = True)
     visualize_load(
         arrival_times_name='azure_code_23',
         requests_name='sharegpt_code',
         model_name = model_name,
         ttft_slo_scale=3.0,
-        slo_tpot=0.025 if 'Qwen' in model_name else 0.05,
+        slo_tpot=0.05 if 'Qwen' in model_name else 0.05,
         window_start=0,
-        window_end=10000,
+        window_end=20000,
         window=0.3,
-        figname=f'figs/loads/{easy_name}-codebot.png',
+        # figname=f'figs/loads/{easy_name}-codebot.png',
+        figname = 'code_bot.png',
         load_scale = 1.0,
-        slo_constant = 0.2
+        slo_constant = 0.2,
+        # auto_scaling_interval = 600,
+        total_ax = ax,
+        mode = 'max' 
     )
+    fig.savefig('figs/loads/azure_code_23.png')
     
+    # fig, ax = plt.subplots()
+    # visualize_load(
+    #     arrival_times_name='azure_chat_23',
+    #     requests_name='azure_chat_23',
+    #     model_name = model_name,
+    #     ttft_slo_scale=3.0,
+    #     slo_tpot=0.05 if 'Qwen' in model_name else 0.05,
+    #     window_start=0,
+    #     window_end=20000,
+    #     window=0.3,
+    #     # figname=f'figs/loads/{easy_name}-codebot.png',
+    #     figname = 'code_bot.png',
+    #     load_scale = 1.0,
+    #     slo_constant = 0.2,
+    #     auto_scaling_interval = 600,
+    #     total_ax = ax,
+    #     mode = 'max' 
+    # )
+    # fig.savefig('figs/loads/azure_chat_23.png')
     
+    # fig, ax = plt.subplots()
+    # visualize_load(
+    #     arrival_times_name='azure_chat',
+    #     requests_name='azure_chat',
+    #     model_name = model_name,
+    #     ttft_slo_scale=3.0,
+    #     slo_tpot=0.05 if 'Qwen' in model_name else 0.05,
+    #     window_start=0,
+    #     window_end=20000,
+    #     window=0.3,
+    #     # figname=f'figs/loads/{easy_name}-codebot.png',
+    #     figname = 'code_bot.png',
+    #     load_scale = 1.0,
+    #     slo_constant = 0.2,
+    #     auto_scaling_interval = 600,
+    #     total_ax = ax,
+    #     mode = 'max' 
+    # )
+    # fig.savefig('figs/loads/azure_chat.png')
+    
+    # fig, ax = plt.subplots()
+    # visualize_load(
+    #     arrival_times_name='azure_code',
+    #     requests_name='azure_code',
+    #     model_name = model_name,
+    #     ttft_slo_scale=3.0,
+    #     slo_tpot=0.05 if 'Qwen' in model_name else 0.05,
+    #     window_start=0,
+    #     window_end=20000,
+    #     window=0.3,
+    #     # figname=f'figs/loads/{easy_name}-codebot.png',
+    #     figname = 'code_bot.png',
+    #     load_scale = 1.0,
+    #     slo_constant = 0.2,
+    #     auto_scaling_interval = 600,
+    #     total_ax = ax,
+    #     mode = 'max' 
+    # )
+    # fig.savefig('figs/loads/azure_code.png')
 
     # visualize_load(
     #     arrival_times_name='burstgpt_GPT-4_Conversation log',

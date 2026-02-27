@@ -125,8 +125,37 @@ def draw(experiment_dir,
     # df['n_device'] = df['avg_n_active_servers'].astype(int)
     df['routing_policy'] = df['routing_policy'].str.split("-").str[:2].str.join('-')
     # print(df)
+    import json 
+    df['rejection_rate'] = 0.0
+    for i in range(len(df)):
+        if df.iloc[i]['scheduling_policy'] != 'slosserve-edf': continue 
+        event_file = df.iloc[i]['event_file']
+        reqs_file = event_file.replace('.events.', '.reqs.')
+        with open(reqs_file, 'r') as f:
+            requests = json.load(f)
+        n_rejected = 0
+        n_satisfied = 0
+        n_violated = 0
+        accepted_input_lengths = []
+        rejected_input_lengths = []
+        for req in requests:
+            
+            is_rejected = req['finish_reason'] != 'length'
+            is_satisfied = req['slo_violation'] == 'none'
+            is_violated = req['finish_reason'] == 'length' and req['slo_violation'] != 'none'
 
+            assert is_rejected + is_satisfied + is_violated == 1
+            
+            n_rejected += is_rejected
+            n_satisfied += is_satisfied
+            n_violated += is_violated 
 
+            if is_rejected: 
+                rejected_input_lengths.append(req['prompt_tokens'])
+            else: 
+                accepted_input_lengths.append(req['prompt_tokens'])
+        print('setting rejection rate tp', n_rejected, n_violated + n_rejected, len(requests))
+        df.loc[df.index[i], 'rejection_rate'] = n_rejected / len(requests)
 
     for feature in features:
         # print('plotting', feature, df[feature])
@@ -205,6 +234,23 @@ def draw(experiment_dir,
                             markersize=15,
                             label=label,
                         )
+                        if ylabel == 'slo_violation_rate' and sched == 'slosserve-edf':
+                            ax.plot(
+                                subg[feature],
+                                subg['rejection_rate'],
+                                marker=marker,
+                                linestyle='--',
+                                color=color,
+                                linewidth=3.0,
+                                markersize=15,
+                                label=label + ' (rej)',
+                            )
+                            
+                            print(title_text)
+                            subdf = subg[[feature, 'rejection_rate', ylabel]]
+                            subdf['yield_rate'] = 1 - ((subdf['slo_violation_rate'] - subdf['rejection_rate'])) / (1 - subdf['rejection_rate'])
+                            print(subdf)
+                            print(subdf.round(4).to_markdown(index = False))
                     
                     if annotate: 
                     # INSERT_YOUR_CODE
@@ -449,7 +495,7 @@ def draw_single_gpu():
     # Remove duplicates
     by_label = dict(zip(labels, handles))
     items = list(by_label.items())
-    ORDER = ['vLLM', 'Sarathi', 'QLM', 'vLLM+', 'Sarathi+', 'QLM+', 'Ours']
+    ORDER = ['vLLM', 'Sarathi', 'QLM', 'vLLM+', 'Sarathi+', 'QLM+', 'Ours', 'Ours (rej)']
     items.sort(key=lambda x: ORDER.index(x[0]))
     labels, handles = zip(*items)
 
@@ -776,6 +822,7 @@ def draw_burstiness():
 #      is_included = single_gpu_is_included,
 #      more_funcs = lambda df: df[df['load_scale'] < 0.35])
 # draw_single_gpu()
+# exit(0)
 
 # draw_ablation()
 # draw_distributed()
@@ -819,6 +866,28 @@ def draw_teaser():
 
     fig.savefig('figs/teaser.png', dpi = 300, bbox_inches = 'tight')
     fig.savefig('figs/teaser.pdf', dpi = 300, bbox_inches = 'tight')
+    
+def draw_perf_model_sensitivity():
+    filename = 'experiments/Gemma-3-27B-IT_constant_sharegpt_code:azure_code_23_3976:4580_anytime_0.0/results.jsonl'
+    data = pd.read_json(filename, lines = True)
+    data = data.sort_values(by = 'perf_model_err')
+    fig, ax = plt.subplots()
+    data['model_err'] = data['perf_model_err'] - 1.0
+    ax.plot(data['model_err'], data['slo_violation_rate'], label = 'SLO violation')
+    ax.plot(data['model_err'], data['rejection_rate'], label = 'rejection rate')
+    text = data[['model_err', 'slo_violation_rate', 'rejection_rate']].to_markdown(index = False)
+    print(text)
+    ax.set_xlabel('Performance Model Error')
+    ax.set_ylabel('Fraction of Request')
+    ax.legend()
+    
+    
+
+    fig.savefig('figs/perf_model_sensitivity.png', dpi = 300, bbox_inches = 'tight')
+    fig.savefig('figs/perf_model_sensitivity.pdf', dpi = 300, bbox_inches = 'tight')
+
+draw_perf_model_sensitivity()
+exit(0)
 # draw_teaser()
 # exit(0)
 # draw_energy('experiments/Qwen-7B_constant_sharegpt_code:azure_code_23_3979:4581_anytime')

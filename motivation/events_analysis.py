@@ -1,11 +1,10 @@
 import json 
 from dataclasses import dataclass, field
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Tuple, Any, Optional
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Callable
 from sklearn.metrics import r2_score
-from typing import Tuple, Any, Optional
 import matplotlib
 
 
@@ -28,6 +27,12 @@ class Event:
     event_type: str
     timestamp: float
     device_id: int = 0
+    extra_args: dict = field(default_factory=dict)
+    
+@dataclass(kw_only=True)
+class ReqEvent(Event):
+    request_id: str
+
 """
 "event_type": "energy",
 "timestamp": float(row["ts"]),                      # seconds since epoch
@@ -65,9 +70,11 @@ class Batch(Event):
     num_scheduled_tokens: Dict[str, int]
     elapsed: float
     scheduling_overhead: float
-    between_batch_time: float
+    between_batch_time: Optional[float] = None
     estimated_time: float = 0
-    output_processing_elapsed: float
+    output_processing_elapsed: Optional[float] = None
+    rejected_reqs: List[str] = None
+    publish_overhead: Optional[float] = None
     
     
     @property
@@ -215,6 +222,7 @@ class RequestInstance:
     prompt_tokens: int = 0
     num_cached_tokens: int = 0
     arrival_time: float = 0
+    engine_arrival_time: float = 0
     profit: float = 0
     schedules: List[ReqSchedule] = field(default_factory=list)
     events: List[Event] = field(default_factory=list)
@@ -246,13 +254,14 @@ class RequestInstance:
                             self.finish_reason += '-prefill'
         return self.finish_reason == 'length'
 
-    def get_stats(self, slo_ttft_fn, slo_tpot):
+    def get_stats(self, slo_ttft_fn, slo_tpot, routing_overhead: float = -1.0):
+        arrival_time = self.arrival_time if routing_overhead < 0.0 else self.engine_arrival_time + routing_overhead
         
         slo_ttft = slo_ttft_fn(self)
-        required_tokens = [(self.arrival_time + slo_ttft, self.prompt_tokens - self.num_cached_tokens)]
+        required_tokens = [(arrival_time + slo_ttft, self.prompt_tokens - self.num_cached_tokens)]
         
         for i in range(self.output_tokens - 1):
-            required_tokens.append((self.arrival_time + slo_ttft + (i + 1) * slo_tpot, 1))
+            required_tokens.append((arrival_time + slo_ttft + (i + 1) * slo_tpot, 1))
             
         # required_tokens = [(self.prefill_ddl + overhead, self.prompt_tokens - self.num_cached_tokens)]
         
@@ -272,7 +281,7 @@ class RequestInstance:
 
         i = 0
         num_scheduled_tokens = 0
-        timestamp = self.arrival_time
+        timestamp = arrival_time
         for j, (t, required_token) in enumerate(required_tokens):
             while i < len(self.schedules) and num_scheduled_tokens < required_token:
                 num_scheduled_tokens += self.schedules[i].num_scheduled_tokens
@@ -461,7 +470,9 @@ def analyze_events(filepath, start_time = None, verbose = False):
                     events.append(ProcessInputQueue(**raw_event))
                 elif raw_event['event_type'] == 'energy':
                     events.append(Energy(**raw_event))
-                else: 
+                elif 'request_id' in raw_event: 
+                    events.append(ReqEvent(**raw_event))
+                else:
                     events.append(Event(**raw_event))
     elif isinstance(filepath, list):
         for event in filepath:
@@ -497,7 +508,9 @@ def analyze_events(filepath, start_time = None, verbose = False):
                 events.append(ProcessInputQueue(**event))
             elif event['event_type'] == 'energy':
                 events.append(Energy(**event))
-            else: 
+            elif 'request_id' in event: 
+                events.append(ReqEvent(**event))
+            else:
                 events.append(Event(**event))
     events = sorted(events, key=lambda x: x.timestamp)
         
@@ -509,15 +522,16 @@ def analyze_events(filepath, start_time = None, verbose = False):
                 reqs[event.request_id] = RequestInstance(
                 req_id=event.request_id, 
                 arrival_time = -1.0,
+                engine_arrival_time= -1.0,
                 prompt_tokens = -1,
                 output_tokens = -1)
             req = reqs[event.request_id]
-            # if event.event_type == 'arrival-router' and req.arrival_time < 0:
-            #     req.zero_load_ttft = event.zero_load_ttft
-            #     req.arrival_time = event.timestamp
-            if event.event_type == 'arrival' and req.arrival_time < 0:
+            if event.event_type == 'arrival-router' and req.arrival_time < 0:
                 req.zero_load_ttft = event.zero_load_ttft
                 req.arrival_time = event.timestamp
+            if event.event_type == 'arrival':
+                req.zero_load_ttft = event.zero_load_ttft
+                req.engine_arrival_time = event.timestamp
             if hasattr(event, 'prefill_ddl'):
                 req.prefill_ddl = event.prefill_ddl
             if event.event_type == 'router_decision':
@@ -587,8 +601,8 @@ def analyze_events(filepath, start_time = None, verbose = False):
                 last_event = (event_name, event.timestamp)
         for key, value in latencies.items():
             value, prompt_tokens = zip(*value)
-            print(f'{key}: {np.mean(value):.4f} +- {np.std(value):.4f} p99: {np.percentile(value, 99):.4f}, p50: {np.percentile(value, 50):.4f}, p90: {np.percentile(value, 90):.4f}, p20: {np.percentile(value, 20):.4f}')
-            fig, ax = plt.subplots()
+            print(f'{key}({len(value)}):  {np.mean(value):.4f} +- {np.std(value):.4f} p99: {np.percentile(value, 99):.4f}, p50: {np.percentile(value, 50):.4f}, p90: {np.percentile(value, 90):.4f}, p20: {np.percentile(value, 20):.4f}')
+            # fig, ax = plt.subplots()
             # ax.scatter(prompt_tokens, value)
             # ax.set_xlabel('Prompt Tokens')
             # ax.set_ylabel('Latency (s)')
@@ -631,7 +645,12 @@ def calc_n_active_servers(events: list, window_size: float = 1.0, ax = None, lab
             if batch_end > start and batch_start < end:
                 device_ids.add(event.device_id)
         num_active_devices_per_bin.append(len(device_ids))
-
+    from collections import Counter
+    
+    breakdown = {}
+    for k, v in Counter(num_active_devices_per_bin).items():
+        breakdown[f'{k}_active (%)'] = v / len(num_active_devices_per_bin)
+    
     # Draw stepwise hlines and vlines
     prev_y = num_active_devices_per_bin[0] if num_active_devices_per_bin else 0
     if ax:
@@ -646,7 +665,145 @@ def calc_n_active_servers(events: list, window_size: float = 1.0, ax = None, lab
         ax.grid(True)
         if label:
             ax.legend()
-    return np.mean(num_active_devices_per_bin)
+    return float(np.mean(num_active_devices_per_bin)), breakdown
+
+def calc_energy(
+    events: list,
+    n_device: int,
+    window_size: float = 1.0,
+    ax=None,
+    n_device_ax=None,
+    label: str = "",
+    color: str = "tab:blue",
+    linestyle: str = "-",          # NEW: distinguish curves
+    smooth_window: int = 0,        # NEW: 0 disables; e.g., 5 or 10 seconds
+    add_direct_label: bool = False # NEW: label curve at right edge
+):
+    """
+    Computes and (optionally) plots per-window GPU power and active device count.
+    Keeps stepwise rendering similar to original, but avoids O(bins * events) scanning.
+    """
+    import numpy as np
+
+    # Gather and sort batch events by start time
+    batch_events = [e for e in events if e.event_type == "batch"]
+    if not batch_events:
+        return []
+
+    batch_events = sorted(batch_events, key=lambda e: e.timestamp - e.elapsed)
+
+    # Window bins
+    t0 = min(e.timestamp - e.elapsed for e in batch_events)
+    tN = max(e.timestamp for e in batch_events)
+    bins = np.arange(t0, tN + window_size, window_size)
+
+    # Power model (same as yours)
+    IDLE_POWER = 53
+    BASELINE_POWER = 143
+    INCREMENTAL_POWER = 0.35
+
+    # Precompute start/end times for sweep
+    starts = np.array([e.timestamp - e.elapsed for e in batch_events], dtype=np.float64)
+    ends   = np.array([e.timestamp for e in batch_events], dtype=np.float64)
+
+    # Active events: store indices of batch_events currently overlapping
+    active = set()
+    j = 0  # pointer to events that have started
+
+    num_active_devices_per_bin = []
+    num_active_requests_per_bin = []
+    energy_per_bins = []
+
+    # Sweep bins left->right
+    for start, end in zip(bins[:-1], bins[1:]):
+        # Add newly started batches (start time < window end)
+        while j < len(batch_events) and starts[j] < end:
+            active.add(j)
+            j += 1
+
+        # Remove finished batches (end time <= window start)
+        # Iterate over a snapshot since we may discard
+        to_remove = []
+        for idx in active:
+            if ends[idx] <= start:
+                to_remove.append(idx)
+        for idx in to_remove:
+            active.discard(idx)
+
+        # Count unique devices + reqs among active batches
+        device_ids = set()
+        req_ids = set()
+        for idx in active:
+            e = batch_events[idx]
+            device_ids.add(e.device_id)
+            # req_ids might be large; still matches your logic
+            for r in e.req_ids:
+                req_ids.add(r)
+
+        n_active_dev = len(device_ids)
+        n_active_req = len(req_ids)
+
+        num_active_devices_per_bin.append(n_active_dev)
+        num_active_requests_per_bin.append(n_active_req)
+
+        energy_per_bin = (
+            n_active_dev * BASELINE_POWER
+            + n_active_req * INCREMENTAL_POWER
+            + (n_device - n_active_dev) * IDLE_POWER
+        )
+        energy_per_bins.append(energy_per_bin)
+
+    print(label, "average", float(np.mean(num_active_devices_per_bin)), "devices")
+
+    # Helper: optional smoothing for nicer poster curves
+    def _moving_avg(y, w):
+        y = np.asarray(y, dtype=np.float64)
+        if w <= 1 or len(y) < w:
+            return y
+        k = np.ones(w, dtype=np.float64) / w
+        return np.convolve(y, k, mode="same")
+
+    # Plot stepwise (same visual style, but with linestyle)
+    def _plot_step(ax_, y_list, y_name):
+        if ax_ is None or not y_list:
+            return
+
+        y = np.asarray(y_list, dtype=np.float64)
+
+        # Raw step curve
+        prev_y = y[0]
+        for i, (x1, x2, yi) in enumerate(zip(bins[:-1], bins[1:], y)):
+            ax_.hlines(yi, x1, x2, linewidth=2.5, linestyle=linestyle,
+                       label=label if i == 0 else "", color=color)
+            if i > 0 and prev_y != yi:
+                ax_.vlines(x1, prev_y, yi, linewidth=2.5, linestyle=linestyle, color=color)
+            prev_y = yi
+
+        # Optional smoothed overlay (draw as normal line, no step)
+        if smooth_window and smooth_window > 1:
+            ys = _moving_avg(y, smooth_window)
+            x_mid = (bins[:-1] + bins[1:]) / 2.0
+            ax_.plot(x_mid, ys, linewidth=4.0, color=color, linestyle=linestyle, alpha=0.9)
+
+        ax_.set_ylabel(y_name)
+        ax_.grid(True, alpha=0.3)
+
+        # Optional direct label at right edge (better than legend for posters)
+        if add_direct_label and label:
+            ax_.text(bins[-1] + window_size * 0.3, y[-1], label,
+                     va="center", fontsize=12, color=color)
+
+    _plot_step(ax, energy_per_bins, "GPU Power (W)")
+    _plot_step(n_device_ax, num_active_devices_per_bin, "Avg #Active GPU")
+
+    # Only set xlabel once (caller can also handle)
+    if ax is not None:
+        ax.set_xlabel("Time (s)")
+    if n_device_ax is not None:
+        n_device_ax.set_xlabel("Time (s)")
+
+    # IMPORTANT: don't call legend() inside here; do it once in caller
+    return energy_per_bins
 
 def calc_num_effective_tokens(
     events: list,
@@ -1261,7 +1418,51 @@ def calc_batch_size_distribution(
         plt.tight_layout()
 
     return stats
+
+def calc_device_stats(events: List[Event], reqs: List[RequestInstance], n_device: int):
+    batches = [e for e in events if e.event_type == 'batch']
     
+    def get_stats(lst):
+        return {
+            'mean': float(np.mean(lst)),
+            'p20': float(np.percentile(lst, 20)),
+            'p50': float(np.percentile(lst, 50)),
+            'p80': float(np.percentile(lst, 80)),
+            'min': float(np.min(lst)),
+            'max': float(np.max(lst)),
+        }
+    
+    device_stats = {
+        did: {
+            'overhead': None,
+            'n_arrived': 0,
+            'n_finished': 0,
+            'n_finish_rejected': 0,
+            'n_slo_satisfied': 0,
+        } for did in range(n_device)
+    }
+    
+    for did in range(n_device):
+        d_batches = [b for b in batches if b.device_id == did]
+        if not len(d_batches): continue
+        network_times = [b.between_batch_time - b.estimated_time for b in d_batches]
+        device_stats[did]['overhead'] = get_stats(network_times)
+    
+    for req in reqs:
+        for e in req.events:
+            if e.event_type == 'arrival' and e.device_id >= 0:
+                device_stats[e.device_id]['n_arrived'] += 1
+        for e in req.events[::-1]:
+            if e.event_type == 'finish':
+                if e.device_id >= 0:
+                    device_stats[e.device_id]['n_finished'] += 1
+                    device_stats[e.device_id]['n_finish_rejected'] += ('reject' in e.finish_reason)
+                    device_stats[e.device_id]['n_slo_satisfied'] += (req.slo_violation == 'none')
+                    break 
+    
+    return device_stats
+
+ 
 def analyze_slo_violation(reqs: Dict[str, RequestInstance],
                           all_events: List[Event],
                           model_name: str,
@@ -1269,6 +1470,8 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
                           slo_tpot: float,
                           length_pattern: str,
                           slo_ttft_overhead: float = 0.0,
+                          routing_overhead: float = -1.0,
+                          n_device: int = -1,
                           prefix = 'trace_analysis',
                           draw = False,
                           verbose = False):
@@ -1297,7 +1500,7 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
     if verbose:
         print('--analyze_slo_violation--')
     for req in reqs.values():
-        req.get_stats(slo_ttft_fn, slo_tpot)        
+        req.get_stats(slo_ttft_fn, slo_tpot, routing_overhead)
         violate = req.violate_slo()
         
         event = {
@@ -1344,8 +1547,17 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
     window_size = 1
     time, num_reqs_series, num_violations, max_ttft, max_tpot, total_prompt_tokens, total_output_tokens, total_tokens, avg_kv_xfer_delay = _compute_window_series(events, window_size)
 
-
+    fig, axes = plt.subplots(2, figsize = (18, 10), tight_layout = True, sharex = True)
+    _plot_line(axes[0], time, num_reqs_series, 'requests', 'tab:blue', ylabel='Requests', stat='mean')
+    energies = calc_energy(all_events, window_size = 1.0, n_device = n_device, ax = axes[1])
+    fig.savefig(f'{prefix}.energy.png', dpi=300, bbox_inches='tight')
+    print(f'Energy saved to {prefix}.energy.png')
+    average_n_active_servers, breakdown = calc_n_active_servers(all_events, window_size = 0.2)
+    device_stats = calc_device_stats(
+        all_events, reqs.values(), n_device
+    )
     if not draw:
+        
         return {
             'slo_attainment_rate': attainment_rate,
             'violations': violations,
@@ -1353,12 +1565,16 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
             'max_ttft_laxity': np.percentile([req.ttft_normalized_laxity for req in reqs.values()], 99),
             'max_tpot_laxity': np.percentile([req.max_tpot_laxity for req in reqs.values()], 99),
             'profit': profit,
+            
             'extra_metrics': {
                 'average_effective_tokens_ratio': float(calc_num_effective_tokens(all_events, reqs, window_size = 1.0)),
-                'average_n_active_servers': float(calc_n_active_servers(all_events, window_size = 1.0)),
+                'average_n_active_servers': average_n_active_servers,
                 'max_num_reqs': float(np.max(num_reqs_series)),
                 'max_num_reqs_under_slo': float(np.max(num_reqs_series - num_violations)),
                 'rejection_rate': rejection_rate,
+                'device_stats': device_stats,
+                'energy_est': sum(energies),
+                **breakdown
             }
         }
 
@@ -1553,10 +1769,13 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
         'subplot_stats': subplot_stats,
         'extra_metrics': {
                 'average_effective_tokens_ratio': float(calc_num_effective_tokens(all_events, reqs, window_size = 1.0)),
-                'average_n_active_servers': float(calc_n_active_servers(all_events, window_size = 1.0)),
+                'average_n_active_servers': average_n_active_servers,
                 # 'max_num_reqs': float(np.max(num_reqs_series)),
                 # 'max_num_reqs_under_slo': float(np.max(num_reqs_series - num_violations)),
                 'rejection_rate': rejection_rate,
+                'device_stats': device_stats,
+                'energy_est': sum(energies),
+                **breakdown
             }
         
     }
@@ -2722,7 +2941,131 @@ def analyze_energy_consumption():
     print("Saved requests_vs_energy_scatter.png, requests_vs_energy_agg.png, requests_vs_energy_box.png")
 
 
+def draw_energy_comparison(
+    event_files = [
+        ('Baseline (8 Servers)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4500_anytime_0.0/vllm_round_robin_1.0_8_anytime_5.0_0.05.events.jsonl', 8, 'red'),
+        # ('Baseline (8 Servers)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4600_anytime_0.0/sarathi_round_robin_1.0_8_anytime_5.0_0.05.events.jsonl', 8, 'orange'),
+        # ('RR + SLOsServe (4, 100%)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4500_anytime_0.0/slosserve-edf_round_robin_1.0_4_anytime_5.0_0.05.events.jsonl', 4, 'orange'),
+        # ('LC (w/o Pre. Adm.) + SLOsServe  (8, 70.8%)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4500_anytime_0.0/slosserve-edf_auto_scaling_resch-all_chat-1.0_1.0_8_anytime_5.0_0.05.events.jsonl', 8, 'green'),
+        # ('LC (Pre. Adm) + SLOsServe  (8, 93.8%)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4500_anytime_0.0/slosserve-edf_auto_scaling_resch-all_chat-0.05_1.0_8_anytime_5.0_0.05.events.jsonl', 8, 'green'),
+        ('SLOsServe (4 Servers)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4600_anytime_0.0/slosserve-edf_auto_scaling_resch-all_chat-1.0_1.0_4_anytime_5.0_0.05.events.jsonl', 4, 'blue')
+    ],
+    output_suffix = None,
+    line_styles = {}
+):
+    
+    fig, axes = plt.subplots(3, figsize = (10, 12), sharex = True, tight_layout = True)
+    is_first = True
+    all_energies = {}
+    for label, file, n_device, color in event_files:
+        events, _ = analyze_events(file)
+        if is_first:
+            arrival_times = [e.timestamp for e in events if e.event_type == 'global_arrival']
+            is_first = False
+            if arrival_times:
+                arrival_window = 5
+                linewidth = 2
+                arrival_times = np.asarray(arrival_times, dtype=np.float64)
+                t0 = np.floor(arrival_times.min() / arrival_window) * arrival_window
+                idx = np.floor((arrival_times - t0) / arrival_window).astype(np.int64)
+                counts = np.bincount(idx)
+                time_axis = t0 + np.arange(counts.size, dtype=np.float64) * arrival_window
+                ax = axes[0]
+                ax.step(time_axis, counts, where="post", color=color, linewidth=linewidth)
+                ax.set_ylabel(f"# requests / {arrival_window:g}s")
+                ax.grid(True, alpha=0.3)
+                            
+                # arrival_times = np.asarray(arrival_times, dtype=np.float64)
+                # t0 = np.floor(arrival_times.min())
+                # second_idx = np.floor(arrival_times - t0).astype(np.int64)
+                # arrivals_per_sec = np.bincount(second_idx)
+                # time_axis = t0 + np.arange(arrivals_per_sec.size, dtype=np.float64)
+                # axes[0].step(time_axis, arrivals_per_sec, where="post", color="black", linewidth=2)
+                # axes[0].set_ylabel("# requests / 1s")
+                # axes[0].set_title("Request arrivals per 1s window")
+                # axes[0].grid(True, alpha=0.3)
+                
+        energies = calc_energy(events, n_device, ax = axes[2], n_device_ax = axes[1], label = label, color = color, window_size=1.0, linestyle = line_styles.get(label, '-'))
+        all_energies[label] = energies
+    print('all_energies', {label: np.mean(value) for label, value in all_energies.items()})
+    
+    axes[0].set_title("")
+    axes[0].set_ylabel('#Req Per\nWindow', fontsize = 30)
+    axes[1].set_ylabel('Average\n#Active GPU', fontsize = 30)
+    axes[1].set_ylim(0,10)
+    axes[1].set_xlabel("")
+    axes[2].set_ylabel('GPU Power\n(W)', fontsize = 30)
+    axes[2].set_ylim(0, 1500)
+    axes[2].set_xlabel('Time (s)', fontsize = 30)
+    # for ax in axes:
+        # axes[0].set_xlim(350, 650)
+    axes[1].set_ylim(0)
+    fig.legend(
+        
+    )
+    fig.savefig(f'energy_comparison-{output_suffix}.png')
+    print(f'saved to energy_comparison-{output_suffix}.png')
+    
+    # fig, ax = plt.subplots(tight_layout = True, figsize = (5, 5))
+    # labels = list(all_energies.keys())
+    # colors = [color for label, _, _, color in event_files]
+    # avg_energies = np.array(
+    #     [np.mean(np.asarray(all_energies[label], dtype=np.float64)) if all_energies[label] else 0.0 for label in labels],
+    #     dtype=np.float64,
+    # )
+    # x = np.arange(len(labels))
+    # ax.bar(x, avg_energies, color=colors[: len(labels)], alpha=0.85)
+    # ax.set_xticks(x)
+    # ax.set_xticklabels(labels, rotation=15, ha='right')
+    # ax.set_ylabel('Average energy (J)')
+    # ax.set_title('Average energy per baseline')
+    # ax.grid(axis='y', alpha=0.3)
+    
+    # for label, energies in all_energies.items():
+    #     ax.hist(energies, label = label)
+    # ax.legend()
+    # ax.set_xlabel('Energy (J)')
+    # ax.set_ylabel('Time (s)')
+    # fig.savefig(f'energy_distr-{output_suffix}.png')
+    # print(f'saved to energy_distr-{output_suffix}.png')
+    return fig, axes
+    
 if __name__ == '__main__':
+    # draw_energy_comparison(event_files = [
+    #     ('vLLM', 'experiments_mock/Qwen-7B_constant_azure_code:azure_code_0:1000_arrival_0.0/vllm_round_robin_1.0_16_arrival_5.0_0.05.events.jsonl', 16, 'Black'),
+    #     # ('+ Feasibility Check', 'experiments_mock/Qwen-7B_constant_azure_code:azure_code_0:1000_arrival_0.0/slosserve-edf_round_robin_1.0_12_arrival_5.0_0.05.events.jsonl', 12, 'red'),
+    #     ('Ours', 'experiments_mock/Qwen-7B_constant_azure_code:azure_code_0:1000_arrival_0.0/slosserve-edf_slosserve-1-4_1.0_12_arrival_5.0_0.05.events.jsonl', 12, 'blue')
+    # ],
+    #     output_suffix = 'azure_code')
+    # fig, axes = draw_energy_comparison(
+    #     event_files = [('vLLM+ (Colocated)', 'experiments_emulation_new/Qwen-7B_constant_azure_code_23:azure_code_23_t0:600_arrival_0.0/sarathi+_round_robin_0.5_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'black'),
+    #                 ('SLO Packer (Colocated)', 'experiments_emulation_new/Qwen-7B_constant_azure_code_23:azure_code_23_t0:600_arrival_0.0/atfc_slosserve_2_0.5_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'blue'),
+    # # ('SLO Packer (Disagg)', 'experiments_emulation/Qwen-7B_constant_azure_code_23:azure_code_23_t0:600_arrival_0.0/atfc_slosserve_1_disagg_4_0.5_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'blue'),
+    # # ('vLLM+ (Disagg)', 'experiments_emulation/Qwen-7B_constant_azure_code_23:azure_code_23_t0:600_arrival_0.0/sarathi+_round_robin-1-disagg-4_0.5_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'green')
+    #     ],
+    #     output_suffix = 'azure_cpde_23',
+    #     line_styles={'vLLM+ (Colocated)': '-', 'SLO Packer (Colocated)': '--'}
+    # )
+    
+    fig, axes = draw_energy_comparison(
+        event_files = [('vLLM+ (Colocated)', 'experiments_emulation_new/Qwen-7B_constant_azure_chat_23:azure_chat_23_t0:600_arrival_0.0/sarathi+_round_robin_1.0_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'black'),
+                    ('SLO Packer (Colocated)', 'experiments_emulation_new/Qwen-7B_constant_azure_chat_23:azure_chat_23_t0:600_arrival_0.0/atfc_slosserve_2_1.0_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'blue'),
+    # ('SLO Packer (Disagg)', 'experiments_emulation/Qwen-7B_constant_azure_code_23:azure_code_23_t0:600_arrival_0.0/atfc_slosserve_1_disagg_4_0.5_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'blue'),
+    # ('vLLM+ (Disagg)', 'experiments_emulation/Qwen-7B_constant_azure_code_23:azure_code_23_t0:600_arrival_0.0/sarathi+_round_robin-1-disagg-4_0.5_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'green')
+        ],
+        output_suffix = 'azure_chat_23',
+        line_styles={'vLLM+ (Colocated)': '-', 'SLO Packer (Colocated)': '-'}
+    )
+    
+    exit(0)
+    draw_energy_comparison(
+        event_files = [
+            ('vLLM', 'experiments_mock/Qwen-7B_constant_azure_code_23:azure_code_23_0:2000_arrival_0.0/vllm_round_robin_1.0_8_arrival_5.0_0.05.events.jsonl', 8, 'red'),
+            ('Ours', 'experiments_mock/Qwen-7B_constant_azure_code_23:azure_code_23_0:2000_arrival_0.0/slosserve-edf_slosserve_1.0_6_arrival_5.0_0.05.events.jsonl', 6, 'green')
+        ],
+        output_suffix = 'azure_code_23'
+    )
+    
     event_file = 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_chat_23_3978:4579_anytime_0.0/slosserve-edf_auto_scaling_resch-all_mock-0.12_1.0_4_anytime_3.0_0.025.events.jsonl'
     events, reqs = analyze_events(event_file)
     fig, ax = plt.subplots(figsize=(10, 5))
