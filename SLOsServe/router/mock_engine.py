@@ -17,7 +17,6 @@ from vllm.v1.engine import FinishReason
 from vllm.utils import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_utils import init_none_hash, get_request_block_hasher
 from vllm.outputs import RequestOutput, CompletionOutput
-from SLOsServe.router.batchplan_bus import normalize_batchplan
 
 def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
     logger = logging.getLogger(name)
@@ -37,21 +36,30 @@ def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
     return logger
 
 
-logger = setup_logger("SLOsServe.router.mock_engine", os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"))
+def _task_done(task: asyncio.Task):
+    try:
+        task.result()  # re-raises exception if task failed
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Background coroutine crashed")
 
+logger = setup_logger("SLOsServe.router.mock_engine", os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"))
+DEBUG = False
 @ray.remote(max_concurrency=1024)
 class MockEngineCore:
     def __init__(self,
                  model_name: str,
                  mock_connector: bool,
+                 output_queue: RayQueue,
                  num_gpu_blocks: int = 23949,
                  device_id: int = -1,
-                 batchplan_bus=None):
+                 execplan_bus=None):
         self.model_name = model_name
         self.mock_connector = mock_connector
+        self.output_queue = output_queue
         self.device_id = device_id
-        self.batchplan_bus = batchplan_bus
-        self.output_queues: dict[str, RayQueue] = {}
+        self.execplan_bus = execplan_bus
         # NOTE: Attributes such as `engine_id`, `request_block_hasher`,
         # `_profile_events`, `n_arrived`, `n_finished_reqs`, and `n_rejected_reqs`
         # are referenced later but never initialized here. Any code that uses
@@ -110,9 +118,6 @@ class MockEngineCore:
         
         self._profile_events = []
         self.loop_task: asyncio.Task | None = None
-        self._batchplan: list[dict[str, Any]] = []
-        self._batchplan_version: int = 0
-        self._batchplan_timestamp: float = time.time()
         
         self.n_arrived_reqs = 0
         self.n_finished_reqs = 0
@@ -129,7 +134,7 @@ class MockEngineCore:
         if self.loop_task is None:
             logger.info('Starting loop task')
             self.loop_task = asyncio.create_task(self.loop())
-
+            self.loop_task.add_done_callback(_task_done)
     async def shutdown(self):
         if self.loop_task is not None:
             self.loop_task.cancel()
@@ -175,6 +180,7 @@ class MockEngineCore:
         self.n_arrived_reqs = 0
         self.n_finished_reqs = 0
         self.n_rejected_reqs = 0
+        self.batch_id = 0
         for k, v in config.items():
             if isinstance(v, dict):
                 for kk, vv in v.items():
@@ -184,10 +190,6 @@ class MockEngineCore:
                 setattr(self.scheduler.scheduler_config, k, v)
         logger.info(f'Scheduler config updated: {self.scheduler.scheduler_config}')
         self.scheduler.reset(self._profile_events)
-        self._batchplan = []
-        self._batchplan_timestamp = time.time()
-        self._batchplan_version += 1
-        self._publish_batchplan_to_bus()
 
     @property
     def on(self) -> bool: 
@@ -195,64 +197,6 @@ class MockEngineCore:
 
     async def get_load_statistics(self, t: float = 1) -> list[dict[str, Any]]:
         return self.scheduler.get_load_statistics(t)
-    
-    async def get_batchplan(self) -> dict[str, Any]:
-        return {
-            "device_id": self.device_id,
-            "version": self._batchplan_version,
-            "timestamp": self._batchplan_timestamp,
-            "batchplan": copy.deepcopy(self._batchplan),
-        }
-
-    def _publish_batchplan_to_bus(self):
-        if self.batchplan_bus is None:
-            return
-        self.batchplan_bus.publish.remote(
-            self.device_id,
-            self._batchplan_version,
-            self._batchplan_timestamp,
-            self._batchplan,
-        )
-
-    def _build_batchplan(self,
-                         scheduler_output,
-                         first_batch_duration: float) -> list[dict[str, Any]]:
-        capacity = getattr(self.scheduler.scheduler_config,
-                           "max_num_batched_tokens",
-                           None)
-
-        planned_batches: list[dict[str, Any]] = []
-
-        # Try scheduler-provided future plans first (if exposed by this version).
-        raw_future = getattr(scheduler_output, "future_batches", None)
-        if isinstance(raw_future, list):
-            for raw_batch in raw_future:
-                if not isinstance(raw_batch, dict):
-                    continue
-                allocated_tokens = raw_batch.get("allocated_tokens")
-                if not isinstance(allocated_tokens, dict):
-                    allocated_tokens = raw_batch.get("num_scheduled_tokens", {})
-                if not isinstance(allocated_tokens, dict):
-                    continue
-                batch = {
-                    "estimated_time": raw_batch.get("estimated_time", 0.0),
-                    "allocated_tokens": allocated_tokens,
-                }
-                batch_capacity = raw_batch.get("capacity", capacity)
-                if batch_capacity is not None:
-                    batch["capacity"] = batch_capacity
-                planned_batches.append(batch)
-
-        # Fallback: only current executing batch is known.
-        if not planned_batches:
-            planned_batches.append({
-                "estimated_time": 0.0,
-                "allocated_tokens": scheduler_output.num_scheduled_tokens,
-                "capacity": capacity,
-                "duration": first_batch_duration,
-            })
-
-        return normalize_batchplan(planned_batches)
 
     async def dump_profile_events(self, filename: str):
         logger.info(f'dumping profile events to {filename}')
@@ -265,7 +209,7 @@ class MockEngineCore:
             json.dump(self._profile_events, f, indent=4)
         logger.info(f'Saved {len(self._profile_events)} events to {filename}')
         self._profile_events.clear()
-     
+
     async def abort_request(self, request_id: str):
         self.scheduler.abort_requests([request_id])
 
@@ -275,11 +219,6 @@ class MockEngineCore:
             print('mock engine started')
             while True:
                 if not self.on:
-                    if self._batchplan:
-                        self._batchplan = []
-                        self._batchplan_timestamp = time.time()
-                        self._batchplan_version += 1
-                        self._publish_batchplan_to_bus()
                     await asyncio.sleep(0.003)
                     continue
                 start_time = time.time()
@@ -287,15 +226,18 @@ class MockEngineCore:
                 if self.batch_id % 100 == 0:
                     stats = self.scheduler.make_stats()
                     print(f'[MockEngineCore] batch_id={self.batch_id}, stats={stats}, n_arrived_reqs={self.n_arrived_reqs}, n_finished_reqs={self.n_finished_reqs}, n_rejected_reqs={self.n_rejected_reqs}')
-                non_loop_time = time.time() - start_time 
-                
                 self.batch_id += 1
                 scheduling_start = time.time()
                 scheduler_output = self.scheduler.schedule()
                 scheduling_overhead = time.time() - scheduling_start
-                
+                publish_start = time.time()
+                if self.execplan_bus is not None:
+                    self.execplan_bus.publish.remote(
+                        self.device_id, time.time(),
+                        self.scheduler.get_exec_plan())
+                publish_overhead = time.time() - publish_start
                 # print(f'[MockEngineCore] batch_id={self.batch_id}, number_scheduled_tokens: {scheduler_output.num_scheduled_tokens}')
-                
+                rejs = []
                 for req in self.scheduler.get_rejected_requests():
                     self._profile_events.append({
                         "event_type": "finish",
@@ -305,9 +247,19 @@ class MockEngineCore:
                         "scheduling_overhead": scheduling_overhead,
                     })
                     
-                    output_queue = self.output_queues.pop(req.request_id)
-                    output_queue.put_nowait({'finish_reason': 'rejected'})
-                    output_queue.put_nowait(None)
+                    rejs.append({
+                        'request_id': req.request_id, 
+                        'finish_reason': 'rejected'
+                    })
+                    
+                    self.n_finished_reqs += 1 
+                    self.n_rejected_reqs += 1 
+                    
+                    # output_queue = self.output_queues.pop(req.request_id)
+                    # output_queue.put_nowait({'finish_reason': 'rejected'})
+                    # output_queue.put_nowait(None)
+                if len(rejs):
+                    self.output_queue.put_nowait(rejs)
                 
                 req_ids = []
                 req_id_to_index = {}
@@ -332,18 +284,8 @@ class MockEngineCore:
                     prompt_logprobs_dict = {},
                     pooler_output = [],
                 )
-                
+                launch_start = time.time()
                 batch_time = self.perf_model.get_batch_time(batch)
-                if scheduler_output.total_num_scheduled_tokens > 0:
-                    self._batchplan = self._build_batchplan(scheduler_output, batch_time)
-                    self._batchplan_timestamp = time.time()
-                    self._batchplan_version += 1
-                    self._publish_batchplan_to_bus()
-                elif self._batchplan:
-                    self._batchplan = []
-                    self._batchplan_timestamp = time.time()
-                    self._batchplan_version += 1
-                    self._publish_batchplan_to_bus()
                 
                 # we mimic the current runtime by blocking the loop for the batch time.
                 await asyncio.sleep(batch_time)
@@ -352,20 +294,29 @@ class MockEngineCore:
                 output_processing_start = time.time()
                 
                 outputs = self.scheduler.update_from_output(scheduler_output, model_runner_output)
-                
+                responses = []
                 for output in outputs.values():
                     for req_output in output.outputs:
                         logger.debug(f"Sending output for request_id={req_output.request_id}")
-                        # print(f'Sending output for request_id={req_output.request_id}, putting {to_put}')
-                        output_queue = self.output_queues[req_output.request_id]
-                        output_queue.put_nowait({
+                        responses.append({
+                            'request_id': req_output.request_id,
                             'new_token_ids': req_output.new_token_ids,
-                            'finish_reason': str(req_output.finish_reason),
-                            'stop_reason': str(req_output.stop_reason),
+                            'finish_reason': str(req_output.finish_reason) if req_output.finish_reason is not None else None,
+                            'stop_reason': str(req_output.stop_reason) if req_output.stop_reason is not None else None,
                             'kv_transfer_params': req_output.kv_transfer_params,
                             'num_computed_tokens': req_output.num_computed_tokens,
                             'timestamp': time.time(),
                         })
+                        # print(f'Sending output for request_id={req_output.request_id}, putting {to_put}')
+                        # output_queue = self.output_queues[req_output.request_id]
+                        # output_queue.put_nowait({
+                        #     'new_token_ids': req_output.new_token_ids,
+                        #     'finish_reason': str(req_output.finish_reason),
+                        #     'stop_reason': str(req_output.stop_reason),
+                        #     'kv_transfer_params': req_output.kv_transfer_params,
+                        #     'num_computed_tokens': req_output.num_computed_tokens,
+                        #     'timestamp': time.time(),
+                        # })
                         if req_output.finish_reason is not None:
                             # print(f"Request {req_output.request_id} finished batch_id={self.batch_id}")
                             self._profile_events.append({
@@ -375,14 +326,17 @@ class MockEngineCore:
                                 "finish_reason": str(req_output.finish_reason),
                             })
                             # print(f"Request {req_output.request_id} finished {req_output.finish_reason}. Closing output queue.")
-                            self.output_queues.pop(req_output.request_id)
-                            output_queue.put_nowait(None)
+                            # self.output_queues.pop(req_output.request_id)
+                            # output_queue.put_nowait(None)
                             self.n_finished_reqs += 1
                             if req_output.finish_reason == FinishReason.REJECTED:
                                 self.n_rejected_reqs += 1
+                if len(responses):
+                    self.output_queue.put_nowait(responses)
+                
                 elapsed = time.time() - start_time
                 output_processing_elapsed = time.time() - output_processing_start
-                print(f'waiting {batch_time} seconds, batch takes {elapsed} seconds')
+                # print(f'waiting {batch_time} seconds, batch takes {elapsed} seconds')
                 if scheduler_output.total_num_scheduled_tokens > 0:
                     self._profile_events.append({
                         "event_type": "batch",
@@ -395,7 +349,15 @@ class MockEngineCore:
                         "scheduling_overhead": scheduling_overhead,
                         "between_batch_time": elapsed,
                         "output_processing_elapsed": output_processing_elapsed,
-                        "estimated_time": batch_time
+                        "estimated_time": batch_time,
+                        "rejected_reqs": [r['request_id'] for r in rejs],
+                        "publish_overhead": publish_overhead,
+                        "extra_args": {
+                            'to_schedule': scheduling_start - start_time, 
+                            'to_launch': launch_start - start_time, 
+                            'to_finish': output_processing_start - start_time,
+                            'to_est_finish': launch_start + batch_time - start_time
+                        }
                     })
         except Exception as e:
             print(f'Exception in loop: {e}')
@@ -403,15 +365,16 @@ class MockEngineCore:
 
     async def add_request(self, prompt: str | list[int], 
                           request_id: str,
-                          sampling_params: SamplingParams,
-                          out_q: RayQueue):
+                          sampling_params: SamplingParams,):
         '''
             SamplingParams(n=1, presence_penalty=0.0, frequency_penalty=0.0, repetition_penalty=1.0, temperature=1.0, top_p=1.0
         , top_k=0, min_p=0.0, seed=None, stop=[], stop_token_ids=[], bad_words=[], include_stop_str_in_output=False, ignore_eos=True, max_tokens=319, min_tokens=0, log
         probs=None, prompt_logprobs=None, skip_special_tokens=True, spaces_between_special_tokens=True, truncate_prompt_tokens=None, guided_decoding=None, extra_args={
         'input_length': 41, 'output_length': 319, 'zero_load_ttft': 0.016091, 'slo_ttft': 0.098273, 'profit': 1.0, 'request_id': 'a3cb6618-42bb-435a-bf6f-e488a56f222d', 'router_arrival_time': 1770191392.005625, 'prefill_ddl': 1770191392.103898})
         '''
-        print(f"Request {request_id} arrived batch_id={self.batch_id}, il={sampling_params.extra_args['input_length']}, ol={sampling_params.extra_args['output_length']}")
+        # print('dispatch', request_id, time.time(), 'mockenginecore')
+        # print(f"Request {request_id} arrived batch_id={self.batch_id}, il={sampling_params.extra_args['input_length']}, ol={sampling_params.extra_args['output_length']}")
+        add_request_start = time.time()
         input_length = sampling_params.extra_args.get('input_length', 0)
         decode_only = sampling_params.extra_args.get('decode_only', False)
         prefill_only = sampling_params.extra_args.get('prefill_only', False)
@@ -451,6 +414,8 @@ class MockEngineCore:
         
         # print(f"Adding request: {request}")
         admitted = self.scheduler.add_request(request)
+        
+        print(f'add_request takes {time.time() - add_request_start}s')
         # print(f"Request {request_id} arrived batch_id={self.batch_id}, il={sampling_params.extra_args['input_length']}, ol={sampling_params.extra_args['output_length']}, admitted = {admitted}")
         if not admitted:
             self.n_finished_reqs += 1
@@ -468,8 +433,7 @@ class MockEngineCore:
         
         logger.debug(f"Request {request.request_id} added to scheduler.")
 
-        
-        self.output_queues[request.request_id] = out_q
+        # self.output_queues[request.request_id] = out_q
         return True
 
 class MockEngine:
@@ -478,19 +442,60 @@ class MockEngine:
                  mock_connector: bool,
                  num_gpu_blocks: int = 23949,
                  device_id: int = -1,
-                 batchplan_bus=None):
+                 execplan_bus=None):
+        self._shared_out_q = RayQueue(maxsize = 8192)
+        self._local_queues: dict[str, asyncio.Queue] = {}
+        '''
+        def __init__(self,
+                 model_name: str,
+                 mock_connector: bool,
+                 output_queue: RayQueue,
+                 num_gpu_blocks: int = 23949,
+                 device_id: int = -1,
+                 execplan_bus=None):
+        '''
         self.engine_core = MockEngineCore.remote(
-            model_name,
-            mock_connector,
-            num_gpu_blocks,
-            device_id,
-            batchplan_bus,
+            model_name = model_name,
+            mock_connector=mock_connector,
+            output_queue = self._shared_out_q,
+            num_gpu_blocks = num_gpu_blocks,
+            device_id = device_id,
+            execplan_bus = execplan_bus,
         )
+        self.device_id = device_id
         ray.get(self.engine_core.ping.remote())
         logger.info(f'MockEngineCore created: {self.engine_core}')
         ray.get(self.engine_core.start_loop.remote())
+        self._demux_task = asyncio.create_task(self._demux_loop())
+        self._demux_task.add_done_callback(_task_done)
+        self._profile_events = []
         logger.info(f'MockEngine started: {self.engine_core}')
-        
+    
+    async def _demux_loop(self):
+        while True:
+            payload = await self._shared_out_q.get_async()
+            if payload:
+                self._handle_payload(payload)
+
+            # drain
+            while True:
+                try:
+                    payload = self._shared_out_q.get_nowait()
+                except Exception:
+                    break
+                if payload:
+                    self._handle_payload(payload)
+
+    def _handle_payload(self, payload):
+        for item in payload:
+            rid = item.get("request_id")
+            if not rid:
+                continue
+            q = self._local_queues.get(rid)
+            if q is None:
+                continue
+            q.put_nowait(item)  # ✅ don’t await if you want speed
+
     def generate(self,
         prompt: str | list[int],
         request_id: str, 
@@ -498,11 +503,30 @@ class MockEngine:
     ) -> AsyncGenerator[RequestOutput, None]:
         
         async def generate_stream():
-            out_q = RayQueue(maxsize = 512)
+            if DEBUG:
+                self._profile_events.append({
+                    'event_type': 'arrive_mock_engine',
+                    'request_id': request_id,
+                    'device_id': self.device_id, 
+                    'timestamp': time.time()
+                })
+            print('dispatch', request_id, time.time(), 'mockengine')
+            _q = asyncio.Queue(maxsize = 512)
+            self._local_queues[request_id] = _q
+            # TODO: ignore the prompt for now. update later. 
             admitted = await self.engine_core.add_request.remote(
-                prompt, request_id, sampling_params, out_q
+                "", request_id, sampling_params
             )
+            
+            if DEBUG:
+                self._profile_events.append({
+                    'event_type': 'mock_engine_get_response',
+                    'timestamp': time.time(),
+                    'request_id': request_id, 
+                    'device_id': self.device_id
+                })
             if not admitted:
+                self._local_queues.pop(request_id)
                 yield RequestOutput(
                     request_id=request_id,
                     prompt=None,
@@ -524,9 +548,7 @@ class MockEngine:
                 return
 
             while True:
-                chunk = await out_q.get_async()
-                if chunk is None:
-                    break
+                chunk = await _q.get()
                 yield RequestOutput(
                     request_id=request_id,
                     prompt=None,
@@ -545,25 +567,38 @@ class MockEngine:
                         )
                     ],
                     finished=chunk.get("finish_reason", None) is not None,
+                    kv_transfer_params=chunk.get('kv_transfer_params', None)
                 )
-
+                if chunk.get('finish_reason') is not None: break
+            self._local_queues.pop(request_id)
         return generate_stream()
-    
+
     async def update_config(self, request_json: dict):
+        self._profile_events.clear()
         await self.engine_core.update_config.remote(request_json)
-        
+
     async def dump_profile_events(self, path: str):
         await self.engine_core.dump_profile_events.remote(path)
+        import json
+        with open(path, 'r') as f:
+            data = json.load(f)
+        data.extend(self._profile_events)
+        with open(path, 'w') as f:
+            json.dump(data, f)
     
     async def shutdown(self):
         await self.engine_core.shutdown.remote()
-    
+        if self._demux_task is not None:
+            self._demux_task.cancel()
+            try:
+                await self._demux_task
+            except asyncio.CancelledError:
+                pass
+            self._demux_task = None
+        
     async def get_load_statistics(self, n: int = 100):
         return await self.engine_core.get_load_statistics.remote(n)
-    
-    async def get_batchplan(self):
-        return await self.engine_core.get_batchplan.remote()
-    
+
     async def abort(self, request_id: str):
         await self.engine_core.abort_request.remote(request_id)
     

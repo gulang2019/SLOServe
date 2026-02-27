@@ -12,7 +12,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 now = time.time
-
+DEBUG = False
 @dataclass(kw_only = True)
 class Request: 
     request_id: str 
@@ -20,16 +20,17 @@ class Request:
     prefill_ddl: float
     slo_tpot: float
     prefill_only: bool
+    kv_ready_time: float | None
     
     num_computed_tokens: int = 0
     last_sch_bid: int = -1
     
-    def get_next_ddl(self) -> float:
+    def get_next_ddl(self) -> float | None:
         if self.num_computed_tokens < self.num_prompt_tokens:
             return self.prefill_ddl
         return self.prefill_ddl + self.slo_tpot * (self.num_computed_tokens - self.num_prompt_tokens + 1)
         
-    def get_next_load(self) -> int:
+    def get_next_load(self) -> int | None:
         if self.num_computed_tokens < self.num_prompt_tokens:
             return self.num_prompt_tokens - self.num_computed_tokens
         return 1
@@ -40,6 +41,10 @@ class Request:
         else:
             assert n == 1
         self.num_computed_tokens += n
+    
+    def finished(self) -> bool:
+        if not self.prefill_only: return False
+        return self.num_computed_tokens >= self.num_prompt_tokens 
 
 @dataclass 
 class Batch:
@@ -64,6 +69,7 @@ class BatchPlanner:
     _next_batch_time: float | None = None # the begining time of the next batch 
     _perf_model_constant_headroom: float = 0.005
     
+    
     def __post_init__(self):
         self._perf_model.hardware_params[4] += self._perf_model_constant_headroom
     
@@ -77,22 +83,24 @@ class BatchPlanner:
                         prefill_ddl: float, 
                         slo_tpot: float, 
                         prefill_only: bool = False,
+                        kv_ready_time: float | None = None,
                         must_admit: bool = False):
         self._requests[request_id] = Request(request_id = request_id, 
                                              num_prompt_tokens=num_prompt_tokens,
                                              num_computed_tokens=num_computed_tokens,
                                              prefill_ddl = prefill_ddl, 
                                              slo_tpot = slo_tpot, 
-                                             prefill_only = prefill_only)
+                                             prefill_only = prefill_only,
+                                             kv_ready_time = kv_ready_time)
         feasible, batch_plan, reason = self._refresh() 
-        if not feasible and not must_admit:
+        if (not feasible) and (not must_admit):
             self._requests.pop(request_id)
         else:
             if not feasible:
                 logger.info(f'[BatchPlanner] Forced admission of {request_id}')
             self._batch_plan = batch_plan
             self._admitted_requests.append(request_id)
-        return feasible
+        return must_admit or feasible
     
     def get_next_batch_and_admitted_reqs(self) -> tuple[dict[str, int], set[str], ExecPlan]:
         if not len(self._batch_plan):
@@ -118,8 +126,15 @@ class BatchPlanner:
             for req_id, n_sch in b.n_scheduled_tokens.items():
                 num_computed_tokens[req_id] += n_sch
                 exec_plan.req_plans[req_id].append((num_computed_tokens[req_id], i))
+        exec_plan.num_free_blocks = self._num_free_blocks
         return next_batch.n_scheduled_tokens, admitted_requests, exec_plan
     
+    def finish_request(self, request_id: str):
+        self._requests.pop(request_id)
+        is_feasible, self._batch_plan, reason = self._refresh()
+        if not is_feasible:
+            logger.info(f'[BatchPlanner]: Infeasibility detected. {reason=}')
+            
     def commit_batch(self,
                      num_scheduled_tokens: dict[str, int],
                      finished_reqs: list[str],
@@ -132,15 +147,16 @@ class BatchPlanner:
                 elapsed
             )
             assert len(self._batch_plan)
-            self._profile_events.append({
-                "event_type": 'batch_planner_batch_commit',
-                "timestamp": t,
-                "extra_args": {
-                    "estimated_finish_time": self._next_batch_time,
-                    "slack": self._next_batch_time - t,
-                    "start_time": self._batch_plan[0].start_time
-                }
-            })
+            if DEBUG:
+                self._profile_events.append({
+                    "event_type": 'batch_planner_batch_commit',
+                    "timestamp": t,
+                    "extra_args": {
+                        "estimated_finish_time": self._next_batch_time,
+                        "slack": self._next_batch_time - t,
+                        "start_time": self._batch_plan[0].start_time
+                    }
+                })
             
         self._last_commit_time = now()
         if not num_scheduled_tokens == self._batch_plan[0].n_scheduled_tokens:
@@ -173,21 +189,43 @@ class BatchPlanner:
         # Step 2: the compute check 
         Q = []
         B: list[Batch] = []
-        for req in self._requests.values(): 
+        for i, req in enumerate(self._requests.values()): 
             req_copy = copy.deepcopy(req)
             req_copy.last_sch_bid = -1
-            heapq.heappush(Q, (req_copy.get_next_ddl(), req_copy))
+            if not req_copy.finished():
+                heapq.heappush(Q, (req_copy.get_next_ddl(), i, req_copy)) # add i to break ties 
         T = now()
         if self._next_batch_time is not None: 
             T = max(T, self._next_batch_time)
         for _ in range(self._max_lookahead): 
             if not len(Q): break
-            next_ddl, req = heapq.heappop(Q)
+            next_ddl, req_uuid, req = heapq.heappop(Q)
             assert isinstance(req, Request)
             _next_load = next_load = req.get_next_load()
+            if req.kv_ready_time is not None and req.kv_ready_time > T:
+                # Try to use the gap before KV is ready.
+                n_token_next_batch = self._perf_model.get_bs(req.kv_ready_time - T, num_reqs=1)
+                if n_token_next_batch > 0:
+                    batch = Batch(
+                        unscheduled_tokens=n_token_next_batch,
+                        start_time=T,
+                    )
+                    B.append(batch)
+                # If the gap is too short (get_bs <= 0), just advance time.
+                T = req.kv_ready_time + 1e-6
+                    
+            if req.last_sch_bid == -1 and req.kv_ready_time is not None:
+                # we set last_sch_bid to the index of first batch begins after req.kv_ready_time minus 1
+                idx = 0
+                while idx < len(B) and B[idx].start_time < req.kv_ready_time:
+                    idx += 1
+                req.last_sch_bid = idx - 1
+                assert (idx == len(B) and T >= req.kv_ready_time) or B[idx].start_time >= req.kv_ready_time
+                
             tot_remained_tokens = sum(B[bid].unscheduled_tokens for bid in range(req.last_sch_bid + 1, len(B)))
             if tot_remained_tokens < next_load:
                 n_token_next_batch = self._perf_model.get_bs(next_ddl - T, num_reqs = 1)
+                start_time = T
                 if n_token_next_batch + tot_remained_tokens < next_load:
                     is_feasible = False
                     # This is the fallback; we 
@@ -197,7 +235,8 @@ class BatchPlanner:
                 else:
                     T = next_ddl
                 batch = Batch(
-                    unscheduled_tokens= n_token_next_batch
+                    unscheduled_tokens= n_token_next_batch,
+                    start_time = start_time
                 )
                 B.append(batch)
                 tot_remained_tokens += n_token_next_batch
@@ -214,7 +253,8 @@ class BatchPlanner:
                     req.last_sch_bid = bid
                     
             req.commit(_next_load)
-            heapq.heappush(Q, (req.get_next_ddl(), req))
+            if not req.finished():
+                heapq.heappush(Q, (req.get_next_ddl(), req_uuid, req))
             assert next_load == 0
         
         logger.info(f'[BatchPlanner] Planned {len(B)} batches')
