@@ -1,4 +1,4 @@
-#include <promax_spec_sch.h>
+#include <adm_ctrl.h>
 #include <iostream>
 #include <chrono>  // For timing utilities
 
@@ -17,10 +17,10 @@ int main() {
     std::vector<Request> reqs = {
         Request("0", true, 8, 1, 1, 3, 0),
         Request("1", true, 12, 2, 20, 3, 0),
-        Request(2, true, 2, 2, 10, 3, 0),
-        Request(3, true, 2, 2, 1, 3, 0),
-        Request(4, false, 0, 0, 1, 3, 0),
-        Request(5, false, 0, 0, 1, 3, 0),
+        Request("2", true, 2, 2, 10, 3, 0),
+        Request("3", true, 2, 2, 1, 3, 0),
+        Request("4", false, 0, 0, 1, 3, 0),
+        Request("5", false, 0, 0, 1, 3, 0),
         // Request(6, false, 4, 2, 1, 3, 0),
     };
     std::sort(reqs.begin(), reqs.end(), [](Request& r1, Request& r2){

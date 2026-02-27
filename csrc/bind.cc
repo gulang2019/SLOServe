@@ -11,10 +11,10 @@ PYBIND11_MODULE(SLOsServe_C, m) {
 
     // Bind the Request struct
     py::class_<Request>(m, "Request")
-        .def(py::init<std::string, bool, double, int, int, double, int, int, int, int, int, bool>(),
+        .def(py::init<std::string, bool, double, int, int, double, int, int, int, int, int, bool, double>(),
              py::arg("id"), py::arg("is_new_req"), py::arg("ddl"), py::arg("input_length"), py::arg("n_computed_tokens"),
              py::arg("profit"), py::arg("mem"), py::arg("tpot_idx"), py::arg("prefill_mem") = -1,
-             py::arg("prefill_device_id") = -1, py::arg("decode_device_id") = -1, py::arg("prefill_only") = false)
+             py::arg("prefill_device_id") = -1, py::arg("decode_device_id") = -1, py::arg("prefill_only") = false, py::arg("arrival_time") = 0.0)
         .def_readwrite("id", &Request::id)
         .def_readwrite("is_new_req", &Request::is_new_req)
         .def_readwrite("ddl", &Request::ddl)
@@ -27,6 +27,7 @@ PYBIND11_MODULE(SLOsServe_C, m) {
         .def_readwrite("prefill_device_id", &Request::prefill_device_id)
         .def_readwrite("decode_device_id", &Request::decode_device_id)
         .def_readwrite("prefill_only", &Request::prefill_only)
+        .def_readwrite("arrival_time", &Request::arrival_time)
         .def("__repr__", [](const Request& req) {
             return "<Request id=" + req.id +
                    " is_new_req=" + std::to_string(req.is_new_req) +
@@ -85,7 +86,7 @@ PYBIND11_MODULE(SLOsServe_C, m) {
     // Bind the AdmCtrlScheduler class
     py::class_<AdmCtrlScheduler>(m, "AdmCtrlScheduler")
         .def(py::init<>())
-        .def(py::init<std::string, bool>(), py::arg("mode"), py::arg("continuous"))
+        .def(py::init<std::string, bool, bool>(), py::arg("mode"), py::arg("fifo_fair"), py::arg("continuous"))
         .def("set_ar_planner", &AdmCtrlScheduler::set_ar_planner,
             py::arg("tpots"), py::arg("hardware_params"), py::arg("fixed_bs"), py::arg("max_bs") = 16384)
         .def("set_sd_planner", &AdmCtrlScheduler::set_sd_planner,

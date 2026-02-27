@@ -113,7 +113,7 @@ int main(int argc, char** argv) {
                   << " " << req.tpot_idx << "\n";
     }
 
-    AdmCtrlScheduler scheduler(mode, false);
+    AdmCtrlScheduler scheduler(mode, true, false);
 
     // scheduler.set_sd_planner(tpots, 
     //     hardware_params, 

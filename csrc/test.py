@@ -136,13 +136,13 @@ def test_problems(filepath = 'experiments/Qwen-7B_constant_sharegpt_code:azure_c
     perf_model = PerfModel.get_perf_model(model_name, 'azure_chat_23')
     bs = perf_model.get_bs(slo_tpot, 1)
     print('bs', bs)
-    scheduler_dp = C.AdmCtrlScheduler("dp", False)
+    scheduler_dp = C.AdmCtrlScheduler("dp", False, False)
     scheduler_dp.set_ar_planner([slo_tpot], perf_model.hardware_params, False)
     
-    scheduler_edf = C.AdmCtrlScheduler("edf", False)
+    scheduler_edf = C.AdmCtrlScheduler("edf", False, False)
     scheduler_edf.set_ar_planner([slo_tpot], perf_model.hardware_params, False)
     
-    scheduler_ar_fixed_bs = C.AdmCtrlScheduler("edf", False)
+    scheduler_ar_fixed_bs = C.AdmCtrlScheduler("edf", False, False)
     scheduler_ar_fixed_bs.set_ar_planner([slo_tpot], perf_model.hardware_params, True, 1769)
     
     num_accepted_reqs = []
@@ -338,7 +338,8 @@ def synthesize_problems(datasets, model_name):
                 prefill_mem = 1,
                 prefill_device_id = 0, 
                 decode_device_id = 0,
-                prefill_only = False
+                prefill_only = False,
+                arrival_time = 0.0
             ) for i, req in enumerate(requests)
         ]
         return {
@@ -406,10 +407,10 @@ def run(problems, model_name, tpot, dataset):
     df = pd.DataFrame(all_results)
     return df
 
-# test_problems('experiments/Qwen-7B_constant_sharegpt_code:azure_code_23_3979:4579_anytime/slosserve-edf_auto_scaling-load_slo_req-1.0_1.2_1_anytime_3.0_0.025.events.jsonl',
-#               'Qwen/Qwen2.5-7B-Instruct',
-#               0.025)
-
+test_problems('experiments/Qwen-7B_constant_sharegpt_code:azure_code_23_3979:4579_anytime/slosserve-edf_auto_scaling-load_slo_req-1.0_1.2_1_anytime_3.0_0.025.events.jsonl',
+              'Qwen/Qwen2.5-7B-Instruct',
+              0.025)
+exit(0)
 # test_problems('experiments/Qwen-7B_constant_azure_chat_23:azure_chat_23_601:1202_anytime/slosserve-edf_auto_scaling-all-0.18_4.0_4_anytime_5.0_0.1.events.jsonl',
 #               'google/gemma-3-27b-it',
 #               0.1)

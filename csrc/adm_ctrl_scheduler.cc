@@ -847,31 +847,35 @@ std::tuple<bool, std::vector<std::string>, std::vector<Batch> > AdmCtrlScheduler
         return {true, {}, {}};
     }
 
-    sort(reqs.begin(), reqs.end(), [](Request& r1, Request& r2){
-        return r1.ddl < r2.ddl; 
-    });
-
+    
     if (_verbose) {
         std::cout << "Requests:" << std::endl;
         for (auto& req: reqs)
-            std::cout << req << std::endl;
+        std::cout << req << std::endl;
     }
     
-    bool is_feasible;
-    std::vector<bool> is_accepted;
-    std::vector<Batch> batches;
-    if (mode == "fcfs") {
-        std::tie(is_feasible, is_accepted, batches) = _admission_control_fcfs(reqs, M, current_time);
-    }
-    else if (mode == "dp") {
-        std::tie(is_feasible, is_accepted, batches) = _admission_control_dp(reqs, M, current_time);
-    }
-    else if (mode == "edf") {
-        std::tie(is_feasible, is_accepted, batches) = _admission_control_edf(reqs, M, current_time);
-    }
-    else {
-        throw std::runtime_error("Invalid mode: " + mode);
-    }
+
+    sort(reqs.begin(), reqs.end(), [](Request& r1, Request& r2){
+        return r1.ddl < r2.ddl; 
+    });
+    auto [is_feasible, is_accepted, batches] = admission_control(reqs, M, current_time);
+
+    // bool is_feasible;
+    // std::vector<bool> is_accepted;
+    // std::vector<Batch> batches;
+
+    // if (mode == "fcfs") {
+    //     std::tie(is_feasible, is_accepted, batches) = _admission_control_fcfs(reqs, M, current_time);
+    // }
+    // else if (mode == "dp") {
+    //     std::tie(is_feasible, is_accepted, batches) = _admission_control_dp(reqs, M, current_time);
+    // }
+    // else if (mode == "edf") {
+    //     std::tie(is_feasible, is_accepted, batches) = _admission_control_edf(reqs, M, current_time);
+    // }
+    // else {
+    //     throw std::runtime_error("Invalid mode: " + mode);
+    // }
     timer("admission_control");
 
     if (not is_feasible) {
@@ -955,6 +959,155 @@ std::tuple<bool, std::vector<std::string>, std::vector<Batch> > AdmCtrlScheduler
     // timer.display();
     /*2. Realize the batch & Maximize the utilization*/
     return {is_feasible, acc_ids, batches};
+}
+
+std::tuple<bool, std::vector<bool>,
+    std::vector<Batch> > AdmCtrlScheduler::admission_control(
+    std::vector<Request>& reqs,
+    const int M,
+    double current_time
+) {
+
+    // Helper that applies the selected admission-control policy to a
+    // given request list. The requests are sorted by deadline before
+    // dispatching to the underlying implementation.
+    auto _dispatch = [this](std::vector<Request>& local_reqs,
+        const int local_M,
+        double local_current_time) {
+        std::sort(local_reqs.begin(), local_reqs.end(),
+                  [](const Request& r1, const Request& r2) {
+                      return r1.ddl < r2.ddl;
+                  });
+        if (mode == "fcfs") {
+            return _admission_control_fcfs(local_reqs, local_M, local_current_time);
+        } else if (mode == "dp") {
+            return _admission_control_dp(local_reqs, local_M, local_current_time);
+        } else if (mode == "edf") {
+            return _admission_control_edf(local_reqs, local_M, local_current_time);
+        }
+        throw std::runtime_error("Invalid mode: " + mode);
+    };
+
+    // Simple path: run admission control once on the full request set.
+    if (not fifo_fair) {
+        return _dispatch(reqs, M, current_time);
+    }
+
+    // FIFO-fair path:
+    //
+    // Old requests (is_new_req == false) are considered first; we find a
+    // feasible schedule for them. Then we add new requests one by one in
+    // arrival order, only keeping configurations where:
+    //  - The system stays feasible.
+    //  - No previously accepted request becomes rejected.
+    //
+    // The final result is expanded back to a full is_accepted mask aligned
+    // with the original reqs vector.
+    
+
+    // Partition into old and new requests, preserving original order.
+    std::vector<Request> old_reqs;
+    std::vector<size_t> old_indices;
+    std::vector<Request> new_reqs;
+    std::vector<size_t> new_indices;
+    old_reqs.reserve(reqs.size());
+    new_reqs.reserve(reqs.size());
+    old_indices.reserve(reqs.size());
+    new_indices.reserve(reqs.size());
+
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        auto& req = reqs[i];
+        if (req.is_new_req) {
+            new_reqs.push_back(req);
+            new_indices.push_back(i);
+        } else {
+            old_reqs.push_back(req);
+            old_indices.push_back(i);
+        }
+    }
+
+    sort(new_reqs.begin(), new_reqs.end(),
+         [](const Request& r1, const Request& r2) {
+             return r1.arrival_time < r2.arrival_time;
+         });
+
+    // Start with only old requests.
+    auto [is_feasible, is_accepted_old, batches] =
+        _dispatch(old_reqs, M, current_time);
+
+    // If the old-only configuration is infeasible, nothing can be admitted.
+    if (!is_feasible) {
+        return {
+            false,
+            std::vector<bool>(reqs.size(), false),
+            std::vector<Batch>()};
+    }
+
+    // Maintain the last accepted decision vector over the *current* working set
+    // of requests, which we grow as we append new ones.
+    std::vector<Request> working_reqs = old_reqs;
+    std::vector<bool> working_accepted = is_accepted_old;
+
+    // Helper to check that previously accepted requests are not dropped
+    // between two admission-control runs (monotonic acceptance).
+    auto preserves_prior_accepts =
+        [](const std::vector<bool>& prev,
+           const std::vector<bool>& curr) {
+            if (prev.size() > curr.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < prev.size(); ++i) {
+                if (prev[i] && !curr[i]) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+    // Try to add each new request in arrival order.
+    for (size_t i = 0; i < new_reqs.size(); ++i) {
+        working_reqs.push_back(new_reqs[i]);
+        auto [next_feasible, next_accepted, next_batches] =
+            _dispatch(working_reqs, M, current_time);
+
+        // If the new request cannot be accommodated without violating
+        // feasibility or dropping previously accepted requests, stop
+        // admitting further new requests.
+        if (!next_feasible ||
+            !preserves_prior_accepts(working_accepted, next_accepted)) {
+            break;
+        }
+
+        // This configuration is acceptable; keep it and continue.
+        working_accepted = std::move(next_accepted);
+        batches = std::move(next_batches);
+    }
+
+    // Expand working_accepted (which is indexed over working_reqs) back
+    // into a full is_accepted vector aligned with the original reqs.
+    std::vector<bool> is_accepted(reqs.size(), false);
+
+    // Map old_reqs part.
+    for (size_t i = 0; i < old_indices.size(); ++i) {
+        size_t idx = old_indices[i];
+        if (i < working_accepted.size()) {
+            is_accepted[idx] = working_accepted[i];
+        }
+    }
+
+    // Map any admitted new requests that were included in working_reqs.
+    size_t offset_new = old_indices.size();
+    for (size_t i = 0; i < new_indices.size(); ++i) {
+        size_t idx = new_indices[i];
+        size_t working_pos = offset_new + i;
+        if (working_pos < working_accepted.size()) {
+            is_accepted[idx] = working_accepted[working_pos];
+        } else {
+            is_accepted[idx] = false;
+        }
+    }
+
+    return {true, is_accepted, batches};
 }
 
 std::tuple<bool, std::vector<bool>, 

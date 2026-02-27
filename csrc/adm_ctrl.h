@@ -21,6 +21,7 @@ struct Request{
     int prefill_device_id; 
     int decode_device_id;
     bool prefill_only;
+    double arrival_time;
     
     Request() = default;
 
@@ -35,7 +36,8 @@ struct Request{
     int prefill_mem = -1,
     int prefill_device_id = 0,
     int decode_device_id = 0,
-    bool prefill_only = false): 
+    bool prefill_only = false,
+    double arrival_time = 0.0): 
         id(id),
         is_new_req(is_new_req), 
         ddl(ddl), 
@@ -47,7 +49,8 @@ struct Request{
         prefill_mem(prefill_mem),
         prefill_device_id(prefill_device_id),
         decode_device_id(decode_device_id),
-        prefill_only(prefill_only) {}
+        prefill_only(prefill_only),
+        arrival_time(arrival_time) {}
 };
 
 struct ReqBatch {
@@ -198,6 +201,7 @@ public:
 class AdmCtrlScheduler {
 protected:
     std::string mode;
+    bool fifo_fair = false;
     bool continuous = false;
     bool _verbose;
 
@@ -239,12 +243,13 @@ protected:
     );
 
 public: 
-    AdmCtrlScheduler(): mode("fcfs"), continuous(false) {}
+    AdmCtrlScheduler(): mode("fcfs"), fifo_fair(false), continuous(false) {}
     
     AdmCtrlScheduler(
         std::string mode,
-        bool continuous = false
-    ): mode(mode), continuous(continuous) {}
+        bool fifo_fair,
+        bool continuous
+    ): mode(mode), fifo_fair(fifo_fair), continuous(continuous) {}
 
     AdmCtrlScheduler& set_ar_planner(
         std::vector<double>& tpots,
@@ -290,6 +295,20 @@ public:
         int M,
         double current_time,
         bool verbose
+    );
+
+    std::tuple<bool, std::vector<bool>, 
+    std::vector<Batch> > admission_control(
+        std::vector<Request>& reqs,
+        const int M,
+        double current_time
+    );
+
+    std::tuple<bool, std::vector<bool>, 
+    std::vector<Batch> > _admission_control(
+        std::vector<Request>& reqs,
+        const int M,
+        double current_time
     );
 };
 
