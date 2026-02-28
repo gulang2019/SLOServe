@@ -20,7 +20,7 @@ except ImportError:
     SLOsServe_C = None
 
 from motivation.bench_api_server import Problem
-from motivation.common import PerfModel
+from SLOsServe.perf_model import PerfModel
 
 import logging
 

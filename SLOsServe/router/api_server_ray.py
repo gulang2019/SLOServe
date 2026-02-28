@@ -28,7 +28,7 @@ import ray
 from asyncio import Queue
 
 from motivation.bench_api_server import Problem
-from motivation.common import PerfModel
+from SLOsServe.perf_model import PerfModel
 
 import logging
 from SLOsServe.router.execplan_bus import ExecPlanBus, ExecPlan
@@ -1129,7 +1129,7 @@ class SLOsServeRouter(Router):
             router_kwargs = json.loads(router_kwargs)
         
         self.n_devices = n_devices
-        from motivation.common import PerfModel
+        from SLOsServe.perf_model import PerfModel
         self.model_name = router_kwargs['model_name']
         perf_model = PerfModel.get_perf_model(self.model_name)
         perf_model.hardware_params[4] += router_kwargs['scheduling_overhead']

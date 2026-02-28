@@ -1,10 +1,14 @@
 import copy
 import logging
 
+from SLOsServe.model_config import get_model_config
+
 logger = logging.getLogger(__name__)
 
 class PerfModel:
-    def __init__(self, hardware_params: list[float]):
+    def __init__(self, model_name, hardware_params: list[float]):
+        self.model_name = model_name
+        self.model_config = get_model_config(model_name)
         assert len(hardware_params) == 5
         self.hardware_params = copy.deepcopy(hardware_params)
         self._online_average_delay = 0.0
@@ -44,10 +48,16 @@ class PerfModel:
     
     @staticmethod
     def get_perf_model(model_name: str, task: str = 'default') -> 'PerfModel':
-        return PerfModel(get_hardware_params(model_name, task))
+        return PerfModel(model_name, get_hardware_params(model_name, task))
     
     def get_zero_load_ttft(self, input_length: int, cached_length: int = 0) -> float:
         return self.get_batch_time([(cached_length, input_length - cached_length)])
+
+    def get_kv_mem_per_token(self):
+        return self.model_config.get_token_cache_mem()
+
+    def get_max_decode_length(self):
+        return get_model_max_tokens(self.model_name)
 
 HW_PARAMS = {
     'default': [4.86e-5, 1.69e-5, 8e-8, 0, 1.4e-2],

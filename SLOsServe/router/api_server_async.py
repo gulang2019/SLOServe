@@ -26,7 +26,7 @@ from vllm.outputs import RequestOutput
 from vllm.inputs import TokensPrompt
 
 from motivation.bench_api_server import Problem
-from motivation.common import PerfModel
+from SLOsServe.perf_model import PerfModel
 
 import logging
 

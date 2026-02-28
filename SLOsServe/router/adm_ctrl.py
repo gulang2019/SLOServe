@@ -4,14 +4,14 @@ from dataclasses import dataclass, field
 import copy
 import math
 
-from motivation.common import PerfModel
+from SLOsServe.perf_model import PerfModel
 from SLOsServe.router.execplan_bus import ExecPlan
 
 import logging 
 
 logger = logging.getLogger(__name__)
 
-now = time.time
+
 DEBUG = False
 @dataclass(kw_only = True)
 class Request: 
@@ -21,6 +21,7 @@ class Request:
     slo_tpot: float
     prefill_only: bool
     kv_ready_time: float | None
+    output_length: int 
     
     num_computed_tokens: int = 0
     last_sch_bid: int = -1
@@ -42,8 +43,12 @@ class Request:
             assert n == 1
         self.num_computed_tokens += n
     
-    def finished(self) -> bool:
-        if not self.prefill_only: return False
+    def finished(self, use_oracle: bool = False) -> bool:
+        if not self.prefill_only: 
+            if use_oracle:
+                assert self.output_length is not None 
+                return self.num_computed_tokens >= self.num_prompt_tokens + self.output_length
+            return False 
         return self.num_computed_tokens >= self.num_prompt_tokens 
 
 @dataclass 
@@ -60,6 +65,8 @@ class BatchPlanner:
     _block_size: int
     _max_decode_length: int
     _profile_events: list = field(default_factory=list)
+    _is_oracle: bool = False
+    _now = time.time
     
     _num_free_blocks: int # the number of free blocks
     _last_commit_time: float | None = None
@@ -68,13 +75,15 @@ class BatchPlanner:
     _admitted_requests: list[str] = field(default_factory=list)
     _next_batch_time: float | None = None # the begining time of the next batch 
     _perf_model_constant_headroom: float = 0.005
+    _last_infeasible_reason: str | None = None
     
     
     def __post_init__(self):
         self._perf_model.hardware_params[4] += self._perf_model_constant_headroom
-    
+
     def _get_batch_time(self, batch: Batch):
         return self._perf_model.get_batch_time([(self._requests[req_id].num_computed_tokens, v) for req_id, v in batch.n_scheduled_tokens.items()])
+    
     def add_request(self, 
                         *,
                         request_id: str, 
@@ -84,22 +93,27 @@ class BatchPlanner:
                         slo_tpot: float, 
                         prefill_only: bool = False,
                         kv_ready_time: float | None = None,
-                        must_admit: bool = False):
+                        must_admit: bool = False,
+                        output_length: int | None = None):
+        assert not self._is_oracle or output_length is not None
         self._requests[request_id] = Request(request_id = request_id, 
                                              num_prompt_tokens=num_prompt_tokens,
                                              num_computed_tokens=num_computed_tokens,
                                              prefill_ddl = prefill_ddl, 
                                              slo_tpot = slo_tpot, 
                                              prefill_only = prefill_only,
-                                             kv_ready_time = kv_ready_time)
+                                             kv_ready_time = kv_ready_time,
+                                             output_length = output_length)
         feasible, batch_plan, reason = self._refresh() 
         if (not feasible) and (not must_admit):
             self._requests.pop(request_id)
+            self._last_infeasible_reason = reason
         else:
             if not feasible:
                 logger.info(f'[BatchPlanner] Forced admission of {request_id}')
             self._batch_plan = batch_plan
             self._admitted_requests.append(request_id)
+            self._last_infeasible_reason = None
         return must_admit or feasible
     
     def get_next_batch_and_admitted_reqs(self) -> tuple[dict[str, int], set[str], ExecPlan]:
@@ -111,13 +125,13 @@ class BatchPlanner:
         admitted_requests = set(self._admitted_requests)
         self._admitted_requests.clear()
         next_batch = self._batch_plan[0]
-        self._next_batch_time = now() + self._get_batch_time(next_batch)
+        self._next_batch_time = self._now() + self._get_batch_time(next_batch)
         
         for req_id, n_token in next_batch.n_scheduled_tokens.items():
             self._requests[req_id].commit(n_token)
                     
         exec_plan = ExecPlan()
-        t = now()
+        t = self._now()
         next_batch.start_time = t
         num_computed_tokens = {req_id: req.num_computed_tokens for req_id, req in self._requests.items()}
         for i, b in enumerate(self._batch_plan):
@@ -140,7 +154,7 @@ class BatchPlanner:
                      finished_reqs: list[str],
                      num_free_blocks: int):
         if self._last_commit_time is not None:
-            t = now()
+            t = self._now()
             elapsed = t - self._last_commit_time
             self._perf_model.update(
                 [(self._requests[req_id].num_computed_tokens, num_sched) for req_id, num_sched in num_scheduled_tokens.items()],
@@ -158,15 +172,15 @@ class BatchPlanner:
                     }
                 })
             
-        self._last_commit_time = now()
-        if not num_scheduled_tokens == self._batch_plan[0].n_scheduled_tokens:
-            logger.warning(f"num_scheduled_tokens mismatch: {num_scheduled_tokens=}, {self._batch_plan[0].n_scheduled_tokens=}")
+        self._last_commit_time = self._now()
+        # if not num_scheduled_tokens == self._batch_plan[0].n_scheduled_tokens:
+        #     logger.warning(f"num_scheduled_tokens mismatch: {num_scheduled_tokens=}, {self._batch_plan[0].n_scheduled_tokens=}")
             
         for req_id in finished_reqs:
             self._requests.pop(req_id) 
         
         self._num_free_blocks = num_free_blocks 
-        self._next_batch_time = now()
+        self._next_batch_time = self._now()
         is_feasible, self._batch_plan, reason = self._refresh()
         if not is_feasible:
             logger.info(f'[BatchPlanner]: Infeasibility detected. {reason=}')
@@ -181,7 +195,13 @@ class BatchPlanner:
         # TODO: Optimize the memory check, the current logic is that _num_free_blocks should be greator than the per-request overprovision for remained blocks and the new_request's size
         mem_ub = 0
         for req in self._requests.values():
-            mem_ub += math.ceil((self._max_decode_length + req.num_prompt_tokens - req.num_computed_tokens) / self._block_size)
+            if req.prefill_only:
+                max_decode_length = 0
+            else:
+                max_decode_length = self._max_decode_length if not self._is_oracle else req.output_length
+            assert max_decode_length is not None
+            mem_ub += math.ceil((max_decode_length + req.num_prompt_tokens - req.num_computed_tokens) / self._block_size)
+                
         if mem_ub > self._num_free_blocks:
             is_feasible = False
             infeasible_reason += f"MEM {mem_ub=}>{self._num_free_blocks=} |"
@@ -194,7 +214,7 @@ class BatchPlanner:
             req_copy.last_sch_bid = -1
             if not req_copy.finished():
                 heapq.heappush(Q, (req_copy.get_next_ddl(), i, req_copy)) # add i to break ties 
-        T = now()
+        T = self._now()
         if self._next_batch_time is not None: 
             T = max(T, self._next_batch_time)
         for _ in range(self._max_lookahead): 
@@ -253,7 +273,7 @@ class BatchPlanner:
                     req.last_sch_bid = bid
                     
             req.commit(_next_load)
-            if not req.finished():
+            if not req.finished(self._is_oracle):
                 heapq.heappush(Q, (req.get_next_ddl(), req_uuid, req))
             assert next_load == 0
         

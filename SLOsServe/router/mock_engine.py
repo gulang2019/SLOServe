@@ -70,7 +70,7 @@ class MockEngineCore:
         from vllm.config import VllmConfig
         from unittest.mock import MagicMock
         from vllm.v1.structured_output import StructuredOutputManager
-        from motivation.common import PerfModel
+        from SLOsServe.perf_model import PerfModel
         
         attrs = {}
         import pickle
