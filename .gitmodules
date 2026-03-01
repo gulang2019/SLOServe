@@ -22,3 +22,6 @@
 [submodule "3rdparty/ai-dynamo"]
 	path = 3rdparty/ai-dynamo
 	url = https://github.com/ai-dynamo/dynamo.git
+[submodule "3rdparty/speech_agent"]
+	path = 3rdparty/speech_agent
+	url = git@github.com:gulang2019/speech_agent.git
