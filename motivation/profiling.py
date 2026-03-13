@@ -101,7 +101,7 @@ async def run(batch_generator_name: str, n: int):
     print(f'{len(batches)} batches collected, {len(results)} batches already profiled')
     # exit(0)
     
-    from motivation.common import PerfModel
+    from SLOsServe.perf_model import PerfModel
     perf_model = PerfModel.get_perf_model('Qwen/Qwen2.5-7B-Instruct')
 
     for batch in tqdm(batches[len(results):]):

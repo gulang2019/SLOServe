@@ -8,7 +8,7 @@ from sklearn.metrics import r2_score
 import matplotlib
 
 
-from motivation.common import PerfModel
+from SLOsServe.perf_model import PerfModel
 filepath = 'events/Qwen_Qwen2.5-7B-Instruct_pd_sharegpt_chat_azure_chat_0-500_0.1.jsonl'
 
 
@@ -155,6 +155,7 @@ class ReqState(Event):
 @dataclass(kw_only=True)
 class KVXferReady(Event):
     request_id: str
+    kv_ready_time: float | None
 
 @dataclass(kw_only=True)
 class Arrival(Event):
@@ -1547,9 +1548,9 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
     window_size = 1
     time, num_reqs_series, num_violations, max_ttft, max_tpot, total_prompt_tokens, total_output_tokens, total_tokens, avg_kv_xfer_delay = _compute_window_series(events, window_size)
 
-    fig, axes = plt.subplots(2, figsize = (18, 10), tight_layout = True, sharex = True)
+    fig, axes = plt.subplots(3, figsize = (18, 10), tight_layout = True, sharex = True)
     _plot_line(axes[0], time, num_reqs_series, 'requests', 'tab:blue', ylabel='Requests', stat='mean')
-    energies = calc_energy(all_events, window_size = 1.0, n_device = n_device, ax = axes[1])
+    energies = calc_energy(all_events, window_size = 1.0, n_device = n_device, ax = axes[1], n_device_ax= axes[2])
     fig.savefig(f'{prefix}.energy.png', dpi=300, bbox_inches='tight')
     print(f'Energy saved to {prefix}.energy.png')
     average_n_active_servers, breakdown = calc_n_active_servers(all_events, window_size = 0.2)
@@ -2708,7 +2709,7 @@ def analyze_energy_consumption():
     ttft_slo_scale = 3
     slo_tpot = 0.025
     slo_ttft_overhead = 0.05
-    from motivation.common import PerfModel
+    from SLOsServe.perf_model import PerfModel
     perf_model = PerfModel.get_perf_model('Qwen/Qwen2.5-7B-Instruct')
     slo_ttft_fn = lambda req: req.zero_load_ttft * ttft_slo_scale + slo_ttft_overhead
     x,y=draw_min_servers(reqs, ax, slo_ttft_fn, slo_tpot, perf_model)

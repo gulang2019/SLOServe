@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 FIGDIR = 'figs/loads'
 os.makedirs(FIGDIR, exist_ok=True)
 
-from motivation.common import PerfModel, get_easy_name
+from SLOsServe.perf_model import PerfModel, get_easy_name
 
 def count_intervals(intervals: list[tuple[float, float, float, str]], 
                     window: float,
@@ -339,7 +339,7 @@ for model_name in [
     fig, ax = plt.subplots(figsize = (18, 5), tight_layout = True)
     visualize_load(
         arrival_times_name='azure_code_23',
-        requests_name='sharegpt_code',
+        requests_name='azure_code_23',
         model_name = model_name,
         ttft_slo_scale=3.0,
         slo_tpot=0.05 if 'Qwen' in model_name else 0.05,

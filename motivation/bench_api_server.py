@@ -24,7 +24,7 @@ logger.setLevel(logging.DEBUG)
 
 FRONTEND_DELAY=0.03
 
-from motivation.common import get_model_max_tokens, get_easy_name
+from SLOsServe.perf_model import get_model_max_tokens, get_easy_name
 from motivation.energy_measure import EnergyMeter, EnergyHistoryRecorder
 @dataclass
 class Problem:
@@ -95,7 +95,7 @@ class ExecutionResults:
     profit: float = field(init=False)
     
     def get_slo_result(self, exec_result: ExecutionResult):
-        from motivation.common import PerfModel
+        from SLOsServe.perf_model import PerfModel
         perf_model = PerfModel.get_perf_model(self.problem.model_name, self.problem.length_pattern)
         slo_ttft = perf_model.get_zero_load_ttft(exec_result.request.input_length, 
                                                  exec_result.request.cached_length) * \
@@ -293,7 +293,7 @@ async def main(problem: Problem, endpoint: str, clients: str):
     arrival_times = [t - arrival_times[0] for t in arrival_times]
     rps = len(arrival_times) / (arrival_times[-1] - arrival_times[0])
     
-    from motivation.common import PerfModel
+    from SLOsServe.perf_model import PerfModel
     perf_model = PerfModel.get_perf_model(problem.model_name, problem.length_pattern)
     
     # ensure_prompts_present(requests, problem.model_name)
@@ -369,7 +369,7 @@ async def main(problem: Problem, endpoint: str, clients: str):
                 prompt = request.prompt
                 assert prompt is not None
                 task_start_time = time.time()
-                request_id_backend = str(uuid.uuid4())
+                request_id_backend = str(arrival_idx) # str(uuid.uuid4())
                 request_id = str(arrival_idx)
                 bid_to_id[request_id_backend] = request_id
                 real_arrival_times[request_id] = task_start_time
@@ -540,13 +540,14 @@ async def main(problem: Problem, endpoint: str, clients: str):
         for event in events:
             if 'prefill_ddl' in event:
                 event['prefill_ddl'] = apply_time_offsets(event['prefill_ddl'])
+            if 'kv_ready_time' in event:
+                event['kv_ready_time'] = apply_time_offsets(event['kv_ready_time'])
         events = sorted(events, key=lambda x: x['timestamp'])
     with open(filename, 'w') as f:
         json.dump(events, f, indent = 4)
     print(f'Saved {filename}')
-    
-    
-    
+
+    # TODO(Yi): add oom fail rate analysis here.
     events, reqs = analyze_events(filename, verbose = True)
     results = analyze_slo_violation(reqs, events, 
                                     model_name = problem.model_name, 
@@ -605,7 +606,8 @@ def build_problems(
     perf_model_err: float = 1.0,
     routing_overhead: float = -1.0,
     scheduling_overhead: float = 0.0,
-    routing_fallback_policy: str = "asap"
+    routing_fallback_policy: str = "asap",
+    kv_xfer_delay: float = 0.05,
 ):
     store_prefix = f'{experiment_dir}/{scheduling_policy}_{routing_policy}_{load_scale}_{n_device}_{admission_mode}_{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
     
@@ -623,14 +625,35 @@ def build_problems(
     requests = Requests.load(requests_trace, window_start = 0, window_end = len(arrival_times.arrival_times), 
                             max_tokens = get_model_max_tokens(model_name)).requests
     
-    average_input_length = np.mean([request.input_length for request in requests])
-    average_output_length = np.mean([request.output_length for request in requests])
-    max_output_length = max([request.output_length for request in requests])
-    
+    input_lengths = np.fromiter((request.input_length for request in requests), dtype=np.float64, count=len(requests))
+    output_lengths = np.fromiter((request.output_length for request in requests), dtype=np.float64, count=len(requests))
+    average_input_length = float(np.mean(input_lengths))
+    average_output_length = float(np.mean(output_lengths))
+    output_length_percentiles = np.percentile(output_lengths, [50, 75, 85, 90, 95, 99])
+    max_output_length = int(max(output_lengths))
+    input_length_percentiles = np.percentile(input_lengths, [50, 75, 85, 90, 95, 99])
     print(f'average_input_length: {average_input_length}')
     print(f'average_output_length: {average_output_length}')
+    print(
+        f'input_length_percentiles: '
+        f'p50={input_length_percentiles[0]}, '
+        f'p75={input_length_percentiles[1]}, '
+        f'p85={input_length_percentiles[2]}, '
+        f'p90={input_length_percentiles[3]}, '
+        f'p95={input_length_percentiles[4]}, '
+        f'p99={input_length_percentiles[5]}'
+    )
+    print(
+        f'output_length_percentiles: '
+        f'p50={output_length_percentiles[0]}, '
+        f'p75={output_length_percentiles[1]}, '
+        f'p85={output_length_percentiles[2]}, '
+        f'p90={output_length_percentiles[3]}, '
+        f'p95={output_length_percentiles[4]}, '
+        f'p99={output_length_percentiles[5]}'
+    )
     print(f'max_output_length: {max_output_length}')
-    from motivation.common import PerfModel
+    from SLOsServe.perf_model import PerfModel
     perf_model = PerfModel.get_perf_model(model_name, requests_trace)
     max_decode_batch_size = perf_model.get_max_decode_batch_size(slo_tpot, average_input_length)
     decode_zero_load = perf_model.get_batch_time([(0, 1)])
@@ -767,16 +790,16 @@ def build_problems(
     if 'round_robin' in routing_policy:
         _args = routing_policy.split('-')
         routing_policy = 'round_robin'
-        n_group = 1
+        group_size = 1
         extra_kwargs = {}
         if len(_args) >= 2:
-            n_group = int(_args[1])
+            group_size = int(_args[1])
         if len(_args) >= 3:
             assert _args[2] == 'disagg'
             assert len(_args) >= 4
             n_prefill_server_per_group = int(_args[3])
             extra_kwargs = {
-                'n_group': n_group,
+                'group_size': group_size,
                 'is_pd_disagg': True, 
                 'n_prefill_per_group': n_prefill_server_per_group,
             }
@@ -855,7 +878,9 @@ def build_problems(
         # Supported forms:
         # - slosserve
         # - slosserve_<n_group>[_<n_lb>]
-        # - slosserve[_<n_group>[_<n_lb>]]_disagg_<n_prefill_per_group>
+        # - slosserve[_<n_group>[_<n_lb>]]_(disagg|diagg)_<n_prefill_per_group>
+        # - any above + _planner suffix (planner path enabled)
+        # - any above + _ablation suffix (without any global admission)
         # Also accepts '-' as separator.
         logger.info(f'parsing routing policy {routing_policy}')
         normalized_policy = routing_policy.replace('-', '_')
@@ -863,12 +888,20 @@ def build_problems(
         if not _args or _args[0] != 'slosserve':
             raise ValueError(f"Invalid slosserve routing policy: {routing_policy}")
 
-        group_size = 1
+        group_size = n_device
         n_lb = 1
         extra_kwargs = {}
-
-        if 'disagg' in _args:
-            disagg_idx = _args.index('disagg')
+        use_planner = False
+        if 'planner' in _args:
+            use_planner = True
+            _args = [x for x in _args if x != 'planner']
+        ablation = False 
+        if 'ablation' in _args:
+            ablation = True 
+            _args = [x for x in _args if x != 'ablation']
+        disagg_tokens = [tok for tok in ('disagg', 'diagg') if tok in _args]
+        if disagg_tokens:
+            disagg_idx = min(_args.index(tok) for tok in disagg_tokens)
             numeric_prefix = _args[1:disagg_idx]
             if len(numeric_prefix) >= 1:
                 group_size = int(numeric_prefix[0])
@@ -878,20 +911,22 @@ def build_problems(
                 raise ValueError(
                     f"Too many numeric fields before disagg in routing policy: {routing_policy}"
                 )
-            if disagg_idx + 1 >= len(_args):
-                raise ValueError(
-                    f"Missing n_prefill_per_group in disagg routing policy: {routing_policy}"
-                )
-            if disagg_idx + 2 != len(_args):
+            if disagg_idx + 2 < len(_args):
                 raise ValueError(
                     f"Unexpected trailing fields in disagg routing policy: {routing_policy}"
                 )
-            n_prefill_server_per_group = int(_args[disagg_idx + 1])
+            if disagg_idx + 1 < len(_args):
+                n_prefill_server_per_group = int(_args[disagg_idx + 1])
+            else:
+                # Allow shorthand like slosserve_4_diagg_planner by defaulting to one decode slot/group.
+                n_prefill_server_per_group = max(1, group_size - 1)
             extra_kwargs = {
                 'is_pd_disagg': True,
                 'n_prefill_per_group': n_prefill_server_per_group,
                 'max_decode_bs': max_num_batched_tokens_vllm,
                 "enable_rerouting": True,
+                'use_planner': use_planner,
+                'ablation': ablation
             }
         else:
             numeric_fields = _args[1:]
@@ -914,9 +949,14 @@ def build_problems(
             'tpot': slo_tpot,
             'scheduling_overhead': scheduling_overhead,
             'group_size': group_size,
-            'n_lb': n_lb
+            'n_lb': n_lb,
+            'use_planner': use_planner,
             # 'routing_overhead': slo_routing_overhead
         } | extra_kwargs)
+
+    for routing_kwargs in routing_kwargss:
+        if isinstance(routing_kwargs, dict):
+            routing_kwargs.setdefault("kv_xfer_delay", kv_xfer_delay)
     
     return [Problem(
         model_name = model_name,
@@ -969,7 +1009,8 @@ def run(
     output_dir: str,
     perf_model_errs: list[float],
     routing_overhead: float,
-    routing_fallback_policy: str 
+    routing_fallback_policy: str,
+    kv_xfer_delay: float,
 ):
     import os
     os.makedirs(output_dir, exist_ok=True)
@@ -1003,6 +1044,7 @@ def run(
     print(f"scheduling_overhead: {scheduling_overhead}")
     print(f'performance model errors: {perf_model_errs}')
     print(f'routing fallback policy: {routing_fallback_policy}')
+    print(f'kv_xfer_delay: {kv_xfer_delay}')
     print('--End of Problem Grid--')
     import os
     results = {}
@@ -1044,7 +1086,8 @@ def run(
             perf_model_err,
             routing_overhead,
             scheduling_overhead = scheduling_overhead,
-            routing_fallback_policy=routing_fallback_policy
+            routing_fallback_policy=routing_fallback_policy,
+            kv_xfer_delay=kv_xfer_delay,
         )
         if not len(problems):
             logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
@@ -1206,6 +1249,7 @@ if __name__ == '__main__':
     parser.add_argument('--perf_model_err', type = float, default = [1.0], nargs = '+', help = 'list of performance model errors')
     parser.add_argument('--routing_overhead', type = float, default = -1.0, help = "mocked overhead from at engine.")
     parser.add_argument('--routing_fallback_policy', type = str, default = 'asap', choices = ['asap', 'reject'])
+    parser.add_argument('--kv_xfer_delay', type=float, default=0.05, help='KV transfer delay budget in seconds')
     args = parser.parse_args()
     
     if not args.run_all:
@@ -1245,7 +1289,8 @@ if __name__ == '__main__':
                 output_dir = args.output_dir,
                 perf_model_errs = args.perf_model_err,
                 routing_overhead = args.routing_overhead,
-                routing_fallback_policy = args.routing_fallback_policy
+                routing_fallback_policy = args.routing_fallback_policy,
+                kv_xfer_delay = args.kv_xfer_delay,
             )
         exit(0)
     
@@ -1298,6 +1343,11 @@ if __name__ == '__main__':
                 'slo_routing_overhead': args.slo_routing_overhead,
                 'admission_mode': args.admission_mode,
                 'routing_overhead': args.routing_overhead,
+                'routing_fallback_policy': args.routing_fallback_policy,
+                'scheduling_overhead': args.scheduling_overhead,
+                'output_dir': args.output_dir,
+                'perf_model_errs': args.perf_model_err,
+                'kv_xfer_delay': args.kv_xfer_delay,
             })
         p.start()
         running_jobs.append((p, clients_str, router))
