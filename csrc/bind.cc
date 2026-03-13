@@ -1,6 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>  // For automatic conversion of STL containers
-
+#include <sstream>
 #include "adm_ctrl.h"  // Include your header file
 
 namespace py = pybind11;
@@ -11,10 +11,10 @@ PYBIND11_MODULE(SLOsServe_C, m) {
 
     // Bind the Request struct
     py::class_<Request>(m, "Request")
-        .def(py::init<std::string, bool, double, int, int, double, int, int, int, int, int, bool, double>(),
+        .def(py::init<std::string, bool, double, int, int, double, int, int, int, int, int, bool, double, int>(),
              py::arg("id"), py::arg("is_new_req"), py::arg("ddl"), py::arg("input_length"), py::arg("n_computed_tokens"),
              py::arg("profit"), py::arg("mem"), py::arg("tpot_idx"), py::arg("prefill_mem") = -1,
-             py::arg("prefill_device_id") = -1, py::arg("decode_device_id") = -1, py::arg("prefill_only") = false, py::arg("arrival_time") = 0.0)
+             py::arg("prefill_device_id") = -1, py::arg("decode_device_id") = -1, py::arg("prefill_only") = false, py::arg("arrival_time") = 0.0, py::arg("max_tokens") = -1)
         .def_readwrite("id", &Request::id)
         .def_readwrite("is_new_req", &Request::is_new_req)
         .def_readwrite("ddl", &Request::ddl)
@@ -28,6 +28,7 @@ PYBIND11_MODULE(SLOsServe_C, m) {
         .def_readwrite("decode_device_id", &Request::decode_device_id)
         .def_readwrite("prefill_only", &Request::prefill_only)
         .def_readwrite("arrival_time", &Request::arrival_time)
+        .def_readwrite("max_tokens", &Request::max_tokens)
         .def("__repr__", [](const Request& req) {
             return "<Request id=" + req.id +
                    " is_new_req=" + std::to_string(req.is_new_req) +
@@ -40,7 +41,8 @@ PYBIND11_MODULE(SLOsServe_C, m) {
                    " prefill_mem=" + std::to_string(req.prefill_mem) +
                    " prefill_device_id=" + std::to_string(req.prefill_device_id) +
                    " decode_device_id=" + std::to_string(req.decode_device_id) +
-                   " prefill_only=" + std::to_string(req.prefill_only) + ">";
+                   " prefill_only=" + std::to_string(req.prefill_only) + 
+                   " max_tokens=" + std::to_string(req.max_tokens) + ">";
         });
 
     // Bind the ReqBatch struct
@@ -64,9 +66,17 @@ PYBIND11_MODULE(SLOsServe_C, m) {
         .def_readwrite("next", &Batch::next)
         .def_readwrite("estimated_time", &Batch::estimated_time)
         .def("__repr__", [](const Batch& bs) {
-            return "<Batch " + std::to_string(bs.req_batches.size()) +
-                   "#bs, prefill_bs=" + std::to_string(bs.prefill_bs) +
-                   " next=" + std::to_string(bs.next) + ">";
+            std::ostringstream oss;
+            oss << "<Batch req_batches=[";
+            for (size_t i = 0; i < bs.req_batches.size(); ++i) {
+                if (i) oss << ", ";
+                oss << py::str(py::repr(py::cast(bs.req_batches[i]))).cast<std::string>();
+            }
+            oss << "], prefill_bs=" << bs.prefill_bs
+                << ", next=" << bs.next
+                << ", estimated_time=" << bs.estimated_time
+                << ">";
+            return oss.str();
         });
 
     // Bind the Batch struct
@@ -86,14 +96,17 @@ PYBIND11_MODULE(SLOsServe_C, m) {
     // Bind the AdmCtrlScheduler class
     py::class_<AdmCtrlScheduler>(m, "AdmCtrlScheduler")
         .def(py::init<>())
-        .def(py::init<std::string, bool, bool>(), py::arg("mode"), py::arg("fifo_fair"), py::arg("continuous"))
+        .def(py::init<std::string, int, bool, bool>(), py::arg("mode"), py::arg("block_size"), py::arg("fifo_fair"), py::arg("continuous"))
         .def("set_ar_planner", &AdmCtrlScheduler::set_ar_planner,
             py::arg("tpots"), py::arg("hardware_params"), py::arg("fixed_bs"), py::arg("max_bs") = 16384)
         .def("set_sd_planner", &AdmCtrlScheduler::set_sd_planner,
             py::arg("tpots"), py::arg("hardware_params"), py::arg("fixed_bs"), 
             py::arg("alpha"), py::arg("max_sd_size"), py::arg("fixed_spec"), py::arg("max_bs") = 16384)
         .def("schedule", &AdmCtrlScheduler::schedule,
-             py::arg("reqs"), py::arg("M"), py::arg("current_time"), py::arg("verbose"))
+             py::arg("reqs"), py::arg("current_time"), py::arg("max_time") = 1,
+             py::arg("verbose") = false)
+        .def("adm_ctrl", &AdmCtrlScheduler::admission_control,
+             py::arg("reqs"), py::arg("M"), py::arg("current_time"))
         .def("__repr__", [](const AdmCtrlScheduler& scheduler) {
             return "<AdmCtrlScheduler>";
         });

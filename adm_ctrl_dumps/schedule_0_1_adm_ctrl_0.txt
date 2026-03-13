@@ -1,0 +1,23 @@
+SLOPACKER_SCHEDULE_DUMP_V1
+timestamp 1773358739.6420946
+did 0
+mode "adm_ctrl_refresh"
+scheduler_mode "edf_sim"
+scheduler_fifo_fair 0
+scheduler_continuous 0
+planner_type "ar"
+planner_fixed_bs 0
+planner_max_bs 16384
+tpots 1 0.05
+hardware_params 5 5.1e-05 1.69e-05 8e-08 0.0 0.024
+M 23948
+current_time 0.0
+max_time 5
+observed_is_feasible 1
+observed_schedule_elapsed_s 0.0
+observed_total_elapsed_s 0.0
+observed_accepted_ids 1
+accepted_id "1"
+reqs 2
+req "1" 0 0.8295912742614746 3727 3727 1.0 59 0 233 0 0 0 0.0 940
+req "0" 1 -0.09708404541015625 72 0 1.0 64 0 5 0 0 0 0.0 940

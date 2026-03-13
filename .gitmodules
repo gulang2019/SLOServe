@@ -25,3 +25,9 @@
 [submodule "3rdparty/speech_agent"]
 	path = 3rdparty/speech_agent
 	url = git@github.com:gulang2019/speech_agent.git
+[submodule "3rdparty/llumnix"]
+	path = 3rdparty/llumnix
+	url = https://github.com/AlibabaPAI/llumnix.git
+[submodule "paper"]
+	path = paper
+	url = git@github.com:gulang2019/SLO-Packer_Paper.git

@@ -28,11 +28,20 @@ int main() {
     });
     auto start = std::chrono::high_resolution_clock::now();
     bool is_feasible = false;
-    std::vector<int> acc_ids;
+    std::vector<bool> is_accepted;
     std::vector<Batch> batches;
     // scheduler.set_ar_planner(tpots, hardware_params, false);
     scheduler.set_sd_planner(tpots, hardware_params, false, 0.9, 10, false);
-    std::tie(is_feasible, acc_ids, batches) = scheduler.schedule(reqs, 100, 0., true);
+    std::tie(is_feasible, is_accepted) = scheduler.admission_control(reqs, 100, 0.);
+    std::vector<Request> accepted_reqs;
+    for (size_t i = 0; i < reqs.size() && i < is_accepted.size(); ++i) {
+        if (is_accepted[i]) {
+            accepted_reqs.push_back(reqs[i]);
+        }
+    }
+    if (is_feasible) {
+        std::tie(is_feasible, batches) = scheduler.schedule(accepted_reqs, 0., 1, true);
+    }
     auto end = std::chrono::high_resolution_clock::now();
     
 

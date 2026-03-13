@@ -54,7 +54,8 @@ public:
         std::cout << "Time Breakdown:\n";
         for (const auto& [key, time] : sorted_times) {
             double fraction = e2e_time > 0 ? time / e2e_time : 0;
-            std::cout << key << ": " << std::fixed << std::setprecision(3) << fraction << "\n";
+            std::cout << key << ": " << std::fixed << std::setprecision(3) << fraction << " " << std::fixed << std::setprecision(3) << time << "\n";
         }
+        std::cout << "Total: " << std::fixed << std::setprecision(3) << e2e_time << " seconds\n";
     }
 };

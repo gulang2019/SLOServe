@@ -32,8 +32,11 @@ from SLOsServe.perf_model import PerfModel
 
 import logging
 from SLOsServe.router.execplan_bus import ExecPlanBus, ExecPlan
+from SLOsServe.router.adm_ctrl import BatchPlanner
+from SLOsServe.router.adm_ctrl import Request as BatchPlannerRequest
 
-DEBUG = False 
+
+DEBUG = True
 
 def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
     logger = logging.getLogger(name)
@@ -60,25 +63,19 @@ class EngineActor:
     engine_actor: ray.ObjectRef
     shared_q: RayQueue
     local_queues: dict[str, Queue] = field(default_factory=dict)
+    _profile_events: list | None = None
     
     async def run(self):
+        # drain_time_budget_s = 0.001
         while True:
             payload = await self.shared_q.get_async()
+            qlen = self.shared_q.qsize()
+            if qlen > 0:
+                payloads = self.shared_q.get_nowait_batch(qlen)
+                for _ in payloads:
+                    payload.extend(_)
             if payload:
                 self._handle_payload(payload)
-
-            drained = 0
-            while drained < 64:
-                try:
-                    payload = self.shared_q.get_nowait()
-                except Exception:
-                    break
-                if payload:
-                    self._handle_payload(payload)
-                    drained += 1
-
-            if drained:
-                await asyncio.sleep(0)
 
     def _handle_payload(self, payload):
         for item in payload:
@@ -89,6 +86,13 @@ class EngineActor:
             if q is None:
                 logger.warning(f'{rid} not found in local_queues')
                 continue
+            if item.get('finish_reason') == 'rejected':
+                self._profile_events.append({
+                    'event_type': 'handle_payload',
+                    'timestamp': time.time(),
+                    'device_id': -1, 
+                    'request_id': rid
+                })
             q.put_nowait(item)  # ✅ don’t await if you want speed
             if item.get('finish_reason') is not None:
                 q.put_nowait(None)
@@ -167,6 +171,7 @@ class EngineWorker:
         self.device_id = device_id
         self.output_queue = output_queue
         self._local_queue = asyncio.Queue()
+        self._control_queue = asyncio.Queue()
         self.is_ready = True
         self._mux_task = asyncio.create_task(self._mux())
         self._mux_task.add_done_callback(_task_done)
@@ -205,13 +210,38 @@ class EngineWorker:
             pass 
 
     async def _mux(self):
-        FLUSH_T = 0.01 
-        FLUSH_N = 10
+        FLUSH_T = 0.05
+        FLUSH_N = 100
         now = time.time()
         buf = []
+
+        async def _flush(payload: list[dict[str, Any]]):
+            if not payload:
+                return
+            for item in payload:
+                if DEBUG:
+                    self._profile_events.append({
+                        'event_type': '_mux_push',
+                        'request_id': item['request_id'],
+                        'device_id': self.device_id,
+                        'timestamp': time.time()
+                    })
+            await self.output_queue.put_async(payload)
+
         while True: 
-            try:
-                item = await asyncio.wait_for(self._local_queue.get(), timeout = FLUSH_T)
+            get_control_task = asyncio.create_task(self._control_queue.get())
+            get_local_task = asyncio.create_task(self._local_queue.get())
+            done, pending = await asyncio.wait(
+                {get_control_task, get_local_task},
+                timeout=FLUSH_T,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            control_payload = []
+            if get_control_task in done:
+                control_payload.append(get_control_task.result())
+            if get_local_task in done:
+                item = get_local_task.result()
                 if DEBUG:
                     self._profile_events.append({
                         'event_type': '_mux_read',
@@ -231,22 +261,31 @@ class EngineWorker:
                                 'device_id': self.device_id, 
                                 'timestamp': time.time()
                             })
-                    except:
+                    except asyncio.QueueEmpty:
                         break 
-            except asyncio.TimeoutError:
-                pass 
-            
+
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            while True:
+                try:
+                    item = self._control_queue.get_nowait()
+                    control_payload.append(item)
+                except asyncio.QueueEmpty:
+                    break
+
+            if control_payload:
+                await _flush(control_payload)
+                now = time.time()
+
             if len(buf) >= FLUSH_N or (len(buf) and (time.time() - now > FLUSH_T)):
                 now = time.time()
-                for item in buf:
-                    if DEBUG:
-                        self._profile_events.append({
-                            'event_type': '_mux_push',
-                            'request_id': item['request_id'],
-                            'device_id': self.device_id, 
-                            'timestamp': time.time()
-                        })
-                await self.output_queue.put_async(buf)
+                await _flush(buf)
                 buf = []
                 
     async def prefill_once(self, req_data: dict, request_id: str):
@@ -320,13 +359,13 @@ class EngineWorker:
                 ignore_eos=True,
             ),
         ):
-            if DEBUG:
-                self._profile_events.append({
-                    'event_type': 'get_decode_stream_response',
-                    'request_id': request_id,
-                    'device_id': self.device_id, 
-                    'timestamp': time.time()
-                })
+            # if DEBUG:
+            #     self._profile_events.append({
+            #         'event_type': 'get_decode_stream_response',
+            #         'request_id': request_id,
+            #         'device_id': self.device_id, 
+            #         'timestamp': time.time()
+            #     })
             completion = output.outputs[0]
             chunk = {
                 'request_id': request_id,
@@ -340,14 +379,17 @@ class EngineWorker:
             n_tokens = len(completion.token_ids)
             text_len = len(completion.text)
             
-            await self._local_queue.put(chunk)
-            if DEBUG:
-                self._profile_events.append({
-                    'event_type': 'decode_stream_put',
-                    'request_id': request_id,
-                    'device_id': self.device_id, 
-                    'timestamp': time.time()
-                })
+            if chunk['finish_reason'] in ('rejected', 'router_rejection', 'error'):
+                await self._control_queue.put(chunk)
+            else:
+                await self._local_queue.put(chunk)
+            # if DEBUG:
+            #     self._profile_events.append({
+            #         'event_type': 'decode_stream_put',
+            #         'request_id': request_id,
+            #         'device_id': self.device_id, 
+            #         'timestamp': time.time()
+            #     })
 
     async def get_load_statistics(self, n: int = 100) -> list[dict[str, Any]]:
         return await self.engine.get_load_statistics(n)
@@ -388,6 +430,13 @@ async def stream_service_response_engine(client_idx, req_data: dict, request_id:
                 item = await asyncio.wait_for(Q.get(), 10)
                 if item is None:
                     break
+                if DEBUG and (actor._profile_events is not None) and item.get('finish_reason') == 'rejected':
+                    actor._profile_events.append({
+                        'event_type': 'stream_service_get_item',
+                        'timestamp': time.time(),
+                        'request_id': request_id, 
+                        'device_id': -1
+                    })
                 yield item
             except asyncio.TimeoutError:
                 logger.error(f"timeout in stream service for {request_id}, {req_data=}")
@@ -468,7 +517,15 @@ class RequestInstance:
             self.num_computed_tokens = num_computed_tokens
             event_ts = data.get('timestamp', time.time())
             self.timestamps.append((num_computed_tokens, event_ts))
-            
+    
+    @property 
+    def is_prefill(self):
+        return self.state < RequestState.PREFILL_FINISHED
+    
+    @property 
+    def is_decode(self):
+        return not self.is_prefill
+    
     @property
     def num_prompt_tokens(self):
         return self.payload['vllm_xargs']['input_length']
@@ -912,11 +969,12 @@ class RoundRobinRouter(Router):
         self.n_devices = n_devices
         self.group_i = 0
         self.is_pd_disagg = router_kwargs.get('is_pd_disagg', False)
-        self.n_group = router_kwargs.get('n_group', 1)
+        self.group_size = router_kwargs.get('group_size', self.n_devices)
+        assert self.n_devices % self.group_size == 0
+        self.n_group = self.n_devices // self.group_size
         self.per_group_indices = [0 for _ in range(self.n_group)]
         self.per_group_decode_indices = [0 for _ in range(self.n_group)]
         assert self.n_devices % self.n_group == 0
-        self.group_size = self.n_devices // self.n_group
         self.n_prefill_or_mixed_per_group = router_kwargs.get('n_prefill_per_group', self.group_size)
         if self.is_pd_disagg:
             assert self.n_prefill_or_mixed_per_group < self.group_size
@@ -1142,6 +1200,7 @@ class SLOsServeRouter(Router):
         self.max_decode_length = router_kwargs['max_decode_length']
         self.group_size = router_kwargs.get('group_size', self.n_devices)
         self.n_lb = router_kwargs.get('n_lb', 1)
+        self.use_planner = router_kwargs.get('use_planner', False)
         assert self.group_size >= 1
         assert self.n_devices % self.group_size == 0 
         self.n_group = self.n_devices // self.group_size
@@ -1171,9 +1230,26 @@ class SLOsServeRouter(Router):
             hardware_params = self.hardware_params,
             fixed_bs = False 
         )
+        self.is_oracle = router_kwargs.get('is_oracle', False)
+        
+        self.adm_planner = SLOsServe_C.AdmCtrlScheduler(
+            "edf_sim", # policy
+            False, # fairness 
+            False, # continuous
+        )
+        self.adm_planner.set_ar_planner(
+            tpots = [self.tpot],
+            hardware_params = self.hardware_params,
+            fixed_bs = False
+        )
+        self.kv_xfer_delay = router_kwargs.get('kv_xfer_delay', 0.05)
         
         
-        logger.info(f'SLOServeRouter: n_group: {self.n_group}, n_lb: {self.n_lb}, group_size: {self.group_size}, n_prefill_or_mixed: {self.n_prefill_or_mixed_per_group}')
+        logger.info(
+            f'SLOServeRouter: n_group: {self.n_group}, n_lb: {self.n_lb}, '
+            f'group_size: {self.group_size}, n_prefill_or_mixed: {self.n_prefill_or_mixed_per_group}, '
+            f'use_planner: {self.use_planner}'
+        )
         
     def get_req_data(self, request: RequestInstance):
         extra_args = request.payload['vllm_xargs']
@@ -1183,6 +1259,184 @@ class SLOsServeRouter(Router):
         prefill_mem = math.ceil(input_length / self.block_size)
         mem = math.ceil((input_length + request.payload['max_tokens']) / self.block_size)
         return prefill_ddl, input_length, profit, prefill_mem, mem
+    
+    def _run_pre_adm_planner(
+        self, 
+        did,
+        running_requests: List[RequestInstance],
+        waiting_requests: List[RequestInstance], 
+        exec_plan: ExecPlan | None = None,
+        mode: str = 'normal'
+    ) -> List[RequestInstance]:
+        if not len(waiting_requests):
+            return []
+
+        now = time.time()
+        num_computed_tokens = {}
+        num_free_blocks = self.n_block
+        if exec_plan is not None and exec_plan['exec_plan'] is not None:
+            exec_plan_ = exec_plan['exec_plan']
+            num_free_blocks = exec_plan_.num_free_blocks
+            bid = 0
+            while bid < len(exec_plan_.batch_times) and exec_plan_.batch_times[bid] < now:
+                bid += 1
+            if bid < len(exec_plan_.batch_times):
+                now = exec_plan_.batch_times[bid]
+            for req_id, req_plan in exec_plan_.req_plans.items():
+                for n_token, cbid in req_plan:
+                    if cbid <= bid:
+                        num_computed_tokens[req_id] = n_token
+                    else:
+                        break
+
+        c_reqs = []
+        for req in waiting_requests:
+            if req.admitted:
+                continue
+            prefill_ddl, input_length, profit, prefill_mem, _ = self.get_req_data(req)
+            if mode == 'prefill_only': prefill_ddl -= self.kv_xfer_delay
+            num_computed = req.num_prompt_tokens if mode == 'decode_only' else 0
+            n_block_ub = math.ceil((req.num_prompt_tokens + self.max_decode_length) / self.block_size)
+            c_reqs.append(
+                SLOsServe_C.Request(
+                    id=req.request_id,
+                    is_new_req=True,
+                    ddl=prefill_ddl,
+                    input_length=input_length,
+                    n_computed_tokens=num_computed,
+                    profit=profit,
+                    mem=n_block_ub,
+                    tpot_idx=0,
+                    prefill_mem=prefill_mem,
+                    prefill_device_id=0,
+                    decode_device_id=0,
+                    prefill_only=(mode == 'prefill_only'),
+                    arrival_time=req.arrival_time,
+                )
+            )
+
+        for req in running_requests:
+            prefill_ddl, input_length, profit, prefill_mem, _ = self.get_req_data(req)
+            num_computed = max(num_computed_tokens.get(req.request_id, 0), req.num_computed_tokens)
+            if mode == 'decode_only' or (self.is_pd_disagg and req.is_decode):
+                num_computed = max(num_computed, req.num_prompt_tokens)
+            num_output_tokens = max(num_computed - input_length, 0) + 1
+            n_block_ub = math.ceil((self.max_decode_length + req.num_prompt_tokens - num_computed) / self.block_size)
+            prefill_only = self.is_pd_disagg and req.is_prefill
+            if prefill_only: prefill_ddl -= self.kv_xfer_delay
+            c_reqs.append(
+                SLOsServe_C.Request(
+                    id=req.request_id,
+                    is_new_req=False,
+                    ddl=prefill_ddl + self.tpot * num_output_tokens,
+                    input_length=input_length,
+                    n_computed_tokens=num_computed,
+                    profit=profit,
+                    mem=n_block_ub,
+                    tpot_idx=0,
+                    prefill_mem=prefill_mem,
+                    prefill_device_id=0,
+                    decode_device_id=0,
+                    prefill_only=prefill_only,
+                    arrival_time=req.arrival_time,
+                )
+            )
+            
+        for c_req in c_reqs:
+            c_req.ddl -= now
+
+        is_feasible, accepted_ids, _ = self.adm_planner.schedule(c_reqs, num_free_blocks, 0.0, False)
+        logger.info(f'[SLOPacker] {did=} {is_feasible=}')
+        if not is_feasible:
+            return waiting_requests
+
+        accepted_set = set(accepted_ids)
+        remained_waiting_requests = []
+        for req in waiting_requests:
+            if req.request_id in accepted_set:
+                if mode in ('normal', 'prefill_only'):
+                    req.prefill_device_id = did
+                if mode in ('normal', 'decode_only'):
+                    req.decode_device_id = did
+                req.admitted = True
+            else:
+                remained_waiting_requests.append(req)
+
+        return remained_waiting_requests
+
+    def run_with_planner(self, waiting_requests: List[RequestInstance],
+            running_requests: List[RequestInstance]):
+        global execplan_bus_actor
+        assert execplan_bus_actor is not None
+        start = time.time()
+        exec_plans = ray.get(execplan_bus_actor.get_all.remote())
+        # logger.info(f'exec_plans: {exec_plans}')
+        elapsed_fetch_exec_plan = time.time() - start
+        logger.info(f'fetch exec plans takes {elapsed_fetch_exec_plan}s')
+        
+        # Step.1 set the 
+        running_requests_by_device = defaultdict(list)
+        for req in running_requests:
+            if self.is_pd_disagg:
+                if req.is_prefill:
+                    assert req.prefill_device_id >= 0
+                    running_requests_by_device[req.prefill_device_id].append(req)
+                else:
+                    assert req.decode_device_id >= 0
+                    running_requests_by_device[req.decode_device_id].append(req)
+            else: 
+                running_requests_by_device[req.prefill_device_id].append(req)
+        
+        waiting_prefill_or_normal_requests = [[] for _ in range(self.n_devices)]
+        waiting_decode_requests = [[] for _ in range(self.n_devices)]
+        for req in waiting_requests:
+            did = None 
+            if not self.is_pd_disagg or req.is_prefill:
+                if req.prefill_device_id == -1:
+                    did = self.group_idx * self.group_size
+                    self.group_idx = (self.group_idx + 1) % self.n_group
+                elif (req.prefill_device_id + 1) % self.group_size: 
+                    did = req.prefill_device_id + 1
+                if did is not None: 
+                    waiting_prefill_or_normal_requests[did].append(req)
+            else:
+                assert req.prefill_device_id >= 0
+                if req.decode_device_id == -1:
+                    # Keep decode in the same group (node) as prefill to avoid cross-node traffic.
+                    did = (req.prefill_device_id // self.group_size) * self.group_size + self.group_size - 1
+                elif req.decode_device_id % self.group_size:
+                    did = req.decode_device_id - 1 
+                if did is not None: 
+                    waiting_decode_requests[did].append(req)
+        
+        for group_i in range(self.n_group):
+            msp = self.group_size * group_i - 1
+            for did in range(self.group_size * group_i, self.group_size * (group_i + 1)):
+                waiting_requests = waiting_prefill_or_normal_requests[did]
+                if not len(waiting_requests):
+                    continue 
+                msp = did
+                remained_waiting_requests = self._run_pre_adm_planner(
+                    did, 
+                    running_requests=running_requests_by_device.get(did, []),
+                    waiting_requests= waiting_prefill_or_normal_requests[did],
+                    exec_plan=exec_plans.get(did, None),
+                    mode = 'normal' if not self.is_pd_disagg else 'prefill_only'
+                )
+                if (did + 1) != (self.group_size * (group_i + 1)):
+                    waiting_prefill_or_normal_requests[did + 1].extend(remained_waiting_requests)
+                    
+            for did in range(self.group_size * (group_i + 1) - 1, msp, -1):
+                remained_waiting_requests = self._run_pre_adm_planner(
+                    did,
+                    running_requests=running_requests_by_device.get(did, []),
+                    waiting_requests= waiting_decode_requests[did],
+                    exec_plan=exec_plans.get(did, None),
+                    mode = 'decode_only'
+                )
+                if did != (msp + 1):
+                    waiting_decode_requests[did - 1].extend(remained_waiting_requests)
+
 
     def _run_pre_adm(
         self, 
@@ -1258,7 +1512,7 @@ class SLOsServeRouter(Router):
                 id = req.request_id,
                 is_new_req = False,
                 ddl = prefill_ddl + self.tpot * num_output_tokens,
-                input_length = input_length,
+                input_length = max(input_length - num_computed_token, 0),
                 n_computed_tokens = num_computed_token,
                 profit = profit,
                 mem = num_block_ub,
@@ -1479,9 +1733,15 @@ class SLOsServeRouter(Router):
     
     def run(self, waiting_requests: List[RequestInstance],
             running_requests: List[RequestInstance]):
+        if self.use_planner:
+            start = time.time()
+            self.run_with_planner(waiting_requests, running_requests)
+            logger.info(f'[SLOPacker] routing takes {time.time() - start}s')
+            return
         if not self.is_pd_disagg:
             self._run(waiting_requests, running_requests)
             return
+        
         prefill_waiting_requests = [req for req in waiting_requests if req.state < RequestState.PREFILL_FINISHED]
         prefill_running_requests = [req for req in running_requests if req.state < RequestState.PREFILL_FINISHED]
         decode_waiting_requests = [req for req in waiting_requests if req.state >= RequestState.PREFILL_FINISHED]
@@ -1590,10 +1850,10 @@ def create_router(t: str, n_devices: int, router_kwargs: str) -> Router:
 # Simple NVLink model for mock connector
 # =========================
 class Network:
-    def __init__(self, bw_per_link_Bps=25e9,  # bytes/s per NVLink lane; adjust to your fabric
+    def __init__(self, bw_per_link_Bps=300e9,  # bytes/s per NVLink lane; adjust to your fabric
                  inj_cap_Bps=300e9,           # per-GPU injection cap (A100 NVSwitch ~300 GB/s)
                  ej_cap_Bps=300e9,            # per-GPU ejection cap
-                 overhead_s=0.030,
+                 overhead_s=0.010,
                  n_devices=8,
                  model_name: str = 'Qwen/Qwen2.5-7B-Instruct'):
         self.bw_per_link = bw_per_link_Bps
@@ -1624,6 +1884,7 @@ class Network:
         self.ej_load = [0] * self.n
 
     def tx(self, src: int, dst: int, num_tokens: int, start_time: float) -> float:
+        if src == dst: return start_time
         # Earliest time all three resources are free
         t0 = max(start_time, self.link_free[(src, dst)], self.inj_free[src], self.ej_free[dst])
 
@@ -1693,6 +1954,7 @@ class RequestPool:
         self.admission_history: list[dict[str, Any]] = []
         self.routing_overhead: float = -1.0
         self.fallback_policy = fallback_policy
+        self.kv_xfer_delay = 0.05
     
     @property
     def on(self):
@@ -1704,6 +1966,9 @@ class RequestPool:
 
     def update_config(self, request_json: dict):
         self.reset(request_json['n_devices'])
+        global engine_actors
+        for actor in engine_actors:
+            actor._profile_events = self._profile_events
 
         self.router = create_router(request_json['routing_policy'],
                                     request_json['n_devices'],
@@ -1720,12 +1985,13 @@ class RequestPool:
             self.enable_rerouting = request_json['routing_kwargs'].get('enable_rerouting', False)
             self.enable_rescheduling = request_json['routing_kwargs'].get('enable_rescheduling', False)
             self.stat_window = request_json['routing_kwargs'].get('stat_window', self.stat_window)
+            self.kv_xfer_delay = request_json['routing_kwargs'].get('kv_xfer_delay', 0.05)
         # except Exception:
         #     self.routing_overhead = 0
         if request_json['routing_policy'] == 'renaming':
             self.enable_rerouting = True
         
-        logger.info(f"RequestPool:[update_config]: {request_json['routing_kwargs']} {request_json['routing_policy']}, Enable Rerouting: {self.enable_rerouting}, Enable Rescheduling: {self.enable_rescheduling}, Route Ovd. {self.routing_overhead}.")
+        logger.info(f"RequestPool:[update_config]: {request_json['routing_kwargs']} {request_json['routing_policy']}, Enable Rerouting: {self.enable_rerouting}, Enable Rescheduling: {self.enable_rescheduling}, Route Ovd. {self.routing_overhead}, kv_xfer_delay: {self.kv_xfer_delay}.")
 
     def reset(self, n_devices):
         assert n_devices <= len(self.clients), f'{n_devices=} <= {len(self.clients)=}'
@@ -2002,7 +2268,10 @@ class RequestPool:
             remained_waiting_requests = []
             for request in self.waiting_pool:
                 prefill_ddl = request.payload['vllm_xargs']['prefill_ddl']
-                if time.time() > prefill_ddl and self.routing_overhead < 0:
+                if self.routing_overhead < 0 and (
+                    (request.state in (RequestState.WAITING, RequestState.PREFILL_REJECTED_WAITING) and time.time() > prefill_ddl ) or 
+                    (request.state == RequestState.PREFILL_FINISHED and time.time() > prefill_ddl)
+                ):
                     request.admitted = False
                 if not request.admitted:
                     if self.admission_mode == 'anytime' and \
@@ -2034,8 +2303,9 @@ class RequestPool:
                         continue
                     elif self.fallback_policy == 'asap': 
                         # When this request cannot be served w/in SLO, we route it to the freest server and serve it asap by forcing admission;
-                        
+                        logger.info(f'[SLO Packer] route {request.request_id} asap from ({request.prefill_device_id=}, {request.decode_device_id=}) ')
                         request.prefill_device_id, request.decode_device_id = self.router.select_asap_server(self.load_stat)
+                        logger.info(f'[SLO Packer] route {request.request_id} asap to ({request.prefill_device_id=}, {request.decode_device_id=}) ')
                         assert 0 <= request.prefill_device_id < self.n_devices, f'not 0 <= {request.prefill_device_id=} < {self.n_devices=}'
                         assert 0 <= request.decode_device_id < self.n_devices, f'not 0 <= {request.decode_device_id=} < {self.n_devices=}'
                         request.payload['vllm_xargs']['must_admit'] = True
@@ -2100,7 +2370,7 @@ class RequestPool:
         assert request.admitted
         assert request.prefill_device_id is not None
         assert self.enable_rerouting or request.decode_device_id is not None
-        logger.debug(f"Dispatching request {request.request_id}: prefill_device_id={request.prefill_device_id}, decode_device_id={request.decode_device_id}")
+        logger.info(f"Dispatching request {request.request_id}: prefill_device_id={request.prefill_device_id}, decode_device_id={request.decode_device_id}")
         # Single-device fast path
         if not self.enable_rerouting and request.prefill_device_id == request.decode_device_id:
             self.load_stat.add_event({
@@ -2150,7 +2420,6 @@ class RequestPool:
                     break
 
                 if first_response:
-                    
                     if data['finish_reason'] != 'rejected' \
                         and request._group is not None:
                         assert not request._group.has_acceptance
@@ -2162,6 +2431,12 @@ class RequestPool:
                 
                 if data['finish_reason'] == 'rejected':
                     logger.debug(f"Request {request.request_id} was rejected at prefill stage")
+                    self._profile_events.append({
+                        "event_type": "receive_rej",
+                        "timestamp": time.time(),
+                        "request_id": request.request_id,
+                        "device_id": -1
+                    })
                     is_rejected = True
                 else:
                     await request.response_queue.put(data)
@@ -2236,11 +2511,13 @@ class RequestPool:
             })
 
             logger.debug(f"Request {request.request_id} sending to prefill device {request.prefill_device_id}")
-            # request.payload['vllm_xargs']['prefill_ddl'] -= self.routing_overhead
+            request.payload['vllm_xargs']['prefill_ddl'] -= self.kv_xfer_delay
+            request.payload['vllm_xargs']['slo_ttft'] -= self.kv_xfer_delay
             response = await send_request_to_service_engine(request.prefill_device_id,
                                                             request.payload,
                                                             request.request_id)
-            # request.payload['vllm_xargs']['prefill_ddl'] += self.routing_overhead
+            request.payload['vllm_xargs']['prefill_ddl'] += self.kv_xfer_delay
+            request.payload['vllm_xargs']['slo_ttft'] += self.kv_xfer_delay
 
             if response.get('finish_reason') == 'rejected':
                 logger.debug(f"Request {request.request_id} was rejected at prefill stage")

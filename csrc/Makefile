@@ -26,5 +26,11 @@ err: err.cc adm_ctrl_scheduler.cc
 timer: timer.cc adm_ctrl_scheduler.cc
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
+repro_long_schedule_dump: repro_long_schedule_dump.cc adm_ctrl_scheduler.cc
+	$(CXX) $(CXXFLAGS) -g -std=c++17 -o $@ $^
+
+repro_schedule: repro_schedule.cc adm_ctrl_scheduler.cc
+	$(CXX) $(CXXFLAGS) -g -std=c++17 -o $@ $^
+
 clean:
-	rm test err
+	rm -f test err repro_long_schedule_dump

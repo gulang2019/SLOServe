@@ -113,9 +113,18 @@ int main(int argc, char** argv) {
         false);
 
     bool feasible;
-    std::vector<int> acc_ids;
+    std::vector<bool> is_accepted;
     std::vector<Batch> accepted_batches;
-    std::tie(feasible, acc_ids, accepted_batches) = scheduler.schedule(requests, n_avail, current_time, false);
+    std::tie(feasible, is_accepted) = scheduler.admission_control(requests, n_avail, current_time);
+    std::vector<Request> accepted_reqs;
+    for (size_t i = 0; i < requests.size() && i < is_accepted.size(); ++i) {
+        if (is_accepted[i]) {
+            accepted_reqs.push_back(requests[i]);
+        }
+    }
+    if (feasible) {
+        std::tie(feasible, accepted_batches) = scheduler.schedule(accepted_reqs, current_time, 1, false);
+    }
     // std::cout << "feasible: " << feasible  << std::endl;
     // std::cout << "acc: ";
     // for (auto id: acc_ids) {
@@ -126,7 +135,18 @@ int main(int argc, char** argv) {
     auto start = std::chrono::high_resolution_clock::now();
     
     for (int i = 0; i < repeat; i++){
-        std::tie(feasible, acc_ids, accepted_batches) = scheduler.schedule(requests, n_avail, current_time, false);
+        std::tie(feasible, is_accepted) = scheduler.admission_control(requests, n_avail, current_time);
+        accepted_reqs.clear();
+        for (size_t j = 0; j < requests.size() && j < is_accepted.size(); ++j) {
+            if (is_accepted[j]) {
+                accepted_reqs.push_back(requests[j]);
+            }
+        }
+        if (feasible) {
+            std::tie(feasible, accepted_batches) = scheduler.schedule(accepted_reqs, current_time, 1, false);
+        } else {
+            accepted_batches.clear();
+        }
     }
 
     auto end = std::chrono::high_resolution_clock::now();

@@ -22,6 +22,7 @@ struct Request{
     int decode_device_id;
     bool prefill_only;
     double arrival_time;
+    int max_tokens; 
     
     Request() = default;
 
@@ -37,7 +38,8 @@ struct Request{
     int prefill_device_id = 0,
     int decode_device_id = 0,
     bool prefill_only = false,
-    double arrival_time = 0.0): 
+    double arrival_time = 0.0,
+    int max_tokens = -1): 
         id(id),
         is_new_req(is_new_req), 
         ddl(ddl), 
@@ -50,7 +52,8 @@ struct Request{
         prefill_device_id(prefill_device_id),
         decode_device_id(decode_device_id),
         prefill_only(prefill_only),
-        arrival_time(arrival_time) {}
+        arrival_time(arrival_time),
+        max_tokens(max_tokens) {}
 };
 
 struct ReqBatch {
@@ -174,6 +177,10 @@ public:
         double finish_time
     ) override;
 
+    double get_alpha() const { return alpha; }
+    int get_max_sd_size() const { return max_sd_size; }
+    bool get_fixed_spec() const { return fixed_spec; }
+
     // std::vector<Batch> plan_decode_only(
     //     const std::vector<Request>& reqs
     // ) override;
@@ -201,16 +208,20 @@ public:
 class AdmCtrlScheduler {
 protected:
     std::string mode;
+    int block_size = 16;
     bool fifo_fair = false;
     bool continuous = false;
     bool _verbose;
 
     std::unique_ptr<BatchPlanner> planner;
 
-    void _batch_impl(
+    std::vector<Batch> _batch_impl(
         const std::vector<Request>& reqs,
         const std::vector<bool>& is_accepted,
-        std::vector<Batch>& batches
+        int M,
+        double current_time,
+        bool verbose,
+        double max_time
     );
 
     bool _check_slo_violation(
@@ -220,36 +231,48 @@ protected:
         double current_time
     );
 
+    std::tuple<bool, std::vector<Batch> > _construct_batch_prefix(
+        const std::vector<Request>& active_reqs,
+        int M,
+        double current_time,
+        double max_time // simulate until the ealiest scheduling time for the token in each request is greator than max_time
+    );
 
-    std::tuple<bool, std::vector<bool>, 
-        std::vector<Batch> > _admission_control_fcfs(
+
+    std::tuple<bool, std::vector<bool> > _admission_control_fcfs(
         std::vector<Request>& reqs,
         const int M,
         double current_time
     );
 
-    std::tuple<bool, std::vector<bool>, 
-        std::vector<Batch> > _admission_control_dp(
+    std::tuple<bool, std::vector<bool> > _admission_control_dp(
         std::vector<Request>& reqs,
         const int M,
         double current_time
     );
 
-    std::tuple<bool, std::vector<bool>, 
-        std::vector<Batch> > _admission_control_edf(
+    std::tuple<bool, std::vector<bool> > _admission_control_edf(
         std::vector<Request>& reqs,
         const int M,
         double current_time
     );
+
+    std::tuple<bool, std::vector<bool> > _admission_control_edf_sim(
+        std::vector<Request>& reqs,
+        const int M,
+        double current_time
+    );
+
 
 public: 
-    AdmCtrlScheduler(): mode("fcfs"), fifo_fair(false), continuous(false) {}
+    AdmCtrlScheduler(): mode("fcfs"), block_size(16), fifo_fair(false), continuous(false) {}
     
     AdmCtrlScheduler(
         std::string mode,
+        int block_size,
         bool fifo_fair,
         bool continuous
-    ): mode(mode), fifo_fair(fifo_fair), continuous(continuous) {}
+    ): mode(mode), block_size(block_size), fifo_fair(fifo_fair), continuous(continuous) {}
 
     AdmCtrlScheduler& set_ar_planner(
         std::vector<double>& tpots,
@@ -289,23 +312,24 @@ public:
         return *this;
     }
 
-    std::tuple<bool, std::vector<std::string>
-        , std::vector<Batch> > schedule(
+    /**
+     * Construct future batch schedules for a request set and report whether
+     * the simulated execution remains SLO-feasible.
+     */
+    std::tuple<bool, std::vector<Batch> > schedule(
         std::vector<Request>& reqs,
-        int M,
         double current_time,
-        bool verbose
+        double max_time = 1,
+        bool verbose = false
     );
 
-    std::tuple<bool, std::vector<bool>, 
-    std::vector<Batch> > admission_control(
+    std::tuple<bool, std::vector<bool> > admission_control(
         std::vector<Request>& reqs,
         const int M,
         double current_time
     );
 
-    std::tuple<bool, std::vector<bool>, 
-    std::vector<Batch> > _admission_control(
+    std::tuple<bool, std::vector<bool> > _admission_control(
         std::vector<Request>& reqs,
         const int M,
         double current_time

@@ -7,11 +7,18 @@
 #include <math.h>
 #include <assert.h>
 #include <stdio.h>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
 #include <list>
 #include <queue>
+#include <sstream>
 #include <unordered_map>
 #include <string>
 #include <list>
+#include <limits>
 
 /**
     our performance model is the following: 
@@ -19,6 +26,307 @@
     the batch planner's job is to take # reqs, t, and plan the batches that maximize the total prefill budget.
 */
 const double INFINITE_TIME = 0.5;
+
+namespace {
+
+std::string dump_batch_impl_failure(
+    const std::vector<Request>& reqs,
+    const std::vector<bool>& is_accepted,
+    const std::vector<Batch>& batches,
+    const std::string& schedule_mode,
+    bool schedule_fifo_fair,
+    bool schedule_continuous,
+    int schedule_M,
+    double schedule_current_time,
+    bool schedule_verbose,
+    const std::string& planner_name,
+    const std::string& planner_type,
+    bool planner_fixed_bs,
+    int planner_max_bs,
+    bool planner_continuous,
+    const std::vector<double>& planner_tpots,
+    const std::vector<double>& planner_hardware,
+    double planner_sd_alpha,
+    int planner_sd_max_sd_size,
+    bool planner_sd_fixed_spec,
+    const std::string& failing_req_id,
+    int remaining_prefill_tokens,
+    size_t failing_batch_idx
+) {
+    std::time_t now = std::time(nullptr);
+    std::ostringstream path_builder;
+    const char* dir = std::getenv("SLOSERVE_BATCH_IMPL_DUMP_DIR");
+    if (dir && dir[0] != '\0') {
+        path_builder << dir;
+        if (dir[std::strlen(dir) - 1] != '/') {
+            path_builder << "/";
+        }
+    } else {
+        path_builder << "/tmp/";
+    }
+    path_builder << "adm_ctrl_batch_impl_failure_" << static_cast<long long>(now) << ".txt";
+    const std::string path = path_builder.str();
+
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        return "";
+    }
+
+    out << "ADM_CTRL_BATCH_IMPL_DUMP_V2\n";
+    out << "schedule_mode " << std::quoted(schedule_mode) << "\n";
+    out << "schedule_fifo_fair " << schedule_fifo_fair << "\n";
+    out << "schedule_continuous " << schedule_continuous << "\n";
+    out << "schedule_M " << schedule_M << "\n";
+    out << "schedule_current_time " << schedule_current_time << "\n";
+    out << "schedule_verbose " << schedule_verbose << "\n";
+    out << "planner_name " << std::quoted(planner_name) << "\n";
+    out << "planner_type " << planner_type << "\n";
+    out << "planner_fixed_bs " << planner_fixed_bs << "\n";
+    out << "planner_max_bs " << planner_max_bs << "\n";
+    out << "planner_continuous " << planner_continuous << "\n";
+    out << "planner_tpots " << planner_tpots.size();
+    for (double x : planner_tpots) out << " " << x;
+    out << "\n";
+    out << "planner_hardware " << planner_hardware.size();
+    for (double x : planner_hardware) out << " " << x;
+    out << "\n";
+    out << "planner_sd_alpha " << planner_sd_alpha << "\n";
+    out << "planner_sd_max_sd_size " << planner_sd_max_sd_size << "\n";
+    out << "planner_sd_fixed_spec " << planner_sd_fixed_spec << "\n";
+    out << "failing_req_id " << std::quoted(failing_req_id) << "\n";
+    out << "remaining_prefill_tokens " << remaining_prefill_tokens << "\n";
+    out << "failing_batch_index " << failing_batch_idx << "\n";
+    out << "reqs " << reqs.size() << "\n";
+    for (const auto& req : reqs) {
+        out << "req "
+            << std::quoted(req.id) << " "
+            << req.is_new_req << " "
+            << req.ddl << " "
+            << req.input_length << " "
+            << req.n_computed_tokens << " "
+            << req.profit << " "
+            << req.mem << " "
+            << req.tpot_idx << " "
+            << req.prefill_mem << " "
+            << req.prefill_device_id << " "
+            << req.decode_device_id << " "
+            << req.prefill_only << " "
+            << req.arrival_time << "\n";
+    }
+
+    out << "accepted " << is_accepted.size() << "\n";
+    for (bool accepted : is_accepted) {
+        out << "acc " << accepted << "\n";
+    }
+
+    out << "batches " << batches.size() << "\n";
+    for (const auto& batch : batches) {
+        out << "batch "
+            << batch.prefill_bs << " "
+            << batch.next << " "
+            << batch.estimated_time << " "
+            << batch.req_batches.size() << "\n";
+        for (const auto& req_batch : batch.req_batches) {
+            out << "req_batch "
+                << std::quoted(req_batch.id) << " "
+                << req_batch.is_prefill << " "
+                << req_batch.n << "\n";
+        }
+    }
+
+    return path;
+}
+
+}  // namespace
+
+std::tuple<bool, std::vector<Batch> > AdmCtrlScheduler::_construct_batch_prefix(
+    const std::vector<Request>& active_reqs,
+    int M,
+    double current_time,
+    double max_time
+) {
+    struct SimReq {
+        Request req;
+        int last_sch_bid = -1;
+        int tie_id = 0;
+        bool has_committed = false;
+
+        double next_ddl(const std::vector<double>& tpots) const {
+            return req.ddl + tpots[req.tpot_idx] * std::max(req.n_computed_tokens - req.input_length + 1, 0);
+        }
+
+        int next_load() const {
+            if (req.n_computed_tokens < req.input_length) {
+                return req.input_length - req.n_computed_tokens;
+            }
+            return 1;
+        }
+
+        void commit(int n_token) {
+            if (req.n_computed_tokens < req.input_length) {
+                assert(req.n_computed_tokens + n_token <= req.input_length);
+            } else {
+                assert(n_token == 1);
+            }
+            req.n_computed_tokens += n_token;
+            has_committed = has_committed || (n_token > 0);
+        }
+
+        bool finished() const {
+            if (req.prefill_only) {
+                return req.n_computed_tokens >= req.input_length;
+            }
+            if (req.max_tokens < 0) {
+                return false;
+            }
+            return req.n_computed_tokens >= req.input_length + req.max_tokens;
+        }
+    };
+
+    struct SimBatch {
+        int unscheduled_tokens = 0;
+        double start_time = 0.0;
+        double end_time = 0.0;
+        std::unordered_map<int, int> n_scheduled_tokens; // tie_id -> n_tokens
+        std::unordered_map<int, bool> is_prefill;        // tie_id -> is_prefill
+
+        int batch_size() const {
+            int size = unscheduled_tokens;
+            for (const auto& kv : n_scheduled_tokens) {
+                size += kv.second;
+            }
+            return size;
+        }
+    };
+
+    struct QNode {
+        double ddl;
+        int tie_id;
+        SimReq req;
+    };
+    
+    struct QNodeCmp {
+        bool operator()(const QNode& a, const QNode& b) const {
+            if (a.ddl != b.ddl) return a.ddl > b.ddl;
+            return a.tie_id > b.tie_id;
+        }
+    };
+
+    const std::clock_t sim_start_clock = std::clock();
+    bool is_feasible = true;
+    int mem_ub = 0;
+    for (const auto& r : active_reqs) {
+        mem_ub += r.mem;
+    }
+    if (mem_ub > M) {
+        is_feasible = false;
+    }
+
+    std::priority_queue<QNode, std::vector<QNode>, QNodeCmp> Q;
+    std::vector<SimBatch> sim_batches;
+    sim_batches.reserve(128);
+
+    for (int i = 0; i < (int)active_reqs.size(); ++i) {
+        SimReq sr;
+        sr.req = active_reqs[i];
+        sr.last_sch_bid = -1;
+        sr.tie_id = i;
+        auto next_ddl = sr.next_ddl(planner->tpots);
+        if (next_ddl < 0) next_ddl = 10;
+        if (!sr.finished()) {
+            Q.push(QNode{next_ddl, sr.tie_id, sr});
+        }
+    }
+    double T = current_time;
+    int idx = 0;
+    while (!Q.empty()) {
+        idx += 1;
+        auto node = Q.top();
+        Q.pop();
+        SimReq req = node.req;
+
+        int next_load = req.next_load();
+        const int next_load_orig = next_load;
+        int tot_remained_tokens = 0;
+        for (int bid = req.last_sch_bid + 1; bid < (int)sim_batches.size(); ++bid) {
+            tot_remained_tokens += sim_batches[bid].unscheduled_tokens;
+        }
+
+        if (tot_remained_tokens < next_load) {
+            const double next_ddl = node.ddl;
+            const int available_bs = planner->time_to_batch(
+                std::max(0.0, next_ddl - T), 1, 0, 1);
+            int n_token_next_batch = available_bs;
+            const double start_time = T;
+
+            if (n_token_next_batch + tot_remained_tokens < next_load) {
+                is_feasible = false;
+                n_token_next_batch = next_load - tot_remained_tokens;
+                T += planner->batch_to_time(
+                    n_token_next_batch,
+                    1,
+                    req.req.n_computed_tokens + tot_remained_tokens,
+                    1);
+            } else {
+                T = next_ddl;
+            }
+
+            SimBatch b;
+            b.unscheduled_tokens = n_token_next_batch;
+            b.start_time = start_time;
+            b.end_time = next_ddl;
+            sim_batches.push_back(std::move(b));
+            tot_remained_tokens += n_token_next_batch;
+        }
+
+        for (int bid = req.last_sch_bid + 1; bid < (int)sim_batches.size() && next_load > 0; ++bid) {
+            int n_sch = std::min(sim_batches[bid].unscheduled_tokens, next_load);
+            tot_remained_tokens -= n_sch;
+            sim_batches[bid].unscheduled_tokens -= n_sch;
+            next_load -= n_sch;
+            if (n_sch > 0) {
+                sim_batches[bid].n_scheduled_tokens[req.tie_id] += n_sch;
+                sim_batches[bid].is_prefill[req.tie_id] =
+                    (req.req.n_computed_tokens < req.req.input_length);
+                req.last_sch_bid = bid;
+            }
+        }
+
+        req.commit(next_load_orig);
+        if (!req.finished()) {
+            double earliest_start_time = sim_batches[req.last_sch_bid].start_time;
+            if (earliest_start_time < (current_time + max_time)) {
+                Q.push(QNode{req.next_ddl(planner->tpots), req.tie_id, req});
+            }
+        }
+        assert(next_load == 0);
+    }
+
+    std::vector<Batch> out_batches;
+    out_batches.reserve(sim_batches.size());
+    for (auto& sb : sim_batches) {
+        Batch b;
+        b.prefill_bs = 0;
+        b.next = 1;
+        for (auto& kv : sb.n_scheduled_tokens) {
+            const int tie_id = kv.first;
+            const int n_sch = kv.second;
+            const bool is_prefill = sb.is_prefill[tie_id];
+            b.req_batches.emplace_back(active_reqs[tie_id].id, is_prefill, n_sch);
+        }
+        out_batches.push_back(std::move(b));
+    }
+
+    if (_verbose) {
+        const double elapsed_s =
+            static_cast<double>(std::clock() - sim_start_clock) / CLOCKS_PER_SEC;
+        std::cout << "Simulated " << idx << " scheduling events over " << sim_batches.size()
+                << " batches. Feasible=" << is_feasible
+                << " elapsed_s=" << elapsed_s << std::endl;
+    }
+
+    return {is_feasible, out_batches};
+}
 
 std::ostream& operator << (std::ostream& o, Request& req) {
     o  << "id " << req.id << " is_new_req " << req.is_new_req 
@@ -471,8 +779,7 @@ void generate_vectors(const std::vector<int>& a, const std::vector<int>& b,
     }
 }
 
-std::tuple<bool, std::vector<bool>, 
-    std::vector<Batch> > AdmCtrlScheduler::_admission_control_dp(
+std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_dp(
     std::vector<Request>& reqs,
     const int M,
     double current_time
@@ -636,7 +943,7 @@ std::tuple<bool, std::vector<bool>,
 
     timer("dp");
     if (not best_state) 
-        return {false, accept_request, batches};
+        return {false, accept_request};
     auto state = best_state;
     while (state and state->i != -1){
         if (not (state->i >=1 && state->i <= accept_request.size())) {
@@ -654,7 +961,7 @@ std::tuple<bool, std::vector<bool>,
     }
     timer("all");
     // timer.display();
-    return {true, accept_request, batches};
+    return {true, accept_request};
 }
 
 
@@ -732,237 +1039,51 @@ bool AdmCtrlScheduler::_check_slo_violation(
     return has_violation;
 }
 
-void AdmCtrlScheduler::_batch_impl(
+std::vector<Batch> AdmCtrlScheduler::_batch_impl(
     const std::vector<Request>& reqs,
     const std::vector<bool>& is_accepted, 
-    std::vector<Batch>& batches
-){
-    // while(not batches.back().req_batches.size())
-    //     batches.pop_back();
-    /*1. We realize the batch first. */
-    assert(reqs.size() == is_accepted.size());
-
-    std::queue<std::pair<std::string, int> > remain_prefills;
-    for (size_t i = 0; i < reqs.size(); i++) {
-        if (is_accepted[i] and reqs[i].input_length > 0) 
-            remain_prefills.push({reqs[i].id, reqs[i].input_length});
-    }
-    
-    size_t bid = 0;
-    while (remain_prefills.size()) {
-        std::string req_id;
-        int prefill_tokens;
-        std::tie(req_id, prefill_tokens) = remain_prefills.front();
-        remain_prefills.pop();
-        while (prefill_tokens and bid < batches.size()) {
-            auto& batch = batches[bid];
-            int n = std::min(batch.prefill_bs, prefill_tokens);
-            batch.req_batches.push_back(ReqBatch(req_id, true, n));
-            prefill_tokens -= n;
-            batch.prefill_bs -= n;
-            if (batch.prefill_bs == 0)
-                bid ++;
-        }
-        assert(prefill_tokens == 0);
-    }
-    // If the last batch has part for prefill, we advance the bid;
-    if (bid < batches.size() and (batches[bid].req_batches.size()
-        and batches[bid].req_batches.back().is_prefill)) 
-        bid++;
-    batches.erase(batches.begin() + bid, batches.end());
-
-    std::vector<Request> accepted_reqs;
-    for (size_t i = 0; i < reqs.size(); ++i) {
-      if (is_accepted[i]) accepted_reqs.push_back(reqs[i]);
-    }
-    int prefill_tokens;
-    double elasped_time;
-    std::vector<Batch> last_batches;
-    std::tie(prefill_tokens, elasped_time, last_batches) 
-        = planner->plan(INFINITE_TIME, accepted_reqs, true);
-    if (last_batches.size())
-        last_batches.back().next = -last_batches.size() + 1;
-    assert(elasped_time >= 0);
-    batches.insert(batches.end(), last_batches.begin(), last_batches.end());
-}
-
-std::tuple<bool, std::vector<std::string>, std::vector<Batch> > AdmCtrlScheduler::schedule(
-    std::vector<Request>& reqs,
     int M,
     double current_time,
-    bool verbose
+    bool verbose,
+    double max_time
 ){
-    // special case if all requests are old decode requests
-    // bool all_old_decode_requests = true;
-    // for (auto& req: reqs) {
-    //     if (req.is_new_req || (req.input_length > 0)) {
-    //         all_old_decode_requests = false;
-    //         break;
-    //     }
-    // }
-    // if (all_old_decode_requests) {
-    //     Batch batch;
-    //     for (auto& req: reqs) {
-    //         batch.req_batches.push_back(ReqBatch(req.id, false, 1));
-    //     }
-    //     batch.prefill_bs = 0;
-    //     batch.next = 0;
-    //     return {true, {}, {batch}};
-    // }
-    
-    Timer timer;
-    timer.start();
-    _verbose = verbose;
+    assert(reqs.size() == is_accepted.size());
+    (void)verbose;
 
-    for (auto& req: reqs) {
-        if (not req.is_new_req)
-            req.mem = 0;
-    }
-
-    if (verbose) {
-        std::cout << "Planner: " << planner->name << std::endl;
-        std::cout << "Continuous: " << planner->continuous << std::endl;
-        std::cout << "Tpots: ";
-        for (double t : planner->tpots) {
-            std::cout << t << " ";
-        }
-        std::cout << "\nHardware Params: ";
-        for (double h : planner->hardware_params) {
-            std::cout << h << " ";
-        }
-        std::cout << "fixed_bs: " << planner->fixed_bs << std::endl;
-        std::cout << "max_bs: " << planner->max_bs << std::endl;
-        std::cout << "\nAvailable Memory: " << M
-                << "\nCurrent Time: " << current_time
-                << "\nRequests:\n";
-
-        for (const auto& req : reqs) {
-            std::cout << req.id << " " << req.is_new_req << " " << req.ddl << " "
-                    << req.input_length << " " << req.profit << " " << req.mem
-                    << " " << req.tpot_idx << "\n";
+    std::vector<Request> accepted_reqs;
+    accepted_reqs.reserve(reqs.size());
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        if (is_accepted[i]) {
+            accepted_reqs.push_back(reqs[i]);
         }
     }
 
-    if (reqs.size() == 0) {
-        return {true, {}, {}};
+    auto [is_construct_feasible, batches] = _construct_batch_prefix(
+        accepted_reqs, M, current_time, max_time);
+    if (!is_construct_feasible && _verbose) {
+        std::cout << "[AdmCtrlScheduler::_batch_impl] construct_batches "
+                  << "reported infeasible; returning prefix batches."
+                  << std::endl;
     }
-
-    
-    if (_verbose) {
-        std::cout << "Requests:" << std::endl;
-        for (auto& req: reqs)
-        std::cout << req << std::endl;
-    }
-    
-
-    sort(reqs.begin(), reqs.end(), [](Request& r1, Request& r2){
-        return r1.ddl < r2.ddl; 
-    });
-    auto [is_feasible, is_accepted, batches] = admission_control(reqs, M, current_time);
-
-    // bool is_feasible;
-    // std::vector<bool> is_accepted;
-    // std::vector<Batch> batches;
-
-    // if (mode == "fcfs") {
-    //     std::tie(is_feasible, is_accepted, batches) = _admission_control_fcfs(reqs, M, current_time);
-    // }
-    // else if (mode == "dp") {
-    //     std::tie(is_feasible, is_accepted, batches) = _admission_control_dp(reqs, M, current_time);
-    // }
-    // else if (mode == "edf") {
-    //     std::tie(is_feasible, is_accepted, batches) = _admission_control_edf(reqs, M, current_time);
-    // }
-    // else {
-    //     throw std::runtime_error("Invalid mode: " + mode);
-    // }
-    timer("admission_control");
-
-    if (not is_feasible) {
-       
-        std::vector<Request> reqs_new;
-        std::vector<int> old_req_ids;
-        is_accepted.clear();
-        is_accepted.resize(reqs.size(), false);
-        for (size_t i = 0; i < reqs.size(); ++i) {
-            auto& req = reqs[i];
-            if (not req.is_new_req) {
-                old_req_ids.push_back(i);
-                reqs_new.push_back(req);
-                reqs_new.back().is_new_req = true;
-            }
-        }
-        std::vector<bool> is_accepted_new;
-        bool is_feasible_new;
-        // batches.clear();
-        std::tie(is_feasible_new, is_accepted_new, batches) = _admission_control_edf(reqs_new, M, current_time);
-        for (size_t i = 0; i < old_req_ids.size(); ++i) {
-            is_accepted[old_req_ids[i]] = is_accepted_new[i];
-        }
-        assert (is_feasible_new);
-    }
-
-    // if (not is_feasible) {
-    //     return {false, {}, {}};
-    // }
-
-    if (_verbose) {
-        for (int i = 0; i < reqs.size(); ++i) {
-            std::cout <<(is_accepted[i]? "ACC":"REJ") << " " << reqs[i] << std::endl;
-        }
-
-        std::cout << "batches:" << std::endl;
-        for (auto & batch: batches) {
-            std::cout << batch << std::endl;
-        }
-        std::cout << "**************" << std::endl;
-    }
-
-    std::vector<std::string> acc_ids;
-    for (int i = 0 ; i < is_accepted.size(); i++) {
-        // assert(reqs[i].is_new_req or is_accepted[i]);
-        if (is_accepted[i]) 
-            acc_ids.push_back(reqs[i].id);
-    }
-
-    if (!continuous)
-        _batch_impl(reqs, is_accepted, batches);
-
-
-    std::unordered_map<std::string, int> n_past_tokens_map;
-    for (auto& req: reqs) {
-        n_past_tokens_map[req.id] = req.n_computed_tokens;
-    }
-    for (auto& batch: batches) {
-        int n_past_tokens = 0;
-        for (auto& req_batch: batch.req_batches) {
-            n_past_tokens += n_past_tokens_map[req_batch.id];
-        }
-        batch.estimated_time = planner->batch_to_time(batch.batch_size(), batch.req_batches.size(), n_past_tokens, batch.max_decode_size());
-    }
-
-
-    if (_verbose) {
-        std::cout << "schedules" << std::endl;
-        double t = current_time;
-        for (auto& batch: batches) {
-            std::cout << batch << std::endl;
-            double elapsed = planner->batch_to_time(batch.batch_size(), batch.max_decode_size());
-            t += elapsed;
-            std::cout << "T: " << t << std::endl;
-        }
-    }
-    timer("batch_impl");
-    bool has_violation = _check_slo_violation(reqs, is_accepted, batches, current_time);
-
-    is_feasible = is_feasible and not has_violation;
-    // timer.display();
-    /*2. Realize the batch & Maximize the utilization*/
-    return {is_feasible, acc_ids, batches};
+    return batches;
 }
 
-std::tuple<bool, std::vector<bool>,
-    std::vector<Batch> > AdmCtrlScheduler::admission_control(
+std::tuple<bool, std::vector<Batch> > AdmCtrlScheduler::schedule(
+    std::vector<Request>& reqs,
+    double current_time,
+    double max_time,
+    bool verbose
+){
+    (void)verbose;
+    return _construct_batch_prefix(
+        reqs,
+        std::numeric_limits<int>::max(),
+        current_time,
+        max_time
+    );
+}
+
+std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::admission_control(
     std::vector<Request>& reqs,
     const int M,
     double current_time
@@ -974,16 +1095,14 @@ std::tuple<bool, std::vector<bool>,
     auto _dispatch = [this](std::vector<Request>& local_reqs,
         const int local_M,
         double local_current_time) {
-        std::sort(local_reqs.begin(), local_reqs.end(),
-                  [](const Request& r1, const Request& r2) {
-                      return r1.ddl < r2.ddl;
-                  });
         if (mode == "fcfs") {
             return _admission_control_fcfs(local_reqs, local_M, local_current_time);
         } else if (mode == "dp") {
             return _admission_control_dp(local_reqs, local_M, local_current_time);
         } else if (mode == "edf") {
             return _admission_control_edf(local_reqs, local_M, local_current_time);
+        } else if (mode == "edf_sim") {
+            return _admission_control_edf_sim(local_reqs, local_M, local_current_time);
         }
         throw std::runtime_error("Invalid mode: " + mode);
     };
@@ -1032,15 +1151,14 @@ std::tuple<bool, std::vector<bool>,
          });
 
     // Start with only old requests.
-    auto [is_feasible, is_accepted_old, batches] =
+    auto [is_feasible, is_accepted_old] =
         _dispatch(old_reqs, M, current_time);
 
     // If the old-only configuration is infeasible, nothing can be admitted.
     if (!is_feasible) {
         return {
             false,
-            std::vector<bool>(reqs.size(), false),
-            std::vector<Batch>()};
+            std::vector<bool>(reqs.size(), false)};
     }
 
     // Maintain the last accepted decision vector over the *current* working set
@@ -1067,7 +1185,7 @@ std::tuple<bool, std::vector<bool>,
     // Try to add each new request in arrival order.
     for (size_t i = 0; i < new_reqs.size(); ++i) {
         working_reqs.push_back(new_reqs[i]);
-        auto [next_feasible, next_accepted, next_batches] =
+        auto [next_feasible, next_accepted] =
             _dispatch(working_reqs, M, current_time);
 
         // If the new request cannot be accommodated without violating
@@ -1080,7 +1198,6 @@ std::tuple<bool, std::vector<bool>,
 
         // This configuration is acceptable; keep it and continue.
         working_accepted = std::move(next_accepted);
-        batches = std::move(next_batches);
     }
 
     // Expand working_accepted (which is indexed over working_reqs) back
@@ -1107,11 +1224,10 @@ std::tuple<bool, std::vector<bool>,
         }
     }
 
-    return {true, is_accepted, batches};
+    return {true, is_accepted};
 }
 
-std::tuple<bool, std::vector<bool>, 
-    std::vector<Batch> > AdmCtrlScheduler::_admission_control_fcfs(
+std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_fcfs(
     std::vector<Request>& reqs,
     const int M,
     double current_time
@@ -1119,8 +1235,153 @@ std::tuple<bool, std::vector<bool>,
     throw std::runtime_error("Not implemented");
 }
 
-std::tuple<bool, std::vector<bool>, 
-    std::vector<Batch> > AdmCtrlScheduler::_admission_control_edf(
+
+std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_sim(
+    std::vector<Request>& reqs,
+    const int M,
+    double current_time
+) {
+    auto get_next_load = [](const Request& req) {
+        if (req.n_computed_tokens < req.input_length) {
+            return req.input_length - req.n_computed_tokens;
+        }
+        return 1;
+    };
+
+    auto get_next_ddl = [&](const Request& req) {
+        return req.ddl + std::max(0, req.n_computed_tokens - req.input_length + 1) * planner->tpots[0];
+    };
+
+    auto feasibility_check = [&](const std::vector<Request>& reqs) -> bool {
+        std::vector<std::tuple<double, std::string, Request> > events;
+        double tpot = planner->tpots[0];
+        double decode_bs = planner->time_to_batch(tpot);
+        double decode_time = planner->batch_to_time(decode_bs);
+        for (auto& req: reqs) {
+            auto next_token_ddl = get_next_ddl(req);
+            events.push_back({next_token_ddl, "first_load", req});
+            assert(req.tpot_idx == 0);
+            if (req.max_tokens > 1) {
+                events.push_back({req.ddl + req.max_tokens * tpot, "finish", req});
+            }
+        }
+        std::sort(events.begin(), events.end(),
+                  [](const auto& a, const auto& b) {
+                      if (std::get<0>(a) != std::get<0>(b)) {
+                          return std::get<0>(a) < std::get<0>(b);
+                      }
+                      return std::get<1>(a) < std::get<1>(b);
+                  });
+        double now = current_time;
+        size_t remained_tk = 0;
+        int remained_mem = M * block_size;
+        size_t n_decode = 0;
+        for (auto& e: events) {
+            auto [t, type, req] = e;
+            if (t < now) 
+                return false;
+            if (n_decode > decode_bs) 
+                return false;
+            if (n_decode > 0) {
+                double elapsed = t - now;
+                size_t n_batch = std::floor(elapsed / decode_time);
+                remained_mem -= n_batch * n_decode;
+                if (remained_mem < 0) {
+                    return false;
+                }
+                now += n_batch * decode_time;
+                remained_tk += (decode_bs - n_decode) * n_batch;
+            }
+            if (type == "first_load") {
+                auto next_load = get_next_load(req);
+                if (remained_tk < next_load) {
+                    auto extra_bgt = planner->time_to_batch(t - now);
+                    if ((extra_bgt + remained_tk) < next_load) {
+                        return false;
+                    }
+                    remained_tk += extra_bgt; 
+                    now += planner->batch_to_time(extra_bgt);
+                }
+                assert (remained_tk >= next_load);
+                remained_tk -= next_load;
+                remained_mem -= next_load;
+                if (remained_mem < 0) {
+                    return false;
+                }
+                if (not req.prefill_only) {
+                    n_decode += 1;
+                }
+            }
+            else if (type == "finish") {
+                n_decode -= 1;
+                remained_mem += req.input_length + req.max_tokens;
+            }
+        }
+        return true; 
+    };
+
+    Timer timer;
+    timer.start();
+    
+    // Build baseline with old requests first.
+    std::vector<Request> working_reqs;
+    working_reqs.reserve(reqs.size());
+    std::vector<bool> is_accepted(reqs.size(), false);
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        if (!reqs[i].is_new_req) {
+            working_reqs.push_back(reqs[i]);
+            is_accepted[i] = true;
+        }
+    }
+
+    bool feasible = feasibility_check(working_reqs);
+    if (!feasible) {
+        return {false, std::vector<bool>(reqs.size(), false)};
+    }
+
+    timer("feasibility_old_reqs");
+
+    // Rank new requests by cost-efficiency, then admit greedily with rollback.
+    struct NewReqCand {
+        size_t idx;
+        double score;
+    };
+    std::vector<NewReqCand> new_cands;
+    new_cands.reserve(reqs.size());
+    for (size_t i = 0; i < reqs.size(); ++i) {
+        if (!reqs[i].is_new_req) continue;
+        new_cands.push_back(NewReqCand{i, - get_next_ddl(reqs[i])});
+    }
+    std::stable_sort(
+        new_cands.begin(), new_cands.end(),
+        [&](const NewReqCand& a, const NewReqCand& b) {
+            if (a.score != b.score) return a.score > b.score;          // higher utility first
+            return reqs[a.idx].arrival_time < reqs[b.idx].arrival_time; // FIFO tie-break
+        });
+
+    int idx = 0;
+    for (const auto& cand : new_cands) {
+        const auto& req = reqs[cand.idx];
+        auto candidate_reqs = working_reqs;
+        candidate_reqs.push_back(req);
+
+        const bool candidate_feasible = feasibility_check(candidate_reqs);
+        if (candidate_feasible) {
+            working_reqs = std::move(candidate_reqs);
+            is_accepted[cand.idx] = true;
+        } else {
+            is_accepted[cand.idx] = false;
+        }
+        timer("feasibility_new_reqs" + std::to_string(idx));
+        idx++;
+    }
+
+    // if (_verbose)
+    //     timer.display();
+    return {true, is_accepted};
+}
+
+std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf(
     std::vector<Request>& reqs,
     const int M,
     double current_time
@@ -1207,5 +1468,5 @@ std::tuple<bool, std::vector<bool>,
         }
     }
 
-    return {is_valid_fn(state), is_accepted, state.batches};
+    return {is_valid_fn(state), is_accepted};
 }
