@@ -807,6 +807,9 @@ class Router(ABC):
         min_n_req = min(n_reqs)
         freest_device_id = n_reqs.index(min_n_req)
         return freest_device_id, freest_device_id
+    
+    def set_iter(self, iter: int):
+        self.iter = iter 
 
 class AutoScalingRouter(Router):
     def __init__(self, n_devices: int, router_kwargs: dict[str, Any]):
@@ -1226,7 +1229,7 @@ class SLOsServeRouter(Router):
         logger.info(
             f'SLOServeRouter: n_group: {self.n_group}, n_lb: {self.n_lb}, '
             f'group_size: {self.group_size}, n_prefill_or_mixed: {self.n_prefill_or_mixed_per_group}, '
-            f'use_planner: {self.use_planner}'
+            f'use_planner: {self.use_planner}, ablation: {self.ablation}', 
         )
         
     def get_req_data(self, request: RequestInstance):
@@ -1340,50 +1343,27 @@ class SLOsServeRouter(Router):
         is_feasible, is_accepteds = self.adm_planner.adm_ctrl(c_reqs, num_free_blocks, 0.0)
         accepted_ids = set(c_req.id for c_req, is_accepted in zip(c_reqs, is_accepteds) if is_accepted)
         t_after_schedule = time.perf_counter()
-        logger.info(f'[SLOPacker] {did=} {is_feasible=}')
-        self._pre_adm_schedule_iter += 1
-        if self._pre_adm_schedule_iter % 1 == 0:
-            total_s = t_after_schedule - t_start
-            schedule_s = t_after_schedule - t_before_schedule
-            self._dump_pre_adm_schedule_inputs(
-                did=did,
-                mode=mode,
-                c_reqs=c_reqs,
-                num_free_blocks=num_free_blocks,
-                current_time=0.0,
-                is_feasible=is_feasible,
-                accepted_ids=accepted_ids,
-                schedule_elapsed_s=schedule_s,
-                total_elapsed_s=total_s,
-                force=True,
-                dump_reason="sanity",
-                iter = self._pre_adm_schedule_iter
-            )
+        # logger.info(f'[SLOPacker] {did=} {is_feasible=}')
         
+        # if schedule_s > self.pre_adm_schedule_dump_threshold_s:
+        
+        # t_end = time.perf_counter()
+        # total_s = t_end - t_start
+        # schedule_s = t_after_schedule - t_before_schedule
+        # prepare_s = t_before_schedule - t_start
+        # post_s = t_end - t_after_schedule
+        # self._dump_pre_adm_schedule_inputs(
+        #     did=did,
+        #     mode=mode,
+        #     c_reqs=c_reqs,
+        #     num_free_blocks=num_free_blocks,
+        #     current_time=0.0,
+        #     is_feasible=is_feasible,
+        #     accepted_ids=accepted_ids,
+        #     schedule_elapsed_s=schedule_s,
+        #     total_elapsed_s=total_s,
+        # )
         if not is_feasible:
-            total_s = t_after_schedule - t_start
-            schedule_s = t_after_schedule - t_before_schedule
-            prepare_s = t_before_schedule - t_start
-            if schedule_s > self.pre_adm_schedule_dump_threshold_s:
-                self._dump_pre_adm_schedule_inputs(
-                    did=did,
-                    mode=mode,
-                    c_reqs=c_reqs,
-                    num_free_blocks=num_free_blocks,
-                    current_time=0.0,
-                    is_feasible=is_feasible,
-                    accepted_ids=accepted_ids,
-                    schedule_elapsed_s=schedule_s,
-                    total_elapsed_s=total_s,
-                )
-            if total_s > self.pre_adm_schedule_dump_threshold_s:
-                ratio = schedule_s / max(total_s, 1e-9)
-                logger.warning(
-                    f"[SLOPackerTiming] slow _run_pre_adm_planner infeasible "
-                    f"did={did} mode={mode} total={total_s:.6f}s prepare={prepare_s:.6f}s "
-                    f"schedule={schedule_s:.6f}s schedule_ratio={ratio:.3f} "
-                    f"n_waiting={len(waiting_requests)} n_running={len(running_requests)} n_creqs={len(c_reqs)}"
-                )
             return waiting_requests
 
         accepted_set = set(accepted_ids)
@@ -1398,32 +1378,18 @@ class SLOsServeRouter(Router):
             else:
                 remained_waiting_requests.append(req)
 
-        t_end = time.perf_counter()
-        total_s = t_end - t_start
-        schedule_s = t_after_schedule - t_before_schedule
-        prepare_s = t_before_schedule - t_start
-        post_s = t_end - t_after_schedule
-        if schedule_s > self.pre_adm_schedule_dump_threshold_s:
-            self._dump_pre_adm_schedule_inputs(
-                did=did,
-                mode=mode,
-                c_reqs=c_reqs,
-                num_free_blocks=num_free_blocks,
-                current_time=0.0,
-                is_feasible=is_feasible,
-                accepted_ids=accepted_ids,
-                schedule_elapsed_s=schedule_s,
-                total_elapsed_s=total_s,
-            )
-        if total_s > self.pre_adm_schedule_dump_threshold_s:
-            ratio = schedule_s / max(total_s, 1e-9)
-            logger.warning(
-                f"[SLOPackerTiming] slow _run_pre_adm_planner "
-                f"did={did} mode={mode} total={total_s:.6f}s prepare={prepare_s:.6f}s "
-                f"schedule={schedule_s:.6f}s post={post_s:.6f}s schedule_ratio={ratio:.3f} "
-                f"n_waiting={len(waiting_requests)} n_running={len(running_requests)} "
-                f"n_creqs={len(c_reqs)} n_accepted={len(accepted_set)}"
-            )
+        
+        
+        
+        # if total_s > self.pre_adm_schedule_dump_threshold_s:
+        #     ratio = schedule_s / max(total_s, 1e-9)
+        #     logger.warning(
+        #         f"[SLOPackerTiming] slow _run_pre_adm_planner "
+        #         f"did={did} mode={mode} total={total_s:.6f}s prepare={prepare_s:.6f}s "
+        #         f"schedule={schedule_s:.6f}s post={post_s:.6f}s schedule_ratio={ratio:.3f} "
+        #         f"n_waiting={len(waiting_requests)} n_running={len(running_requests)} "
+        #         f"n_creqs={len(c_reqs)} n_accepted={len(accepted_set)}"
+        #     )
 
         return remained_waiting_requests
 
@@ -1440,7 +1406,6 @@ class SLOsServeRouter(Router):
         total_elapsed_s: float,
         force: bool = False,
         dump_reason: str = "slow",
-        iter = 0
     ) -> None:
         now = time.time()
         if (not force) and (now - self._last_pre_adm_schedule_dump_ts) < self.pre_adm_schedule_dump_cooldown_s:
@@ -1450,7 +1415,7 @@ class SLOsServeRouter(Router):
             os.makedirs(self.pre_adm_schedule_dump_dir, exist_ok=True)
             filename = os.path.join(
                 self.pre_adm_schedule_dump_dir,
-                f"pre_adm_schedule_{iter}_did{did}_{mode}.txt",
+                f"pre_adm_schedule_{self.iter}_did{did}_{mode}.txt",
             )
             with open(filename, "w") as f:
                 f.write("SLOPACKER_SCHEDULE_DUMP_V1\n")
@@ -1544,8 +1509,11 @@ class SLOsServeRouter(Router):
                     self.group_idx = (self.group_idx + 1) % self.n_group
                 elif (req.prefill_device_id + 1) % self.group_size: 
                     did = req.prefill_device_id + 1
-                if did is not None: 
-                    waiting_prefill_or_normal_requests[did].append(req)
+                else:
+                    # begin the next cycle
+                    did = req.prefill_device_id // self.group_size * self.group_size
+                # if did is not None: 
+                waiting_prefill_or_normal_requests[did].append(req)
             else:
                 assert req.prefill_device_id >= 0
                 if req.decode_device_id == -1:
@@ -1553,8 +1521,11 @@ class SLOsServeRouter(Router):
                     did = (req.prefill_device_id // self.group_size) * self.group_size + self.group_size - 1
                 elif req.decode_device_id % self.group_size:
                     did = req.decode_device_id - 1 
-                if did is not None: 
-                    waiting_decode_requests[did].append(req)
+                else:
+                    # begin the next cycle
+                    did = req.decode_device_id + self.group_size - 1
+                # if did is not None: 
+                waiting_decode_requests[did].append(req)
         
         for group_i in range(self.n_group):
             msp = self.group_size * group_i - 1
@@ -1826,7 +1797,6 @@ class SLOsServeRouter(Router):
                     device_to_waiting_reqs[i * self.group_size + j + 1].extend(remained_waiting_reqs)
         
         routing_elapsed = time.time() - start_routing
-        logger.info(f'SLOsServeRouter, elapsed: {routing_elapsed:.6f}s')
     
     def _run_decode(self, waiting_requests: List[RequestInstance],
             running_requests: List[RequestInstance],
@@ -2383,6 +2353,8 @@ class RequestPool:
             
             
             if len(self.waiting_pool): 
+                routing_iter += 1
+                self.router.set_iter(routing_iter)
                 self.router.run(self.waiting_pool, self.running_pool)
             routing_elapsed = time.time() - it_start_time
 
@@ -2400,7 +2372,6 @@ class RequestPool:
                     },
                     "device_id": -1,
                 })
-                routing_iter += 1
                 if routing_iter % 100 == 0:
                     logger.info(f"Routing loop: routing_iter={routing_iter}, load_statistics={self.load_stat.get_stat()}")
             
@@ -2452,7 +2423,8 @@ class RequestPool:
                                 "state": str(request.state),
                                 "admission_mode": self.admission_mode,
                                 "prefill_id": request.prefill_device_id,
-                                "decode_id": request.decode_device_id
+                                "decode_id": request.decode_device_id,
+                                "routing_iter": routing_iter
                             }
                         })
                         remained_waiting_requests.append(request)
@@ -2477,7 +2449,8 @@ class RequestPool:
                                 "state": str(request.state),
                                 "admission_mode": self.admission_mode,
                                 "prefill_id": request.prefill_device_id,
-                                "decode_id": request.decode_device_id
+                                "decode_id": request.decode_device_id,
+                                'routing_iter': routing_iter
                             }
                         })
                         
@@ -2487,7 +2460,7 @@ class RequestPool:
                             'device_id': request.prefill_device_id,
                             'request_id': request.request_id,
                             'is_rejection': True, 
-                            'is_slo_violation': True 
+                            'is_slo_violation': True,
                         })
 
                         logger.debug(f"Request {request.request_id} not admitted due to , sending rejection")

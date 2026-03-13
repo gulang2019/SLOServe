@@ -228,7 +228,7 @@ class MockEngineCore:
                     print(f'[MockEngineCore] batch_id={self.batch_id}, stats={stats}, n_arrived_reqs={self.n_arrived_reqs}, n_finished_reqs={self.n_finished_reqs}, n_rejected_reqs={self.n_rejected_reqs}')
                 self.batch_id += 1
                 scheduling_start = time.time()
-                self.scheduler.atfc_planner.tag = f'{self.device_id}_{self.batch_id}'
+                # self.scheduler.atfc_planner.tag = f'{self.device_id}_{self.batch_id}'
                 scheduler_output = self.scheduler.schedule()
                 scheduling_overhead = time.time() - scheduling_start
                 publish_start = time.time()

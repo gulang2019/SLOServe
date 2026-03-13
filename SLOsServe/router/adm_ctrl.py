@@ -211,14 +211,14 @@ class BatchPlanner:
         # print('is_feasible', is_feasible, 'is_accepteds', is_accepteds)
         self._cpp_adm_ctrl_iterations += 1
         elapsed = time.time() - start
-        self._dump_schedule_inputs(
-            c_reqs,
-            [req.id for req, is_acc in zip(c_reqs, is_accepteds) if is_acc],
-            num_free_blocks=self._num_free_blocks,
-            current_time=0.0,
-            is_feasible=bool(is_feasible),
-            surfix = f'adm_ctrl_{new_req.request_id}'
-        )
+        # self._dump_schedule_inputs(
+        #     c_reqs,
+        #     [req.id for req, is_acc in zip(c_reqs, is_accepteds) if is_acc],
+        #     num_free_blocks=self._num_free_blocks,
+        #     current_time=0.0,
+        #     is_feasible=bool(is_feasible),
+        #     surfix = f'adm_ctrl_{new_req.request_id}'
+        # )
         return bool(is_feasible and len(is_accepteds) == len(c_reqs) and is_accepteds[-1])
     
     def add_request(self, 

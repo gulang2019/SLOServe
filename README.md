@@ -81,13 +81,7 @@ python motivation/bench_api_server.py --overwrite \
 ## Step 4. end to end evaluation
 End-to-end scripts
 ```sh
-# 1. Single Server
-# ./run_unit.sh <gpu> <port> <baseline> <load_scale> [slo_tpots] [ttft_slo_scales] [window] [trace] [model_name]
-source ./run_unit.sh 0 8000 slosserve-edf 0.5 0.1 5.0 600:1201 azure_chat_23:azure_chat_23 Qwen/Qwen2.5-7B-Instruct 2>&1 | tee out.txt
-# run a grid of experiment 
-# usage: run_new.py [-h]
-#                   [--job {Coder-Qwen7B-bustiness,ChatBot-Qwen7B-bustiness,Coder-Qwen7B,Coder-Qwen7B-tpot-ablation,Coder-Qwen7B-ttft-ablation,ChatBot-Qwen7B,Arxiv-Qwen7B,Coder-Gemma27B,ChatBot-Gemma27B,Arxiv-Gemma27B}]
-python run_new.py --job Coder-Qwen8B
+source run_batch.sh
 ```
 
 # Instructions

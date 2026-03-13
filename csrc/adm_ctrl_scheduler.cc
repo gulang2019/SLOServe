@@ -1251,7 +1251,7 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
     auto get_next_ddl = [&](const Request& req) {
         return req.ddl + std::max(0, req.n_computed_tokens - req.input_length + 1) * planner->tpots[0];
     };
-
+    // TODO(Yi): implement the memory feasibility check with MontCaro;
     auto feasibility_check = [&](const std::vector<Request>& reqs) -> bool {
         std::vector<std::tuple<double, std::string, Request> > events;
         double tpot = planner->tpots[0];
