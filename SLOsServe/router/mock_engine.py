@@ -228,6 +228,7 @@ class MockEngineCore:
                     print(f'[MockEngineCore] batch_id={self.batch_id}, stats={stats}, n_arrived_reqs={self.n_arrived_reqs}, n_finished_reqs={self.n_finished_reqs}, n_rejected_reqs={self.n_rejected_reqs}')
                 self.batch_id += 1
                 scheduling_start = time.time()
+                self.scheduler.atfc_planner.tag = f'{self.device_id}_{self.batch_id}'
                 scheduler_output = self.scheduler.schedule()
                 scheduling_overhead = time.time() - scheduling_start
                 publish_start = time.time()
@@ -289,7 +290,7 @@ class MockEngineCore:
                 
                 # we mimic the current runtime by blocking the loop for the batch time.
                 await asyncio.sleep(batch_time)
-                
+
                 # time.sleep(batch_time)
                 output_processing_start = time.time()
                 
@@ -415,7 +416,13 @@ class MockEngineCore:
         # print(f"Adding request: {request}")
         admitted = self.scheduler.add_request(request)
         
-        print(f'add_request takes {time.time() - add_request_start}s')
+        self._profile_events.append({
+            "event_type": "add_request",
+            "request_id": request.request_id,
+            "timestamp": time.time(),
+            "extra_args": {'elapsed': time.time() - current_time}
+        })
+        
         # print(f"Request {request_id} arrived batch_id={self.batch_id}, il={sampling_params.extra_args['input_length']}, ol={sampling_params.extra_args['output_length']}, admitted = {admitted}")
         if not admitted:
             self.n_finished_reqs += 1
@@ -496,6 +503,47 @@ class MockEngine:
                 continue
             q.put_nowait(item)  # ✅ don’t await if you want speed
 
+    def add_request(self,
+        prompt: str | list[int],
+        request_id: str, 
+        sampling_params: SamplingParams,
+    ) -> tuple[bool, AsyncGenerator[RequestOutput, None]]: 
+        _q = asyncio.Queue(maxsize = 512)
+        self._local_queues[request_id] = _q
+        admitted = ray.get(self.engine_core.add_request.remote(
+            "", request_id, sampling_params
+        ))
+        if not admitted:
+            self._local_queues.pop(request_id)
+            return False, None
+        
+        async def generate_stream():
+            while True:
+                chunk = await _q.get()
+                yield RequestOutput(
+                    request_id=request_id,
+                    prompt=None,
+                    prompt_token_ids=None,
+                    prompt_logprobs=None,
+                    outputs=[
+                        CompletionOutput(
+                            index=0,
+                            text=chunk.get("text", ""),
+                            token_ids=chunk.get("new_token_ids", []),
+                            cumulative_logprob=None,
+                            logprobs=None,
+                            finish_reason=chunk.get("finish_reason", None),
+                            stop_reason=chunk.get("stop_reason", None),
+                            num_computed_tokens=chunk.get("num_computed_tokens", None)
+                        )
+                    ],
+                    finished=chunk.get("finish_reason", None) is not None,
+                    kv_transfer_params=chunk.get('kv_transfer_params', None)
+                )
+                if chunk.get('finish_reason') is not None: break
+            self._local_queues.pop(request_id)
+        return True, generate_stream()
+
     def generate(self,
         prompt: str | list[int],
         request_id: str, 
@@ -518,13 +566,7 @@ class MockEngine:
                 "", request_id, sampling_params
             )
             
-            if DEBUG:
-                self._profile_events.append({
-                    'event_type': 'mock_engine_get_response',
-                    'timestamp': time.time(),
-                    'request_id': request_id, 
-                    'device_id': self.device_id
-                })
+            # if DEBUG:
             if not admitted:
                 self._local_queues.pop(request_id)
                 yield RequestOutput(
