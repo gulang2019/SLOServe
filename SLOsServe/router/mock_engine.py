@@ -7,6 +7,7 @@ import json
 import logging
 from typing import AsyncGenerator, Any
 import os 
+import math
 import ray
 from ray.util.queue import Queue as RayQueue
 
@@ -17,6 +18,9 @@ from vllm.v1.engine import FinishReason
 from vllm.utils import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_utils import init_none_hash, get_request_block_hasher
 from vllm.outputs import RequestOutput, CompletionOutput
+
+from SLOsServe.model_config import get_model_config
+from SLOsServe.router.execplan_bus import normalize_load_stats
 
 def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
     logger = logging.getLogger(name)
@@ -46,13 +50,76 @@ def _task_done(task: asyncio.Task):
 
 logger = setup_logger("SLOsServe.router.mock_engine", os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"))
 DEBUG = False
+
+
+def _get_scheduler_exec_plan_snapshot(scheduler) -> Any | None:
+    getter = getattr(scheduler, "get_exec_plan", None)
+    if not callable(getter):
+        return None
+    return getter()
+
+
+def _get_scheduler_load_stats_snapshot(scheduler) -> dict[str, int]:
+    getter = getattr(scheduler, "get_load_statistics", None)
+    if callable(getter):
+        try:
+            return normalize_load_stats(getter())
+        except TypeError:
+            try:
+                return normalize_load_stats(getter(1))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    waiting = 0
+    if hasattr(scheduler, "waiting"):
+        try:
+            waiting = len(scheduler.waiting)
+        except TypeError:
+            waiting = 0
+    else:
+        for attr in ("waiting_attainable", "waiting_kv_xfer"):
+            queue = getattr(scheduler, attr, None)
+            if queue is None:
+                continue
+            try:
+                waiting += len(queue)
+            except TypeError:
+                continue
+
+    running = 0
+    if hasattr(scheduler, "running"):
+        try:
+            running = len(scheduler.running)
+        except TypeError:
+            running = 0
+
+    num_free_blocks = 0
+    kv_cache_manager = getattr(scheduler, "kv_cache_manager", None)
+    if kv_cache_manager is not None:
+        get_num_free_blocks = getattr(kv_cache_manager, "get_num_free_blocks",
+                                      None)
+        if callable(get_num_free_blocks):
+            try:
+                num_free_blocks = get_num_free_blocks()
+            except Exception:
+                num_free_blocks = 0
+
+    return normalize_load_stats({
+        "num_free_blocks": num_free_blocks,
+        "n_waitings": waiting,
+        "n_running": running,
+    })
+
+
 @ray.remote(max_concurrency=1024)
 class MockEngineCore:
     def __init__(self,
                  model_name: str,
                  mock_connector: bool,
                  output_queue: RayQueue,
-                 num_gpu_blocks: int = 23949,
+                 device_mem: int = 20e9,
                  device_id: int = -1,
                  execplan_bus=None):
         self.model_name = model_name
@@ -80,20 +147,25 @@ class MockEngineCore:
             with open(f'assets/stub/SchedulerAdmCtrl_{config_name}.pkl', 'rb') as f:
                 attrs[config_name] = pickle.load(f)
         
-        with open(f'assets/stub/SchedulerAdmCtrl_kv_cache_config.pkl', 'rb') as f:
-            kv_cache_configs = pickle.load(f)
-            kv_cache_config = KVCacheConfig(
-                num_blocks=num_gpu_blocks,
-                kv_cache_tensors=[],
-                kv_cache_groups=kv_cache_configs['kv_cache_groups'],
-            )
-
         # attrs.update({'model_config': None})
         VllmConfig.__post_init__ = MagicMock()
         vllm_config = VllmConfig(
             **attrs            
         )
+        block_size = vllm_config.cache_config.block_size
+        assert block_size == 16, f"Unsupported block_size={block_size}"
+
         structured_output_manager = StructuredOutputManager(vllm_config)
+        with open(f'assets/stub/SchedulerAdmCtrl_kv_cache_config.pkl', 'rb') as f:
+            kv_cache_configs = pickle.load(f)
+            model_config = get_model_config(model_name)
+            per_token_cache_mem = model_config.get_token_cache_mem()
+            self.num_blocks = int(math.floor(device_mem / (per_token_cache_mem * block_size)))
+            kv_cache_config = KVCacheConfig(
+                num_blocks=self.num_blocks,
+                kv_cache_tensors=[],
+                kv_cache_groups=kv_cache_configs['kv_cache_groups'],
+            )
         
         vllm_config.model_config.model_name = model_name
         
@@ -108,7 +180,6 @@ class MockEngineCore:
         logger.info(f'Scheduler created: {self.scheduler}')
         self.perf_model = PerfModel.get_perf_model(model_name)
         
-        block_size = self.scheduler.vllm_config.cache_config.block_size
         caching_hash_fn = get_hash_fn_by_name(
             self.scheduler.vllm_config.cache_config.prefix_caching_hash_algo)
         init_none_hash(caching_hash_fn)
@@ -125,7 +196,7 @@ class MockEngineCore:
         
         self.batch_id = 0
         
-        logger.info(f'MockEngineCore initialized: {self.model_name}, {self.mock_connector}')
+        logger.info(f'MockEngineCore initialized: {self.model_name=}, {self.mock_connector=}, {self.num_blocks=}, {block_size=}, #token: {self.num_blocks * block_size}, total_kv_mem: {per_token_cache_mem * self.num_blocks * block_size}')
 
     def ping(self):
         return True
@@ -228,14 +299,22 @@ class MockEngineCore:
                     print(f'[MockEngineCore] batch_id={self.batch_id}, stats={stats}, n_arrived_reqs={self.n_arrived_reqs}, n_finished_reqs={self.n_finished_reqs}, n_rejected_reqs={self.n_rejected_reqs}')
                 self.batch_id += 1
                 scheduling_start = time.time()
-                # self.scheduler.atfc_planner.tag = f'{self.device_id}_{self.batch_id}'
+                if hasattr(self.scheduler, "atfc_planner"):
+                    self.scheduler.atfc_planner.tag = f'{self.device_id}_{self.batch_id}'
+                    self.scheduler.atfc_planner.batch_id = self.batch_id
                 scheduler_output = self.scheduler.schedule()
                 scheduling_overhead = time.time() - scheduling_start
                 publish_start = time.time()
                 if self.execplan_bus is not None:
+                    exec_plan = _get_scheduler_exec_plan_snapshot(self.scheduler)
+                    exec_plan.batch_id = self.batch_id
                     self.execplan_bus.publish.remote(
-                        self.device_id, time.time(),
-                        self.scheduler.get_exec_plan())
+                        self.device_id,
+                        time.time(),
+                        exec_plan,
+                        load_stats=_get_scheduler_load_stats_snapshot(
+                            self.scheduler),
+                    )
                 publish_overhead = time.time() - publish_start
                 # print(f'[MockEngineCore] batch_id={self.batch_id}, number_scheduled_tokens: {scheduler_output.num_scheduled_tokens}')
                 rejs = []
@@ -375,16 +454,15 @@ class MockEngineCore:
         '''
         # print('dispatch', request_id, time.time(), 'mockenginecore')
         # print(f"Request {request_id} arrived batch_id={self.batch_id}, il={sampling_params.extra_args['input_length']}, ol={sampling_params.extra_args['output_length']}")
-        add_request_start = time.time()
         input_length = sampling_params.extra_args.get('input_length', 0)
-        decode_only = sampling_params.extra_args.get('decode_only', False)
-        prefill_only = sampling_params.extra_args.get('prefill_only', False)
+        decode_only = sampling_params.extra_args.get('kv_transfer_params', {}).get('do_remote_prefill', False)
+        prefill_only = sampling_params.extra_args.get('kv_transfer_params', {}).get('do_remote_decode', False)
         
         self.n_arrived_reqs += 1
         current_time = time.time()
         request = vllm.v1.request.Request(
             request_id = request_id,
-            prompt_token_ids = [random.randint(0, 1000) for _ in range(input_length + (1 if decode_only else 0))],
+            prompt_token_ids = [random.randint(0, 1000) for _ in range(input_length)],
             sampling_params = sampling_params,
             priority = 0,
             arrival_time = current_time,
@@ -408,19 +486,22 @@ class MockEngineCore:
             "profit": request.sampling_params.extra_args.get('profit', 1),
             "prefill_only": prefill_only,
             "decode_only": decode_only,
-            "add_req_time": request.arrival_time,
+            "add_req_time": request.arrival_time,"extra_args": {'batch_id': self.batch_id}
         })
         
-        if decode_only: request.num_computed_tokens = input_length
+        # if decode_only: request.num_computed_tokens = input_length
         
         # print(f"Adding request: {request}")
         admitted = self.scheduler.add_request(request)
-        
+        now = time.time()
         self._profile_events.append({
             "event_type": "add_request",
             "request_id": request.request_id,
-            "timestamp": time.time(),
-            "extra_args": {'elapsed': time.time() - current_time}
+            "timestamp": now,
+            "extra_args": {'elapsed': now - current_time,
+                           'kv_transfer_params': sampling_params.extra_args.get('kv_transfer_params', {}),
+                           'kv_ready_time': sampling_params.extra_args.get('kv_transfer_params', {}).get('arrival_time', now) - now,
+                           'admitted': admitted}
         })
         
         # print(f"Request {request_id} arrived batch_id={self.batch_id}, il={sampling_params.extra_args['input_length']}, ol={sampling_params.extra_args['output_length']}, admitted = {admitted}")
@@ -443,12 +524,15 @@ class MockEngineCore:
         # self.output_queues[request.request_id] = out_q
         return True
 
+    def get_num_blocks(self) -> int:
+        return self.num_blocks
+
 class MockEngine:
     def __init__(self,
                  model_name: str,
                  mock_connector: bool,
-                 num_gpu_blocks: int = 23949,
                  device_id: int = -1,
+                 device_mem: int = 20e9,
                  execplan_bus=None):
         self._shared_out_q = RayQueue(maxsize = 8192)
         self._local_queues: dict[str, asyncio.Queue] = {}
@@ -465,7 +549,7 @@ class MockEngine:
             model_name = model_name,
             mock_connector=mock_connector,
             output_queue = self._shared_out_q,
-            num_gpu_blocks = num_gpu_blocks,
+            device_mem = device_mem,
             device_id = device_id,
             execplan_bus = execplan_bus,
         )
@@ -647,6 +731,9 @@ class MockEngine:
     async def health_check(self) -> dict[str, Any]:
         """Expose the loop task status from the Ray actor."""
         return await self.engine_core.health_check.remote()
+    
+    def get_num_blocks(self) -> int:
+        return ray.get(self.engine_core.get_num_blocks.remote())
 
 if __name__ == "__main__":
     ray.init()

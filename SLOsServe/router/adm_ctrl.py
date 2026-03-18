@@ -9,6 +9,7 @@ import SLOsServe_C
 
 from SLOsServe.perf_model import PerfModel
 from SLOsServe.router.execplan_bus import ExecPlan
+from SLOsServe.router.macro import PERF_MODEL_HEADROOM, DUMP_SCHS, DUMP_ADM
 
 import logging 
 
@@ -30,6 +31,11 @@ class Request:
     
     num_computed_tokens: int = 0
     last_sch_bid: int = -1
+    arrived: bool = True
+    
+    def __post_init__(self):
+        if self.kv_ready_time is not None:
+            self.arrived = False
     
     def get_next_ddl(self) -> float | None:
         if self.num_computed_tokens < self.num_prompt_tokens:
@@ -79,7 +85,6 @@ class BatchPlanner:
     _requests: dict[str, Request] = field(default_factory=dict)
     _admitted_requests: list[str] = field(default_factory=list)
     _next_batch_time: float | None = None # the begining time of the next batch 
-    _perf_model_constant_headroom: float = 0.005
     _last_infeasible_reason: str | None = None
     _adm_ctrler: any = None
     _adm_ctrler_tpot: float | None = None
@@ -89,7 +94,7 @@ class BatchPlanner:
     
     
     def __post_init__(self):
-        self._perf_model.hardware_params[4] += self._perf_model_constant_headroom
+        self._perf_model.hardware_params[4] += PERF_MODEL_HEADROOM
         # Initialize C++ admission controller; TPOT is set lazily per request mix.
         self._adm_ctrler = SLOsServe_C.AdmCtrlScheduler("edf_sim", self._block_size, False, False)
         self._adm_ctrler_tpot = None
@@ -188,6 +193,7 @@ class BatchPlanner:
             ddl=req.prefill_ddl - now,
             input_length=req.num_prompt_tokens,
             n_computed_tokens=req.num_computed_tokens,
+            max_tokens = 1 if req.prefill_only else max_decode_length,
             profit=1.0,
             mem=mem,
             tpot_idx=0,
@@ -195,8 +201,7 @@ class BatchPlanner:
             prefill_device_id=0,
             decode_device_id=0,
             prefill_only=req.prefill_only,
-            arrival_time=0.0,
-            max_tokens = max_decode_length
+            arrival_time=req.kv_ready_time - now if req.kv_ready_time is not None else 0,
         )
 
     def _cpp_feasible_with_new(self, new_req: Request, now: float) -> bool:
@@ -211,14 +216,28 @@ class BatchPlanner:
         # print('is_feasible', is_feasible, 'is_accepteds', is_accepteds)
         self._cpp_adm_ctrl_iterations += 1
         elapsed = time.time() - start
-        # self._dump_schedule_inputs(
-        #     c_reqs,
-        #     [req.id for req, is_acc in zip(c_reqs, is_accepteds) if is_acc],
-        #     num_free_blocks=self._num_free_blocks,
-        #     current_time=0.0,
-        #     is_feasible=bool(is_feasible),
-        #     surfix = f'adm_ctrl_{new_req.request_id}'
-        # )
+        if DUMP_ADM and hasattr(self, "_profile_events"):
+            self._profile_events.append({
+                'event_type': 'local_admission', 
+                'request_id': new_req.request_id,
+                'timestamp': time.time(),
+                'extra_args': {
+                    'now': now,
+                    'is_feasible': is_feasible,
+                    'state': {
+                        req.id: (req.is_new_req, is_acc, req.n_computed_tokens, req.input_length, req.ddl, req.max_tokens, req.arrival_time) for req, is_acc in zip(c_reqs, is_accepteds)
+                    },
+                }
+            })
+        if DUMP_SCHS:
+            self._dump_schedule_inputs(
+                c_reqs,
+                [req.id for req, is_acc in zip(c_reqs, is_accepteds) if is_acc],
+                num_free_blocks=self._num_free_blocks,
+                current_time=0.0,
+                is_feasible=bool(is_feasible),
+                surfix = f'adm_ctrl_{new_req.request_id}'
+            )
         return bool(is_feasible and len(is_accepteds) == len(c_reqs) and is_accepteds[-1])
     
     def add_request(self, 
@@ -256,9 +275,6 @@ class BatchPlanner:
     
     def get_next_batch_and_admitted_reqs(self) -> tuple[dict[str, int], set[str], ExecPlan]:
         start = time.time()
-        
-        if self._next_batch_time is not None:
-            print(f"laxity {self._now() - self._next_batch_time:.3f}")
             
         self._last_commit_time = self._now()
         
@@ -266,7 +282,7 @@ class BatchPlanner:
         if not is_feasible:
             logger.info(f'[BatchPlanner]: Infeasibility detected before dispatch. {reason=}')
         if not len(self._batch_plan):
-            assert len(self._requests) == 0 or not is_feasible
+            # assert len(self._requests) == 0 or not is_feasible
             self._next_batch_time = None 
             return {}, set(), ExecPlan()
         assert len(self._batch_plan)
@@ -275,9 +291,6 @@ class BatchPlanner:
         next_batch = self._batch_plan[0]
         self._next_batch_time = self._now() + self._get_batch_time(next_batch)
         
-        for req_id, n_token in next_batch.n_scheduled_tokens.items():
-            self._requests[req_id].commit(n_token)
-            
         refresh_time = time.time() - start 
                     
         exec_plan = ExecPlan()
@@ -293,6 +306,8 @@ class BatchPlanner:
         exec_plan.num_free_blocks = self._num_free_blocks
         self._last_scheduled_tokens = copy.copy(next_batch.n_scheduled_tokens)
         
+        for req_id, n_token in next_batch.n_scheduled_tokens.items():
+            self._requests[req_id].commit(n_token)
         
         e2e_time = time.time() - start
         if e2e_time > 0.1:
@@ -304,7 +319,12 @@ class BatchPlanner:
         # is_feasible, self._batch_plan, reason = self._refresh()
         # if not is_feasible:
         #     logger.info(f'[BatchPlanner]: Infeasibility detected. {reason=}')
-            
+    
+    def request_arrive(self, request_id: str):
+        req = self._requests.get(request_id, None)
+        assert req is not None and req.kv_ready_time is not None
+        req.arrived = True
+     
     def commit_batch(self,
                      num_scheduled_tokens: dict[str, int],
                      finished_reqs: list[str],
@@ -327,21 +347,21 @@ class BatchPlanner:
         baseline_batch_time = self._perf_model.get_batch_time([(0, 256)])
         load_ddls = sorted(
             [
-                (req_id, req.get_next_ddl(), req.get_next_load())
+                (req_id, req.get_next_ddl() - now, req.get_next_load())
                 for req_id, req in self._requests.items()
-                if not req.finished(self._is_oracle)
+                if (req.arrived and not req.finished(self._is_oracle))
             ],
             key=lambda x: (x[1], x[0]),
         )
         if not load_ddls:
             return True, [], "|"
 
-        cutoff = now + baseline_batch_time
+        cutoff = baseline_batch_time
         feasible_load_ddls = [x for x in load_ddls if x[1] >= cutoff]
         overdue_load_ddls = [x for x in load_ddls if x[1] < cutoff]
 
         if feasible_load_ddls:
-            batch_time_budget = feasible_load_ddls[0][1] - now
+            batch_time_budget = feasible_load_ddls[0][1]
             batch_size = max(0, self._perf_model.get_bs(batch_time_budget, num_reqs=1))
         else:
             batch_size = 16384  # Recover overdue work aggressively when no request is still feasible.
@@ -374,7 +394,22 @@ class BatchPlanner:
             total_scheduled_tokens += n_sch
             total_past_tokens += req.num_computed_tokens
             num_scheduled_reqs += 1
-            b.unscheduled_tokens = batch_size - total_scheduled_tokens
+            b.unscheduled_tokens = remaining_tokens - n_sch
+        if hasattr(self, '_profile_events'):
+            self._profile_events.append({
+                'event_type': 'planner_sch',
+                'timestamp': time.time(),
+                'extra_args': {
+                    'batch_id': self.batch_id,
+                    'load_ddls': load_ddls,
+                    'sch': b.n_scheduled_tokens,
+                    'unsched_tokens': b.unscheduled_tokens,
+                    'cutoff': cutoff,
+                    'total_past_tokens': total_past_tokens,
+                    'total_scheduled_tokens': total_scheduled_tokens,
+                    'num_scheduled_reqs': num_scheduled_reqs
+                }
+            })
         return True, [b], None
             
 
@@ -417,23 +452,23 @@ class BatchPlanner:
             if n_scheduled_tokens:
                 py_batches.append(Batch(unscheduled_tokens=0, n_scheduled_tokens=n_scheduled_tokens))
         elapsed = time.time() - start
-        logger.info(f'[BatchPlanner] Planned {len(py_batches)} batches (cpp)')
+        # logger.info(f'[BatchPlanner] Planned {len(py_batches)} batches (cpp)')
         self._cpp_schedule_iterations += 1
         # if not is_feasible or self._cpp_schedule_iterations % 1 == 0:
             # logger.info(
             #     "[BatchPlanner] Periodic cpp schedule dump at iteration %d",
             #     self._cpp_schedule_iterations,
             # )
-        if elapsed > 0.05:
-            logger.warning(f'[BatchPlanner] LONG SCHEDULE: {setup_elapsed=}, {sch_elapsed=}, {elapsed=}')
-            self._dump_schedule_inputs(
-                c_reqs,
-                list(accepted_ids),
-                num_free_blocks=self._num_free_blocks,
-                current_time=0.0,
-                is_feasible=bool(is_feasible),
-                surfix = 'sch' + "" if elapsed < 0.05 else '_LONG'
-            )
+        # if DUMP_ADM and elapsed > 0.05:
+            # logger.warning(f'[BatchPlanner] LONG SCHEDULE: {setup_elapsed=}, {sch_elapsed=}, {elapsed=}')
+        # self._dump_schedule_inputs(
+        #     c_reqs,
+        #     list(accepted_ids),
+        #     num_free_blocks=self._num_free_blocks,
+        #     current_time=0.0,
+        #     is_feasible=bool(is_feasible),
+        #     surfix = 'sch'
+        # )
         return bool(is_feasible), py_batches, ("|" if is_feasible else " CPP schedule infeasible |")
 
     def _refresh(self) -> tuple[bool, list[Batch], str | None]:

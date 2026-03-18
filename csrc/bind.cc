@@ -11,15 +11,16 @@ PYBIND11_MODULE(SLOsServe_C, m) {
 
     // Bind the Request struct
     py::class_<Request>(m, "Request")
-        .def(py::init<std::string, bool, double, int, int, double, int, int, int, int, int, bool, double, int>(),
-             py::arg("id"), py::arg("is_new_req"), py::arg("ddl"), py::arg("input_length"), py::arg("n_computed_tokens"),
+        .def(py::init<std::string, bool, double, int, int, int, double, int, int, int, int, int, bool, double>(),
+             py::arg("id"), py::arg("is_new_req"), py::arg("ddl"), py::arg("input_length"), py::arg("n_computed_tokens"), py::arg("max_tokens"),
              py::arg("profit"), py::arg("mem"), py::arg("tpot_idx"), py::arg("prefill_mem") = -1,
-             py::arg("prefill_device_id") = -1, py::arg("decode_device_id") = -1, py::arg("prefill_only") = false, py::arg("arrival_time") = 0.0, py::arg("max_tokens") = -1)
+             py::arg("prefill_device_id") = -1, py::arg("decode_device_id") = -1, py::arg("prefill_only") = false, py::arg("arrival_time") = 0.0)
         .def_readwrite("id", &Request::id)
         .def_readwrite("is_new_req", &Request::is_new_req)
         .def_readwrite("ddl", &Request::ddl)
         .def_readwrite("input_length", &Request::input_length)
         .def_readwrite("n_computed_tokens", &Request::n_computed_tokens)
+        .def_readwrite("max_tokens", &Request::max_tokens)
         .def_readwrite("profit", &Request::profit)
         .def_readwrite("mem", &Request::mem)
         .def_readwrite("tpot_idx", &Request::tpot_idx)
@@ -28,21 +29,20 @@ PYBIND11_MODULE(SLOsServe_C, m) {
         .def_readwrite("decode_device_id", &Request::decode_device_id)
         .def_readwrite("prefill_only", &Request::prefill_only)
         .def_readwrite("arrival_time", &Request::arrival_time)
-        .def_readwrite("max_tokens", &Request::max_tokens)
         .def("__repr__", [](const Request& req) {
             return "<Request id=" + req.id +
                    " is_new_req=" + std::to_string(req.is_new_req) +
                    " ddl=" + std::to_string(req.ddl) +
                    " input_length=" + std::to_string(req.input_length) +
                    " n_computed_tokens=" + std::to_string(req.n_computed_tokens) +
+                   " max_tokens=" + std::to_string(req.max_tokens) +
                    " profit=" + std::to_string(req.profit) +
                    " mem=" + std::to_string(req.mem) +
                    " tpot_idx=" + std::to_string(req.tpot_idx) +
                    " prefill_mem=" + std::to_string(req.prefill_mem) +
                    " prefill_device_id=" + std::to_string(req.prefill_device_id) +
                    " decode_device_id=" + std::to_string(req.decode_device_id) +
-                   " prefill_only=" + std::to_string(req.prefill_only) + 
-                   " max_tokens=" + std::to_string(req.max_tokens) + ">";
+                   " prefill_only=" + std::to_string(req.prefill_only) + ">";
         });
 
     // Bind the ReqBatch struct

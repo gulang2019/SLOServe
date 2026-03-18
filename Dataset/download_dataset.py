@@ -168,14 +168,13 @@ def download_dataset(dataset_name: str):
             for i, item in enumerate(ex['conversation']):
                 if item['role'] == 'assistant':
                     previous_items = ex['conversation'][:i]
-                    # if i - 2 >= 0:
-                    #     cached_contents = format_conversation(ex['conversation'][:i-2])
-                    # else: 
-                    #     cached_contents = ""
-                    # cached_contents = format_conversation(previous_items)
+                    if i - 2 >= 0:
+                        cached_contents = format_conversation(ex['conversation'][:i-2])
+                    else: 
+                        cached_contents = ""
                     prompt = format_conversation(previous_items)
                     response = item.get("content", "")
-                    valid_conversations.append(("", prompt, response))
+                    valid_conversations.append((cached_contents, prompt, response))
 
         # Process conversations in parallel
         import concurrent.futures
@@ -184,7 +183,7 @@ def download_dataset(dataset_name: str):
             return Request(
                 prompt=prompt,
                 answer=response,
-                cached_length = 0,
+                cached_length = count_length(cached_contents),
                 input_length=count_length(prompt),
                 output_length=count_length(response)
             )
@@ -214,13 +213,13 @@ def download_dataset(dataset_name: str):
             for i, item in enumerate(ex['conversations']):
                 if item['from'] == 'gpt':
                     previous_items = ex['conversations'][:i]
-                    # if i - 2 >= 0:
-                    #     cached_contents = format_conversation(ex['conversations'][:i-2])
-                    # else: 
-                    #     cached_contents = ""
+                    if i - 2 >= 0:
+                        cached_contents = format_conversation(ex['conversations'][:i-2])
+                    else: 
+                        cached_contents = ""
                     prompt = ex['conversations'][i-1].get("value", "") # format_conversation(ex['conversations'][i-1])
                     response = item.get("value", "")
-                    valid_conversations.append(("", prompt, response))
+                    valid_conversations.append((cached_contents, prompt, response))
 
         # Process conversations in parallel
         import concurrent.futures
@@ -229,7 +228,7 @@ def download_dataset(dataset_name: str):
             return Request(
                 prompt=prompt,
                 answer=response,
-                cached_length=0,
+                cached_length=count_length(cached_contents),
                 input_length=count_length(prompt),
                 output_length=count_length(response)
             )
@@ -363,12 +362,13 @@ if __name__ == '__main__':
             logger.error(f"Failed to download {dataset_name}: {e}")
     
     datasets_to_download = [
-        'reasoning'
+        # 'reasoning'
         # 'azure_code',
         # 'azure_chat', 
         # 'azure_chat_23',
         # 'azure_code_23',
         # 'sharegpt_chat',
+        "reasoning",
         # 'sharegpt_code',
         # 'burstgpt',
         # 'humaneval',

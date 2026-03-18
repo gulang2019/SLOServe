@@ -31,3 +31,6 @@
 [submodule "paper"]
 	path = paper
 	url = git@github.com:gulang2019/SLO-Packer_Paper.git
+[submodule "Paper"]
+	path = Paper
+	url = git@github.com:gulang2019/SLOsServe-SOSP-26.git

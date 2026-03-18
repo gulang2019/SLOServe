@@ -288,6 +288,9 @@ async def main(problem: Problem, endpoint: str, clients: str):
                             window_start = 0,
                             window_end = len(arrival_times.arrival_times),
                             max_tokens = get_model_max_tokens(problem.model_name))
+    for req in requests.requests:
+        req.input_length -= req.cached_length 
+        req.cached_length = 0
     requests = requests.requests
     arrival_times = arrival_times.arrival_times
     arrival_times = [t - arrival_times[0] for t in arrival_times]
@@ -306,7 +309,7 @@ async def main(problem: Problem, endpoint: str, clients: str):
     import numpy as np
     global average_input_length, average_output_length
     average_input_length = np.mean([request.input_length for request in requests])
-    average_output_length = np.mean([request.output_length + request.thinking_length for request in requests])
+    average_output_length = np.mean([request.output_length for request in requests])
     print(f'#Requests: {len(requests)}')
     print(f'average_input_length: {average_input_length}')
     print(f'average_output_length: {average_output_length}')
@@ -369,7 +372,7 @@ async def main(problem: Problem, endpoint: str, clients: str):
                 prompt = request.prompt
                 assert prompt is not None
                 task_start_time = time.time()
-                request_id_backend = str(arrival_idx) # str(uuid.uuid4())
+                request_id_backend = str(arrival_idx) # str(uuid.uuid4()) # 
                 request_id = str(arrival_idx)
                 bid_to_id[request_id_backend] = request_id
                 real_arrival_times[request_id] = task_start_time
@@ -378,12 +381,12 @@ async def main(problem: Problem, endpoint: str, clients: str):
                                                     problem.model_name, 
                                                     prompt,
                                                     request.input_length,
-                                                    request.output_length + request.thinking_length,
+                                                    request.output_length,
                                                     zero_load_ttft = perf_model.get_zero_load_ttft(request.input_length, request.cached_length),
                                                     ttft_slo_scale = problem.ttft_slo_scale,
                                                     slo_tpot = problem.slo_tpot,
                                                     slo_routing_overhead = problem.slo_routing_overhead,
-                                                    expected_profit = problem.get_expected_profit(request.input_length)))
+                                                    expected_profit = problem.get_expected_profit(request.input_length - request.cached_length)))
 
                 tasks.append((task, request, task_start_time, request_id))
                 arrival_bar.update(1)
@@ -720,7 +723,7 @@ def build_problems(
             'enable_chunked_prefill': True,
             'enable_admission': False,
             'allow_rejection': False,
-            'scheduling_policy': 'vllm-sarathi+'
+            'scheduling_policy': 'vllm-edf-sarathi+'
         })
     
     elif scheduling_policy == 'qlm':
@@ -790,18 +793,36 @@ def build_problems(
     if 'round_robin' in routing_policy:
         _args = routing_policy.split('-')
         routing_policy = 'round_robin'
-        group_size = 1
+        admission_mode = "off" # w/ round robin, we let each request ends 
+        group_size = n_device
         extra_kwargs = {}
         if len(_args) >= 2:
-            group_size = int(_args[1])
-        if len(_args) >= 3:
-            assert _args[2] == 'disagg'
-            assert len(_args) >= 4
-            n_prefill_server_per_group = int(_args[3])
+            assert _args[1] == 'disagg'
+            opt_n_prefill_devices = int(optimal_prefill_ratio * group_size)
+            opt_n_prefill_devices = min(max(opt_n_prefill_devices, 1), n_device - 1)
+            print(f'opt_n_prefill_devices: {opt_n_prefill_devices}')
             extra_kwargs = {
                 'group_size': group_size,
                 'is_pd_disagg': True, 
-                'n_prefill_per_group': n_prefill_server_per_group,
+                'n_prefill_per_group': opt_n_prefill_devices,
+            }
+        routing_kwargss = [{"enable_rerouting": False,
+                            "enable_rescheduling": False} | extra_kwargs]
+    elif 'llumnix_load' in routing_policy:
+        _args = routing_policy.split('-')
+        routing_policy = 'llumnix_load'
+        admission_mode = "off" # w/ round robin, we let each request ends 
+        group_size = n_device
+        extra_kwargs = {}
+        if len(_args) >= 2:
+            assert _args[1] == 'disagg'
+            opt_n_prefill_devices = int(optimal_prefill_ratio * group_size)
+            opt_n_prefill_devices = min(max(opt_n_prefill_devices, 1), n_device - 1)
+            print(f'opt_n_prefill_devices: {opt_n_prefill_devices}')
+            extra_kwargs = {
+                'group_size': group_size,
+                'is_pd_disagg': True, 
+                'n_prefill_per_group': opt_n_prefill_devices,
             }
         routing_kwargss = [{"enable_rerouting": False,
                             "enable_rescheduling": False} | extra_kwargs]
@@ -951,6 +972,7 @@ def build_problems(
             'group_size': group_size,
             'n_lb': n_lb,
             'use_planner': use_planner,
+            'ablation': ablation
             # 'routing_overhead': slo_routing_overhead
         } | extra_kwargs)
 

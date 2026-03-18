@@ -296,7 +296,7 @@ int main(int argc, char** argv) {
     std::cout << "n_new_reqs " << n_new
               << " n_running_reqs " << n_running
               << " n_prefill_only " << n_prefill_only << "\n";
-    const size_t kPrintReqs = 8;
+    const size_t kPrintReqs = 100;
     std::cout << "req_samples_n " << std::min(kPrintReqs, dump.reqs.size()) << "\n";
     for (size_t i = 0; i < dump.reqs.size() && i < kPrintReqs; ++i) {
         const auto& req = dump.reqs[i];
@@ -319,6 +319,10 @@ int main(int argc, char** argv) {
     std::cout << "observed_accepted_n " << dump.observed_accepted_ids.size()
               << " replay_accepted_n " << replay_accepted_ids.size()
               << " accepted_match " << accepted_match << "\n";
+    std::cout << "replay_acc_ids: "; 
+    for (auto& id: replay_accepted_ids)
+        std::cout << id << " ";
+    std::cout << std::endl;
     std::cout << "observed_schedule_elapsed_s " << dump.observed_schedule_elapsed_s << "\n";
     std::cout << "replay_schedule_elapsed_avg_s " << replay_avg << "\n";
     std::cout << "replay_schedule_elapsed_min_s " << elapsed_min_s << "\n";

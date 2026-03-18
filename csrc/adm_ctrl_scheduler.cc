@@ -173,13 +173,7 @@ std::tuple<bool, std::vector<Batch> > AdmCtrlScheduler::_construct_batch_prefix(
         }
 
         bool finished() const {
-            if (req.prefill_only) {
-                return req.n_computed_tokens >= req.input_length;
-            }
-            if (req.max_tokens < 0) {
-                return false;
-            }
-            return req.n_computed_tokens >= req.input_length + req.max_tokens;
+            return (req.n_computed_tokens + 1) >= req.input_length + req.max_tokens;
         }
     };
 
@@ -1241,6 +1235,11 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
     const int M,
     double current_time
 ) {
+    int int_remained_mem = M * block_size;
+    for (auto& req: reqs) {
+        if (req.is_new_req) int_remained_mem -= req.n_computed_tokens;
+    }
+
     auto get_next_load = [](const Request& req) {
         if (req.n_computed_tokens < req.input_length) {
             return req.input_length - req.n_computed_tokens;
@@ -1259,6 +1258,12 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
         double decode_time = planner->batch_to_time(decode_bs);
         for (auto& req: reqs) {
             auto next_token_ddl = get_next_ddl(req);
+            if (req.arrival_time >= next_token_ddl) {
+                return false;
+            }
+            if (req.arrival_time > current_time) {
+                events.push_back({req.arrival_time, "arrival", req});
+            }
             events.push_back({next_token_ddl, "first_load", req});
             assert(req.tpot_idx == 0);
             if (req.max_tokens > 1) {
@@ -1273,8 +1278,14 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
                       return std::get<1>(a) < std::get<1>(b);
                   });
         double now = current_time;
-        size_t remained_tk = 0;
-        int remained_mem = M * block_size;
+        // size_t remained_tk = 0;
+        std::unordered_map<std::string, size_t> req_remained_tk_idx;
+        std::vector<int> remained_tks;
+        for (auto& req: reqs) {
+            req_remained_tk_idx[req.id] = 0;
+        }
+        remained_tks.push_back(0);
+        int remained_mem = int_remained_mem;
         size_t n_decode = 0;
         for (auto& e: events) {
             auto [t, type, req] = e;
@@ -1290,31 +1301,46 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
                     return false;
                 }
                 now += n_batch * decode_time;
-                remained_tk += (decode_bs - n_decode) * n_batch;
+                remained_tks.back() += (decode_bs - n_decode) * n_batch;
             }
             if (type == "first_load") {
                 auto next_load = get_next_load(req);
+                remained_mem -= next_load;
+                if (remained_mem < 0) {
+                    return false;
+                }
+                size_t remained_tk = 0;
+                for (size_t idx = req_remained_tk_idx[req.id]; idx < remained_tks.size(); idx++) {
+                    remained_tk += remained_tks[idx];
+                }
                 if (remained_tk < next_load) {
                     auto extra_bgt = planner->time_to_batch(t - now);
                     if ((extra_bgt + remained_tk) < next_load) {
                         return false;
                     }
+                    remained_tks.back() += extra_bgt;
                     remained_tk += extra_bgt; 
                     now += planner->batch_to_time(extra_bgt);
                 }
                 assert (remained_tk >= next_load);
-                remained_tk -= next_load;
-                remained_mem -= next_load;
-                if (remained_mem < 0) {
-                    return false;
+                for (size_t idx = req_remained_tk_idx[req.id]; 
+                    next_load && idx < remained_tks.size(); idx++) {
+                    auto n_sch = std::min(remained_tks[idx], next_load);
+                    next_load -= n_sch;
+                    remained_tks[idx] -= n_sch;
                 }
-                if (not req.prefill_only) {
+                assert (next_load == 0);
+                if (req.max_tokens > 1) {
                     n_decode += 1;
                 }
             }
             else if (type == "finish") {
                 n_decode -= 1;
                 remained_mem += req.input_length + req.max_tokens;
+            }
+            else if (type == "arrival") {
+                req_remained_tk_idx[req.id] = remained_tks.size();
+                remained_tks.push_back(0);
             }
         }
         return true; 

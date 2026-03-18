@@ -15,7 +15,7 @@ class ModelConfig:
     n_elem: int = 2 # TODO(update this for dtypes)
     
     def get_token_cache_mem(self):
-        return self.n_layer * self.num_heads * self.head_dim * self.n_elem
+        return 2 * self.n_layer * self.num_heads * self.head_dim * self.n_elem
         
 @lru_cache(maxsize=None)
 def get_model_config(

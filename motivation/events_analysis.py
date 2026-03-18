@@ -318,7 +318,7 @@ class RequestInstance:
         if self.ttft_normalized_laxity > 0:
             self.slo_violation = 'ttft'
             return 'ttft'
-        if max(self.tpot_laxities, default=0) > 0:
+        if len(self.tpot_laxities) and np.percentile(self.tpot_laxities, 90) > 0:
             self.slo_violation = 'tpot'
             return 'tpot'
         self.slo_violation = 'none'
@@ -699,8 +699,8 @@ def calc_energy(
     bins = np.arange(t0, tN + window_size, window_size)
 
     # Power model (same as yours)
-    IDLE_POWER = 53
-    BASELINE_POWER = 143
+    IDLE_POWER = 17
+    BASELINE_POWER = 250
     INCREMENTAL_POWER = 0.35
 
     # Precompute start/end times for sweep
@@ -1557,6 +1557,8 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
     device_stats = calc_device_stats(
         all_events, reqs.values(), n_device
     )
+    finish_reasons = sum([[e.finish_reason for e in req.events if e.event_type == 'finish'] for req in reqs.values()], start = [])
+    
     if not draw:
         
         return {
@@ -1575,6 +1577,7 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
                 'rejection_rate': rejection_rate,
                 'device_stats': device_stats,
                 'energy_est': sum(energies),
+                'finish_reasons': dict(Counter(finish_reasons)),
                 **breakdown
             }
         }
@@ -1776,6 +1779,7 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
                 'rejection_rate': rejection_rate,
                 'device_stats': device_stats,
                 'energy_est': sum(energies),
+                'finish_reasons': dict(Counter(finish_reasons)),
                 **breakdown
             }
         
@@ -2944,35 +2948,92 @@ def analyze_energy_consumption():
 
 def draw_energy_comparison(
     event_files = [
-        ('Baseline (8 Servers)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4500_anytime_0.0/vllm_round_robin_1.0_8_anytime_5.0_0.05.events.jsonl', 8, 'red'),
-        # ('Baseline (8 Servers)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4600_anytime_0.0/sarathi_round_robin_1.0_8_anytime_5.0_0.05.events.jsonl', 8, 'orange'),
-        # ('RR + SLOsServe (4, 100%)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4500_anytime_0.0/slosserve-edf_round_robin_1.0_4_anytime_5.0_0.05.events.jsonl', 4, 'orange'),
-        # ('LC (w/o Pre. Adm.) + SLOsServe  (8, 70.8%)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4500_anytime_0.0/slosserve-edf_auto_scaling_resch-all_chat-1.0_1.0_8_anytime_5.0_0.05.events.jsonl', 8, 'green'),
-        # ('LC (Pre. Adm) + SLOsServe  (8, 93.8%)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4500_anytime_0.0/slosserve-edf_auto_scaling_resch-all_chat-0.05_1.0_8_anytime_5.0_0.05.events.jsonl', 8, 'green'),
-        ('SLOsServe (4 Servers)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4600_anytime_0.0/slosserve-edf_auto_scaling_resch-all_chat-1.0_1.0_4_anytime_5.0_0.05.events.jsonl', 4, 'blue')
+        ('Baseline (8 Servers)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4500_anytime_0.0/vllm_round_robin_1.0_8_anytime_5.0_0.05.events.jsonl', 8),
+        ('SLOsServe (4 Servers)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4600_anytime_0.0/slosserve-edf_auto_scaling_resch-all_chat-1.0_1.0_4_anytime_5.0_0.05.events.jsonl', 4)
     ],
     output_suffix = None,
     line_styles = {}
 ):
-    
-    fig, axes = plt.subplots(3, figsize = (10, 12), sharex = True, tight_layout = True)
+
+    def _infer_slo_params(event_file: str) -> tuple[float, float]:
+        stem = event_file.rsplit('/', 1)[-1].removesuffix('.events.jsonl')
+        numeric_tokens = []
+        for token in reversed(stem.split('_')):
+            try:
+                numeric_tokens.append(float(token))
+            except ValueError:
+                continue
+            if len(numeric_tokens) == 2:
+                break
+        if len(numeric_tokens) < 2:
+            raise ValueError(f'Unable to infer SLO settings from {event_file}')
+        slo_tpot, ttft_slo_scale = numeric_tokens
+        return ttft_slo_scale, slo_tpot
+
+    def _compute_slo_violations(reqs: Dict[str, RequestInstance], event_file: str, window_size: float):
+        if not reqs:
+            return np.array([]), np.array([])
+
+        ttft_slo_scale, slo_tpot = _infer_slo_params(event_file)
+        slo_ttft_fn = lambda req: req.zero_load_ttft * ttft_slo_scale + 0.05
+        violation_cnts = 0
+        arrival_times = []
+        violation_times = []
+        for req in reqs.values():
+            req.get_stats(slo_ttft_fn, slo_tpot)
+            arrival_times.append(req.arrival_time)
+            if req.violate_slo() != 'none':
+                violation_times.append(req.arrival_time)
+                violation_cnts += 1
+
+        arrival_times = np.asarray(arrival_times, dtype=np.float64)
+        if arrival_times.size == 0:
+            return np.array([]), np.array([])
+
+        t0 = np.floor(arrival_times.min() / window_size) * window_size
+        n_bins = int(np.floor((arrival_times.max() - t0) / window_size)) + 1
+        counts = np.zeros(n_bins, dtype=np.int64)
+        if violation_times:
+            violation_times = np.asarray(violation_times, dtype=np.float64)
+            idx = np.floor((violation_times - t0) / window_size).astype(np.int64)
+            counts = np.bincount(idx, minlength=n_bins)
+        time_axis = t0 + np.arange(n_bins, dtype=np.float64) * window_size
+        return time_axis, counts
+
+    parsed_event_files = []
+    for entry in event_files:
+        if len(entry) == 3:
+            parsed_event_files.append(entry)
+        elif len(entry) == 4:
+            parsed_event_files.append(entry[:3])
+        else:
+            raise ValueError(f'Expected (label, file, n_device) for event_files, got {entry}')
+
+    fig, axes = plt.subplots(4, figsize = (16, 16), sharex = True, tight_layout = True)
+    cmap = plt.get_cmap('tab10', max(len(parsed_event_files), 1))
+    legend_handles = []
     is_first = True
     all_energies = {}
-    for label, file, n_device, color in event_files:
-        events, _ = analyze_events(file)
+    arrival_window = 5
+    violation_window = 5
+    linewidth = 2
+    for idx, (label, file, n_device) in enumerate(parsed_event_files):
+        color = cmap(idx)
+        legend_handles.append(
+            plt.Line2D([0], [0], color=color, linewidth=2.5, linestyle=line_styles.get(label, '-'), label=label)
+        )
+        events, reqs = analyze_events(file)
         if is_first:
             arrival_times = [e.timestamp for e in events if e.event_type == 'global_arrival']
             is_first = False
             if arrival_times:
-                arrival_window = 5
-                linewidth = 2
                 arrival_times = np.asarray(arrival_times, dtype=np.float64)
                 t0 = np.floor(arrival_times.min() / arrival_window) * arrival_window
                 idx = np.floor((arrival_times - t0) / arrival_window).astype(np.int64)
                 counts = np.bincount(idx)
                 time_axis = t0 + np.arange(counts.size, dtype=np.float64) * arrival_window
                 ax = axes[0]
-                ax.step(time_axis, counts, where="post", color=color, linewidth=linewidth)
+                ax.step(time_axis, counts, where="post", color='black', linewidth=linewidth)
                 ax.set_ylabel(f"# requests / {arrival_window:g}s")
                 ax.grid(True, alpha=0.3)
                             
@@ -2987,6 +3048,16 @@ def draw_energy_comparison(
                 # axes[0].grid(True, alpha=0.3)
                 
         energies = calc_energy(events, n_device, ax = axes[2], n_device_ax = axes[1], label = label, color = color, window_size=1.0, linestyle = line_styles.get(label, '-'))
+        violation_time_axis, violation_counts = _compute_slo_violations(reqs, file, violation_window)
+        if violation_time_axis.size:
+            axes[3].step(
+                violation_time_axis,
+                violation_counts,
+                where='post',
+                color=color,
+                linewidth=linewidth,
+                linestyle=line_styles.get(label, '-'),
+            )
         all_energies[label] = energies
     print('all_energies', {label: np.mean(value) for label, value in all_energies.items()})
     
@@ -2997,12 +3068,17 @@ def draw_energy_comparison(
     axes[1].set_xlabel("")
     axes[2].set_ylabel('GPU Power\n(W)', fontsize = 30)
     axes[2].set_ylim(0, 1500)
-    axes[2].set_xlabel('Time (s)', fontsize = 30)
+    axes[2].set_xlabel("")
+    axes[3].set_ylabel('SLO Viol.\nPer Window', fontsize = 30)
+    axes[3].set_xlabel('Time (s)', fontsize = 30)
     # for ax in axes:
         # axes[0].set_xlim(350, 650)
     axes[1].set_ylim(0)
+    axes[3].set_ylim(0)
     fig.legend(
-        
+        handles=legend_handles,
+        loc='upper center',
+        ncol=max(1, min(4, len(legend_handles))),
     )
     fig.savefig(f'energy_comparison-{output_suffix}.png')
     print(f'saved to energy_comparison-{output_suffix}.png')
@@ -3032,37 +3108,33 @@ def draw_energy_comparison(
     return fig, axes
     
 if __name__ == '__main__':
-    # draw_energy_comparison(event_files = [
-    #     ('vLLM', 'experiments_mock/Qwen-7B_constant_azure_code:azure_code_0:1000_arrival_0.0/vllm_round_robin_1.0_16_arrival_5.0_0.05.events.jsonl', 16, 'Black'),
-    #     # ('+ Feasibility Check', 'experiments_mock/Qwen-7B_constant_azure_code:azure_code_0:1000_arrival_0.0/slosserve-edf_round_robin_1.0_12_arrival_5.0_0.05.events.jsonl', 12, 'red'),
-    #     ('Ours', 'experiments_mock/Qwen-7B_constant_azure_code:azure_code_0:1000_arrival_0.0/slosserve-edf_slosserve-1-4_1.0_12_arrival_5.0_0.05.events.jsonl', 12, 'blue')
-    # ],
-    #     output_suffix = 'azure_code')
+    
+    draw_energy_comparison(
+        event_files = [
+            ('SLO-Packer (RR)', 'experiments_emulation_0316/Qwen-7B_constant_azure_code_23:azure_code_23_t1200:1800_arrival_0.0/atfc_round_robin_1.0_8_arrival_5.0_0.05_reject.events.jsonl', 8),
+            ('vLLM+ (RR)', 'experiments_emulation_0316/Qwen-7B_constant_azure_code_23:azure_code_23_t1200:1800_arrival_0.0/sarathi+_round_robin_1.0_8_arrival_5.0_0.05_reject.events.jsonl', 8),
+            ('SLO-Packer', 'experiments_emulation_0316/Qwen-7B_constant_azure_code_23:azure_code_23_t1200:1800_arrival_0.0/atfc_slosserve_planner_1.0_8_arrival_5.0_0.05_reject.events.jsonl', 8),
+            ('vLLM+ (Load-Aware)', 'experiments_emulation_0316/Qwen-7B_constant_azure_code_23:azure_code_23_t1200:1800_arrival_0.0/sarathi+_llumnix_load_1.0_8_arrival_5.0_0.05_reject.events.jsonl', 8)
+        ],
+        output_suffix = None,
+        line_styles = {},
+    )
+    
     # fig, axes = draw_energy_comparison(
-    #     event_files = [('vLLM+ (Colocated)', 'experiments_emulation_new/Qwen-7B_constant_azure_code_23:azure_code_23_t0:600_arrival_0.0/sarathi+_round_robin_0.5_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'black'),
-    #                 ('SLO Packer (Colocated)', 'experiments_emulation_new/Qwen-7B_constant_azure_code_23:azure_code_23_t0:600_arrival_0.0/atfc_slosserve_2_0.5_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'blue'),
+    #     event_files = [('vLLM+ (Colocated)', 'experiments_emulation_new/Qwen-7B_constant_azure_chat_23:azure_chat_23_t0:600_arrival_0.0/sarathi+_round_robin_1.0_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'black'),
+    #                 ('SLO Packer (Colocated)', 'experiments_emulation_new/Qwen-7B_constant_azure_chat_23:azure_chat_23_t0:600_arrival_0.0/atfc_slosserve_2_1.0_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'blue'),
     # # ('SLO Packer (Disagg)', 'experiments_emulation/Qwen-7B_constant_azure_code_23:azure_code_23_t0:600_arrival_0.0/atfc_slosserve_1_disagg_4_0.5_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'blue'),
     # # ('vLLM+ (Disagg)', 'experiments_emulation/Qwen-7B_constant_azure_code_23:azure_code_23_t0:600_arrival_0.0/sarathi+_round_robin-1-disagg-4_0.5_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'green')
     #     ],
-    #     output_suffix = 'azure_cpde_23',
-    #     line_styles={'vLLM+ (Colocated)': '-', 'SLO Packer (Colocated)': '--'}
+    #     output_suffix = 'azure_chat_23',
+    #     line_styles={'vLLM+ (Colocated)': '-', 'SLO Packer (Colocated)': '-'}
     # )
-    
-    fig, axes = draw_energy_comparison(
-        event_files = [('vLLM+ (Colocated)', 'experiments_emulation_new/Qwen-7B_constant_azure_chat_23:azure_chat_23_t0:600_arrival_0.0/sarathi+_round_robin_1.0_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'black'),
-                    ('SLO Packer (Colocated)', 'experiments_emulation_new/Qwen-7B_constant_azure_chat_23:azure_chat_23_t0:600_arrival_0.0/atfc_slosserve_2_1.0_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'blue'),
-    # ('SLO Packer (Disagg)', 'experiments_emulation/Qwen-7B_constant_azure_code_23:azure_code_23_t0:600_arrival_0.0/atfc_slosserve_1_disagg_4_0.5_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'blue'),
-    # ('vLLM+ (Disagg)', 'experiments_emulation/Qwen-7B_constant_azure_code_23:azure_code_23_t0:600_arrival_0.0/sarathi+_round_robin-1-disagg-4_0.5_8_arrival_5.0_0.05_asap.events.jsonl', 8, 'green')
-        ],
-        output_suffix = 'azure_chat_23',
-        line_styles={'vLLM+ (Colocated)': '-', 'SLO Packer (Colocated)': '-'}
-    )
     
     exit(0)
     draw_energy_comparison(
         event_files = [
-            ('vLLM', 'experiments_mock/Qwen-7B_constant_azure_code_23:azure_code_23_0:2000_arrival_0.0/vllm_round_robin_1.0_8_arrival_5.0_0.05.events.jsonl', 8, 'red'),
-            ('Ours', 'experiments_mock/Qwen-7B_constant_azure_code_23:azure_code_23_0:2000_arrival_0.0/slosserve-edf_slosserve_1.0_6_arrival_5.0_0.05.events.jsonl', 6, 'green')
+            ('vLLM', 'experiments_mock/Qwen-7B_constant_azure_code_23:azure_code_23_0:2000_arrival_0.0/vllm_round_robin_1.0_8_arrival_5.0_0.05.events.jsonl', 8),
+            ('Ours', 'experiments_mock/Qwen-7B_constant_azure_code_23:azure_code_23_0:2000_arrival_0.0/slosserve-edf_slosserve_1.0_6_arrival_5.0_0.05.events.jsonl', 6)
         ],
         output_suffix = 'azure_code_23'
     )

@@ -168,7 +168,8 @@ bool load_dump(const std::string& path, BatchImplDump& dump, std::string& err) {
            >> req.prefill_device_id
            >> req.decode_device_id
            >> req.prefill_only
-           >> req.arrival_time;
+           >> req.arrival_time
+           >> req.max_tokens; 
         if (!in.good()) {
             err = "failed parsing req row";
             return false;

@@ -5,6 +5,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <assert.h>
 
 #define MAX_BS 16384
 
@@ -14,6 +15,7 @@ struct Request{
     double ddl;
     int input_length;
     int n_computed_tokens;
+    int max_tokens;
     double profit;
     int mem;
     int tpot_idx;
@@ -22,7 +24,6 @@ struct Request{
     int decode_device_id;
     bool prefill_only;
     double arrival_time;
-    int max_tokens; 
     
     Request() = default;
 
@@ -31,6 +32,7 @@ struct Request{
     double ddl, 
     int input_length,
     int n_computed_tokens,
+    int max_tokens,
     double profit,
     int mem, 
     int tpot_idx,
@@ -38,13 +40,14 @@ struct Request{
     int prefill_device_id = 0,
     int decode_device_id = 0,
     bool prefill_only = false,
-    double arrival_time = 0.0,
-    int max_tokens = -1): 
+    double arrival_time = 0.0
+    ): 
         id(id),
         is_new_req(is_new_req), 
         ddl(ddl), 
         input_length(input_length),
         n_computed_tokens(n_computed_tokens),
+        max_tokens(max_tokens),
         profit(profit), 
         mem(mem), 
         tpot_idx(tpot_idx),
@@ -52,8 +55,10 @@ struct Request{
         prefill_device_id(prefill_device_id),
         decode_device_id(decode_device_id),
         prefill_only(prefill_only),
-        arrival_time(arrival_time),
-        max_tokens(max_tokens) {}
+        arrival_time(arrival_time)
+         {
+            assert(max_tokens >= 1);
+         }
 };
 
 struct ReqBatch {

@@ -153,14 +153,11 @@ bool load_dump(const std::string& path, ScheduleDump& dump, std::string& err) {
             >> req.prefill_device_id
             >> req.decode_device_id
             >> req.prefill_only
-            >> req.arrival_time;
+            >> req.arrival_time
+            >> req.max_tokens;
         if (!row.good()) {
             err = "failed parsing req row";
             return false;
-        }
-        req.max_tokens = req.prefill_only ? 0 : -1;
-        if (!(row >> req.max_tokens)) {
-            row.clear();
         }
         dump.reqs.push_back(req);
     }
