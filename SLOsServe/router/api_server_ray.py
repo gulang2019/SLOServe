@@ -173,7 +173,10 @@ class EngineWorker:
         self._local_queue = asyncio.Queue()
         self._control_queue = asyncio.Queue()
         self.is_ready = True
-        self._mux_task = asyncio.create_task(self._mux())
+        self._mux_task = asyncio.create_task(
+            self._mux(),
+            name=f"EngineWorker[{device_id}]._mux",
+        )
         self._mux_task.add_done_callback(_task_done)
         self._profile_events = []
         
@@ -229,8 +232,14 @@ class EngineWorker:
             await self.output_queue.put_async(payload)
 
         while True: 
-            get_control_task = asyncio.create_task(self._control_queue.get())
-            get_local_task = asyncio.create_task(self._local_queue.get())
+            get_control_task = asyncio.create_task(
+                self._control_queue.get(),
+                name=f"EngineWorker[{self.device_id}]._mux.control_get",
+            )
+            get_local_task = asyncio.create_task(
+                self._local_queue.get(),
+                name=f"EngineWorker[{self.device_id}]._mux.local_get",
+            )
             done, pending = await asyncio.wait(
                 {get_control_task, get_local_task},
                 timeout=FLUSH_T,
@@ -368,7 +377,10 @@ class EngineWorker:
                 n_tokens = len(completion.token_ids)
                 text_len = len(completion.text)
                 await self._local_queue.put(chunk)
-        task = asyncio.create_task(_loop())
+        task = asyncio.create_task(
+            _loop(),
+            name=f"EngineWorker[{self.device_id}].decode_stream[{request_id}]",
+        )
         task.add_done_callback(_task_done)
         return True 
 
@@ -1487,7 +1499,7 @@ class SLOsServeRouter(Router):
         accepted_ids = set(c_req.id for c_req, is_accepted in zip(c_reqs, is_accepteds) if is_accepted)
         t_after_schedule = time.perf_counter()
         # logger.info(f'[SLOPacker] {did=} {is_feasible=}')
-        if hasattr(self, '_profile_events'):
+        if DUMP_ADM and hasattr(self, '_profile_events'):
             self._profile_events.append({
                 'event_type': 'global_admission', 
                 'device_id': did, 
@@ -1674,7 +1686,7 @@ class SLOsServeRouter(Router):
         # logger.info(f'fetch exec plans takes {elapsed_fetch_exec_plan}s')
         
         engine_states = self.get_engine_states()
-        if hasattr(self, '_profile_events'):
+        if DUMP_ADM and hasattr(self, '_profile_events'):
             self._profile_events.append({
                 'event_type': 'engine_states',
                 'timestamp': time.time(),
@@ -2368,10 +2380,26 @@ class RequestPool:
         return gen
 
     async def add_request(self, request: Request) -> StreamingResponse:
+        start = time.time()
+        # async with self.parse_json_sem:
         request_json = await request.json()
+        after_request_json = time.time()
         await self.sem.acquire()
-        return StreamingResponse(self.add_request_json(request_json)(), 
-                                 media_type="text/event-stream")
+        after_sem_time = time.time()
+        gen = self.add_request_json(request_json)()
+        now = time.time()
+        self._profile_events.append({
+            'event_type': 'add_req_req_pool',
+            'request_id': request_json['vllm_xargs']['request_id'],
+            'timestamp': now,
+            'device_id': -1,
+            'extra_args': {
+                'parsing_time': after_request_json - start, 
+                'sem_time': after_sem_time - after_request_json,
+                'add_req_time': now - after_sem_time
+            }
+        })
+        return StreamingResponse(gen, media_type="text/event-stream")
 
     def update_req_state(self, request: RequestInstance, state: RequestState):
         self.router.update(request, state)
@@ -2607,7 +2635,10 @@ class RequestPool:
             if time.time() >= next_load_statistics_time:
                 next_load_statistics_time = time.time() + self.stat_window
                 if get_load_statistics_task is None:
-                    get_load_statistics_task = asyncio.create_task(self.get_load_statistics())
+                    get_load_statistics_task = asyncio.create_task(
+                        self.get_load_statistics(),
+                        name="RequestPool.get_load_statistics",
+                    )
                     get_load_statistics_task.add_done_callback(_task_done)
 
             to_launch_stats = time.time() - it_start_time 
@@ -2708,7 +2739,7 @@ class RequestPool:
                 logger.debug(f"Request {request.request_id} admitted, prefill_device_id={request.prefill_device_id}, decode_device_id={request.decode_device_id}")
                 self._profile_events.append({
                     "event_type": "router_decision",
-                    "timestamp": it_start_time,
+                    "timestamp": time.time(),
                     "device_id": -1,
                     "request_id": request.request_id,
                     "prefill_device_id": request.prefill_device_id,
@@ -2718,7 +2749,10 @@ class RequestPool:
                 assert request.prefill_device_id is not None
                 assert request.decode_device_id is not None
                 self.running_pool.append(request)
-                task = asyncio.create_task(self.dispatch_request_safe(request))
+                task = asyncio.create_task(
+                    self.dispatch_request_safe(request),
+                    name=f"RequestPool.dispatch_request_safe[{request.request_id}]",
+                )
                 task.add_done_callback(_task_done)
                 self.running_tasks.append((time.time(), task, request))
 
@@ -2998,12 +3032,18 @@ async def lifespan(app: FastAPI):
     # Start engine mux tasks now that an event loop exists
     engine_tasks = []
     if engine_actors:
-        for ea in engine_actors:
-            task = asyncio.create_task(ea.run())
+        for idx, ea in enumerate(engine_actors):
+            task = asyncio.create_task(
+                ea.run(),
+                name=f"EngineActor.run[{idx}]",
+            )
             task.add_done_callback(_task_done)
             engine_tasks.append(task)
             
-    routing_loop_task = asyncio.create_task(routing_loop_with_error_monitoring())
+    routing_loop_task = asyncio.create_task(
+        routing_loop_with_error_monitoring(),
+        name="routing_loop_with_error_monitoring",
+    )
     routing_loop_task.add_done_callback(_task_done)
     yield
     # Shutdown Ray actors cleanly
@@ -3140,11 +3180,17 @@ async def update_clients(request: Request):
                     logger.warning(f"Failed to kill old engine actor: {e!r}")
         start_engine(clients)
         engine_tasks = []
-        for ea in engine_actors:
-            task = asyncio.create_task(ea.run())
+        for idx, ea in enumerate(engine_actors):
+            task = asyncio.create_task(
+                ea.run(),
+                name=f"EngineActor.run[{idx}]",
+            )
             task.add_done_callback(_task_done)
             engine_tasks.append(task)
-        routing_loop_task = asyncio.create_task(routing_loop_with_error_monitoring())
+        routing_loop_task = asyncio.create_task(
+            routing_loop_with_error_monitoring(),
+            name="routing_loop_with_error_monitoring",
+        )
         routing_loop_task.add_done_callback(_task_done)
     request_pool.clients = clients
     logger.info(f"Updated clients: {clients}")

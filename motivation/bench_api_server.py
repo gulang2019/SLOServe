@@ -139,7 +139,7 @@ class ExecutionResults:
         self.profit = (np.array(profits) * 1 - np.array(is_slo_violation)).sum() / len(self.execution_results)
     
 
-async def run_request(end_point: str,
+async def run_request(client: httpx.AsyncClient,
                     request_id: str,
                     model_name: str,
                     prompt: str | list[int], 
@@ -149,7 +149,9 @@ async def run_request(end_point: str,
                     ttft_slo_scale: float,
                     slo_routing_overhead: float,
                     slo_tpot: float, 
-                    expected_profit: float) -> Tuple[str, List[float]]:
+                    expected_profit: float,
+                    real_arrival_times: dict) -> Tuple[str, List[float]]:
+        real_arrival_times[request_id] = time.time()
         timestamps = []
         response_text = ""
         
@@ -176,7 +178,6 @@ async def run_request(end_point: str,
             }
         }
         
-        client = httpx.AsyncClient(timeout = 3600, base_url = end_point)
         chunks = []
         is_rejected = False
         async with client.stream("POST",
@@ -316,7 +317,7 @@ async def main(problem: Problem, endpoint: str, clients: str):
     
     
     arrival_idx = 0
-    window_size = 0.05
+    window_size = 0.001
     
     execution_results: List[ExecutionResult] = []
     
@@ -357,107 +358,109 @@ async def main(problem: Problem, endpoint: str, clients: str):
     n_rejected = 0
     n_timed_out = 0
     
-    with EnergyMeter() as energy_meter:
-        rec = EnergyHistoryRecorder(energy_meter, interval_s=0.1, csv_path=f"{problem.store_prefix}.energy.csv")
-        rec.start()
-        while finished_bar.n < len(requests):
-            elapsed_time = time.time() - global_start_time + time_offset
-            
-            while arrival_idx < len(requests) and arrival_times[arrival_idx] <= elapsed_time:
-                request = requests[arrival_idx]
-                # if request.prompt is None:
-                #     prompt = [random.randint(1000, 2000) for _ in range(request.input_length)]
-                # else:
-                assert request.prompt is not None
-                prompt = request.prompt
-                assert prompt is not None
-                task_start_time = time.time()
-                request_id_backend = str(arrival_idx) # str(uuid.uuid4()) # 
-                request_id = str(arrival_idx)
-                bid_to_id[request_id_backend] = request_id
-                real_arrival_times[request_id] = task_start_time
-                task = asyncio.create_task(run_request(endpoint,
-                                                    request_id_backend,
-                                                    problem.model_name, 
-                                                    prompt,
-                                                    request.input_length,
-                                                    request.output_length,
-                                                    zero_load_ttft = perf_model.get_zero_load_ttft(request.input_length, request.cached_length),
-                                                    ttft_slo_scale = problem.ttft_slo_scale,
-                                                    slo_tpot = problem.slo_tpot,
-                                                    slo_routing_overhead = problem.slo_routing_overhead,
-                                                    expected_profit = problem.get_expected_profit(request.input_length - request.cached_length)))
-
-                tasks.append((task, request, task_start_time, request_id))
-                arrival_bar.update(1)
-                arrival_bar.set_description(f'Arrival Time: {arrival_times[arrival_idx]:.2f}, Elapsed Time: {elapsed_time:.2f}')
-                arrival_idx += 1
+    async with httpx.AsyncClient(timeout=3600, base_url=endpoint) as client:
+        with EnergyMeter() as energy_meter:
+            rec = EnergyHistoryRecorder(energy_meter, interval_s=0.1, csv_path=f"{problem.store_prefix}.energy.csv")
+            rec.start()
+            while finished_bar.n < len(requests):
+                elapsed_time = time.time() - global_start_time + time_offset
                 
-            real_time = time.time()
-            elapsed_time = real_time - global_start_time + time_offset
-            if finished_bar.n == arrival_bar.n and arrival_idx < len(requests) and (arrival_times[arrival_idx] - elapsed_time > 10):
-                time_offset += arrival_times[arrival_idx] - elapsed_time -1
-                time_offsets.append((real_time, time_offset))
-                continue
-            # Only check finished requests without waiting, and keep unfinished tasks in the list
-            new_tasks = []
-            current_time = time.time()
+                while arrival_idx < len(requests) and arrival_times[arrival_idx] <= elapsed_time:
+                    request = requests[arrival_idx]
+                    # if request.prompt is None:
+                    #     prompt = [random.randint(1000, 2000) for _ in range(request.input_length)]
+                    # else:
+                    assert request.prompt is not None
+                    prompt = request.prompt
+                    assert prompt is not None
+                    task_start_time = time.time()
+                    request_id_backend = str(arrival_idx) # str(uuid.uuid4()) # 
+                    request_id = str(arrival_idx)
+                    bid_to_id[request_id_backend] = request_id
+                    
+                    task = asyncio.create_task(run_request(client,
+                                                        request_id_backend,
+                                                        problem.model_name, 
+                                                        prompt,
+                                                        request.input_length,
+                                                        request.output_length,
+                                                        zero_load_ttft = perf_model.get_zero_load_ttft(request.input_length, request.cached_length),
+                                                        ttft_slo_scale = problem.ttft_slo_scale,
+                                                        slo_tpot = problem.slo_tpot,
+                                                        slo_routing_overhead = problem.slo_routing_overhead,
+                                                        expected_profit = problem.get_expected_profit(request.input_length - request.cached_length),
+                                                        real_arrival_times = real_arrival_times))
 
-            for task, request, task_start_time, request_id in tasks:
-                if task.done():
-                    timed_out_before = request_id in timed_out_requests
-                    finished_bar.update(1)
-                    finished_bar.set_description(f'Finished: {finished_bar.n}, Rejected: {n_rejected}, Timed Out: {n_timed_out}')
+                    tasks.append((task, request, task_start_time, request_id))
+                    arrival_bar.update(1)
+                    arrival_bar.set_description(f'Arrival Time: {arrival_times[arrival_idx]:.2f}, Elapsed Time: {elapsed_time:.2f}')
+                    arrival_idx += 1
+                    
+                real_time = time.time()
+                elapsed_time = real_time - global_start_time + time_offset
+                if finished_bar.n == arrival_bar.n and arrival_idx < len(requests) and (arrival_times[arrival_idx] - elapsed_time > 10):
+                    time_offset += arrival_times[arrival_idx] - elapsed_time -1
+                    time_offsets.append((real_time, time_offset))
+                    continue
+                # Only check finished requests without waiting, and keep unfinished tasks in the list
+                new_tasks = []
+                current_time = time.time()
 
-                    # ---- explicit status checks ----
-                    if task.cancelled():
-                        logger.info(f"Request {request_id} cancelled before completion")
-                        execution_results.append(ExecutionResult(request, [task_start_time], request_id))
-                        timed_out_requests.discard(request_id)
-                        continue
+                for task, request, task_start_time, request_id in tasks:
+                    if task.done():
+                        timed_out_before = request_id in timed_out_requests
+                        finished_bar.update(1)
+                        finished_bar.set_description(f'Finished: {finished_bar.n}, Rejected: {n_rejected}, Timed Out: {n_timed_out}')
 
-                    exc = task.exception()  # safe here because task.done() is True and not cancelled
-                    if exc is not None:
-                        # ===== task FAILED =====
-                        logger.error(f"Task for request {request_id} failed: {exc!r}")
-                        import traceback
-                        logger.error("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
-                        # Record something for failures if you track them
-                        # failed_requests.append((request_id, exc))
-                        timed_out_requests.discard(request_id)
-                        continue
+                        # ---- explicit status checks ----
+                        if task.cancelled():
+                            logger.info(f"Request {request_id} cancelled before completion")
+                            execution_results.append(ExecutionResult(request, [task_start_time], request_id))
+                            timed_out_requests.discard(request_id)
+                            continue
 
-                    # ===== task SUCCEEDED =====
-                    try:
-                        is_rejected, response_text, timestamps = task.result()  # no exception expected now
-                        if is_rejected:
-                            n_rejected += 1
-                        if not len(timestamps):
-                            timestamps = [task_start_time]
-                            # logger.warning(f"Request {request_id} finished with 0 timestamps")
-                        execution_results.append(ExecutionResult(request, timestamps, request_id))
-                        if timed_out_before:
-                            logger.info(f"Request {request_id} returned after timeout")
-                    finally:
-                        timed_out_requests.discard(request_id)
+                        exc = task.exception()  # safe here because task.done() is True and not cancelled
+                        if exc is not None:
+                            # ===== task FAILED =====
+                            logger.error(f"Task for request {request_id} failed: {exc!r}")
+                            import traceback
+                            logger.error("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+                            # Record something for failures if you track them
+                            # failed_requests.append((request_id, exc))
+                            timed_out_requests.discard(request_id)
+                            continue
 
-                elif request_id in timed_out_requests:
-                    new_tasks.append((task, request, task_start_time, request_id))
+                        # ===== task SUCCEEDED =====
+                        try:
+                            is_rejected, response_text, timestamps = task.result()  # no exception expected now
+                            if is_rejected:
+                                n_rejected += 1
+                            if not len(timestamps):
+                                timestamps = [task_start_time]
+                                # logger.warning(f"Request {request_id} finished with 0 timestamps")
+                            execution_results.append(ExecutionResult(request, timestamps, request_id))
+                            if timed_out_before:
+                                logger.info(f"Request {request_id} returned after timeout")
+                        finally:
+                            timed_out_requests.discard(request_id)
 
-                elif current_time - task_start_time > timeout:
-                    # logger.warning(f"Request {request_id} timed out")
-                    n_timed_out += 1
-                    task.cancel()
-                    timed_out_requests.add(request_id)
-                    new_tasks.append((task, request, task_start_time, request_id))
+                    elif request_id in timed_out_requests:
+                        new_tasks.append((task, request, task_start_time, request_id))
 
-                else:
-                    new_tasks.append((task, request, task_start_time, request_id))
-            tasks = new_tasks
-            await asyncio.sleep(window_size)
-        
-        rec.stop()
-        energy_events = get_energy_events(f"{problem.store_prefix}.energy.csv")
+                    elif current_time - task_start_time > timeout:
+                        # logger.warning(f"Request {request_id} timed out")
+                        n_timed_out += 1
+                        task.cancel()
+                        timed_out_requests.add(request_id)
+                        new_tasks.append((task, request, task_start_time, request_id))
+
+                    else:
+                        new_tasks.append((task, request, task_start_time, request_id))
+                tasks = new_tasks
+                await asyncio.sleep(window_size)
+            
+            rec.stop()
+            energy_events = get_energy_events(f"{problem.store_prefix}.energy.csv")
 
     arrival_bar.close()
     finished_bar.close()
