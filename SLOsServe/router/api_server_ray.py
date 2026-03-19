@@ -38,6 +38,7 @@ from SLOsServe.router.execplan_bus import (ExecPlanBus, ExecPlan,
                                            extract_load_statistics)
 from SLOsServe.router.adm_ctrl import Request as BatchPlannerRequest
 from SLOsServe.router.macro import PERF_MODEL_HEADROOM, DUMP_SCHS, DUMP_ADM
+from SLOsServe.router.sem_util import MaxCapSemaphore
 
 DEBUG = False
 
@@ -2270,6 +2271,8 @@ class RequestPool:
         self.routing_overhead: float = -1.0
         self.fallback_policy = fallback_policy
         self.kv_xfer_delay = 0.05
+        self.maximum_ingress = 20 
+        self.sem = MaxCapSemaphore(self.maximum_ingress)
         
     
     @property
@@ -2366,6 +2369,7 @@ class RequestPool:
 
     async def add_request(self, request: Request) -> StreamingResponse:
         request_json = await request.json()
+        await self.sem.acquire()
         return StreamingResponse(self.add_request_json(request_json)(), 
                                  media_type="text/event-stream")
 
@@ -2566,6 +2570,7 @@ class RequestPool:
             it_start_time = time.time()
             await asyncio.sleep(self.window_size)
             waiting_time = time.time() - it_start_time            
+            await self.sem.reset()
             
             
             if len(self.waiting_pool): 
