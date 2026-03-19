@@ -2582,7 +2582,7 @@ class RequestPool:
             if len(self.waiting_pool) > 0:
                 self._profile_events.append({
                     "event_type": "routing",
-                    "timestamp": it_start_time,
+                    "timestamp": time.time(),
                     "routing_overhead": routing_elapsed,
                     "schedules": {
                         request.request_id: {
@@ -2592,6 +2592,12 @@ class RequestPool:
                         } for request in self.waiting_pool
                     },
                     "device_id": -1,
+                    "extra_args": {
+                        'waiting_time': waiting_time, 
+                        'n_waiting': len(self.waiting_pool),
+                        'n_running': len(self.running_pool), 
+                        'routing_iter': routing_iter 
+                    }
                 })
                 if routing_iter % 100 == 0:
                     logger.info(f"Routing loop: routing_iter={routing_iter}, load_statistics={self.load_stat.stats}")
