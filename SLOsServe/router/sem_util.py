@@ -28,4 +28,3 @@ class MaxCapSemaphore:
             added = self._value - previous
             if added > 0:
                 self._cond.notify_all()
-            return added
