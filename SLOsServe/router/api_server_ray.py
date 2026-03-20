@@ -3530,6 +3530,11 @@ def start_engine(clients: list):
                 execplan_bus=execplan_bus_actor,
                 output_queue = output_queue 
             )
+        # Engine initialization picks internal torch/vLLM rendezvous ports.
+        # Starting many replicas concurrently can race on the same free port,
+        # so wait for each actor to finish bootstrapping before launching the
+        # next one.
+        ray.get(actor.wait_until_ready.remote())
         engine_actor = EngineActor(
             actor,
             output_queue
