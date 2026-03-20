@@ -593,8 +593,8 @@ class EngineWorker:
     async def abort_request(self, request_id: str):
         await self.engine.abort(request_id)
 
-    async def health_check(self) -> dict[str, Any]:
-        return await self.engine.health_check()
+    async def health_check(self) -> dict[str, Any] | None:
+        return await self.engine.check_health()
 # =========================
 # Helpers (engine RPC)
 # =========================
@@ -3532,6 +3532,7 @@ def start_engine(clients: list):
         execplan_bus_actor.reset.remote()
     engine_actors = []
     engine_tasks = []
+    remote_actors = []
     for device_id in range(n_devices):
         output_queue = RayQueue(maxsize=8192)
         vllm_port = None
@@ -3559,16 +3560,13 @@ def start_engine(clients: list):
                 execplan_bus=execplan_bus_actor,
                 output_queue = output_queue 
             )
-        # Engine initialization picks internal torch/vLLM rendezvous ports.
-        # Starting many replicas concurrently can race on the same free port,
-        # so wait for each actor to finish bootstrapping before launching the
-        # next one.
-        ray.get(actor.wait_until_ready.remote())
+        remote_actors.append(actor)
         engine_actor = EngineActor(
             actor,
             output_queue
         )
         engine_actors.append(engine_actor)
+    ray.get([actor.wait_until_ready.remote() for actor in remote_actors])
 
 if __name__ == "__main__":
     import uvicorn
