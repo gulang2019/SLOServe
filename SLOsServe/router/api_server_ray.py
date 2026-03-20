@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import os
 from xxlimited import Str
 import httpx
@@ -39,6 +40,7 @@ from SLOsServe.router.execplan_bus import (ExecPlanBus, ExecPlan,
 from SLOsServe.router.adm_ctrl import Request as BatchPlannerRequest
 from SLOsServe.router.macro import PERF_MODEL_HEADROOM, DUMP_SCHS, DUMP_ADM
 from SLOsServe.router.sem_util import MaxCapSemaphore
+from motivation.energy_measure import EnergyMeter, EnergyHistoryRecorder
 
 DEBUG = False
 
@@ -61,6 +63,152 @@ def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
 
 
 logger = setup_logger("SLOsServe.router.api_server", os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"))
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _sorted_metric_columns(fieldnames: list[str], prefix: str) -> list[str]:
+    return sorted(
+        [name for name in fieldnames if name.startswith(prefix)],
+        key=lambda name: int(name[len(prefix):]),
+    )
+
+
+def _to_float_or_none(value: str | None) -> float | None:
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
+def _parse_energy_csv(csv_path: str) -> tuple[list[dict[str, Any]], list[float], float]:
+    if not os.path.exists(csv_path):
+        return [], [], 0.0
+
+    with open(csv_path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        fieldnames = reader.fieldnames or []
+        j_cols = _sorted_metric_columns(fieldnames, "J_gpu")
+        w_cols = _sorted_metric_columns(fieldnames, "W_gpu")
+        mhz_cols = _sorted_metric_columns(fieldnames, "MHz_gpu")
+        per_gpu = [0.0 for _ in j_cols]
+        events: list[dict[str, Any]] = []
+        for row in reader:
+            timestamp = float(row["ts"])
+            for local_idx, j_col in enumerate(j_cols):
+                energy = float(row.get(j_col, 0.0) or 0.0)
+                per_gpu[local_idx] += energy
+                w_col = w_cols[local_idx] if local_idx < len(w_cols) else None
+                mhz_col = mhz_cols[local_idx] if local_idx < len(mhz_cols) else None
+                events.append({
+                    "event_type": "energy",
+                    "timestamp": timestamp,
+                    "device_id": local_idx,
+                    "energy": energy,
+                    "power": float(row.get(w_col, 0.0) or 0.0) if w_col else 0.0,
+                    "mhz": _to_float_or_none(row.get(mhz_col)) or 0.0,
+                })
+    return events, per_gpu, sum(per_gpu)
+
+
+def _build_worker_dump_path(filename: str, device_id: int) -> str:
+    base, ext = os.path.splitext(filename)
+    if not ext:
+        ext = ".json"
+    return f"{base}.device{device_id}{ext}"
+
+
+class WorkerEnergyProfiler:
+    def __init__(self, *, device_id: int, interval_s: float = 0.1):
+        self.device_id = device_id
+        self.interval_s = interval_s
+        self.physical_gpu_ids = self._detect_physical_gpu_ids()
+        self.csv_path: str | None = None
+        self._meter: EnergyMeter | None = None
+        self._recorder: EnergyHistoryRecorder | None = None
+        self._started = False
+
+    def _detect_physical_gpu_ids(self) -> list[int]:
+        gpu_ids: list[int] = []
+        try:
+            for gpu_id in ray.get_gpu_ids():
+                if isinstance(gpu_id, str):
+                    if gpu_id.isdigit():
+                        gpu_ids.append(int(gpu_id))
+                elif isinstance(gpu_id, (int, float)) and float(gpu_id).is_integer():
+                    gpu_ids.append(int(gpu_id))
+        except Exception:
+            gpu_ids = []
+        if gpu_ids:
+            return gpu_ids
+
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        parsed: list[int] = []
+        for token in visible.split(","):
+            token = token.strip()
+            if token.isdigit():
+                parsed.append(int(token))
+        return parsed
+
+    def restart(self, store_prefix: str | None) -> None:
+        self.stop()
+        if not store_prefix:
+            self.csv_path = None
+            return
+        self.csv_path = os.path.abspath(
+            f"{store_prefix}.device{self.device_id}.energy.csv")
+        _ensure_parent_dir(self.csv_path)
+        self._meter = EnergyMeter(devices=self.physical_gpu_ids or None)
+        self._meter.start()
+        self._recorder = EnergyHistoryRecorder(
+            self._meter,
+            interval_s=self.interval_s,
+            csv_path=self.csv_path,
+        )
+        self._recorder.start()
+        self._started = True
+        logger.info(
+            "Started worker energy profiler for device %s on physical GPUs %s -> %s",
+            self.device_id,
+            self.physical_gpu_ids,
+            self.csv_path,
+        )
+
+    def stop(self) -> dict[str, Any]:
+        recorder = self._recorder
+        meter = self._meter
+        csv_path = self.csv_path
+        was_started = self._started
+        self._started = False
+        self._recorder = None
+        self._meter = None
+
+        per_gpu_joules: list[float] = []
+        total_joules = 0.0
+        if recorder is not None:
+            recorder.stop()
+        if meter is not None:
+            per_gpu_joules, total_joules = meter.stop()
+
+        energy_events: list[dict[str, Any]] = []
+        if was_started and csv_path:
+            energy_events, csv_per_gpu_joules, csv_total_joules = _parse_energy_csv(
+                csv_path)
+            if not per_gpu_joules:
+                per_gpu_joules = csv_per_gpu_joules
+            if total_joules == 0.0:
+                total_joules = csv_total_joules
+
+        return {
+            "energy_csv_path": csv_path if was_started else None,
+            "energy_events": energy_events,
+            "per_gpu_joules": per_gpu_joules,
+            "total_joules": total_joules,
+            "physical_gpu_ids": list(self.physical_gpu_ids),
+        }
 
 @dataclass 
 class EngineActor:
@@ -108,10 +256,16 @@ class EngineActor:
 
 engine_actors: list[EngineActor] | None = None 
 engine_tasks: list | None = None 
-# REPLACED: engine -> Ray actors (one per GPU)
+# REPLACED: engine -> Ray actors (one per logical replica)
 execplan_bus_actor = None
 
 routing_loop_task: asyncio.Task | None = None
+
+
+def _parse_clients_arg(raw_clients: str | None) -> list[str]:
+    if raw_clients is None:
+        return []
+    return [client.strip() for client in raw_clients.split(",") if client.strip()]
 
 def _task_done(task: asyncio.Task):
     try:
@@ -132,19 +286,24 @@ class EngineWorker:
                  output_queue: RayQueue,
                  mock_engine: bool = False,
                  device_id: int = -1,
+                 tensor_parallel_size: int = 1,
                  execplan_bus=None):
         setup_logger("SLOsServe.router.api_server", os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"))
+        self.tensor_parallel_size = tensor_parallel_size
         if not mock_engine:
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.config import CompilationConfig, KVTransferConfig
             from vllm.v1.engine.async_llm import AsyncLLM
-            # One model replica per actor/process
+            # One logical model replica per actor/process. Ray assigns the
+            # physical GPUs and vLLM uses TP within the actor-local GPU set.
             engine_args = AsyncEngineArgs(
                 model=model_name,
                 enable_chunked_prefill=True,
                 enable_expert_parallel=False,
                 max_num_batched_tokens=16384,
-                data_parallel_size=1,  # single replica in this process
+                tensor_parallel_size=tensor_parallel_size,
+                data_parallel_size=1,
+                distributed_executor_backend="mp",
                 max_num_seqs=512,
                 long_prefill_token_threshold=16384,
                 compilation_config=CompilationConfig(
@@ -166,6 +325,7 @@ class EngineWorker:
                 model_name,
                 mock_connector,
                 device_id=device_id,
+                tensor_parallel_size=tensor_parallel_size,
                 execplan_bus=execplan_bus,
             )
         self.device_id = device_id
@@ -179,6 +339,11 @@ class EngineWorker:
         )
         self._mux_task.add_done_callback(_task_done)
         self._profile_events = []
+        self._energy_store_prefix: str | None = None
+        self._energy_profiler = None if mock_engine else WorkerEnergyProfiler(
+            device_id=device_id,
+            interval_s=float(os.getenv("SLOSSERVE_ENERGY_INTERVAL_S", "0.1")),
+        )
         
     async def wait_until_ready(self):
         while not self.is_ready:
@@ -188,6 +353,17 @@ class EngineWorker:
     async def update_config(self, request_json: dict):
         await self.engine.update_config(request_json)
         self._profile_events.clear()
+        if self._energy_profiler is not None:
+            self._energy_profiler.stop()
+            self._energy_store_prefix = request_json.get("store_prefix")
+
+    async def start_energy_profiling(self, store_prefix: str | None = None):
+        if self._energy_profiler is None:
+            return False
+        if store_prefix is not None:
+            self._energy_store_prefix = store_prefix
+        self._energy_profiler.restart(self._energy_store_prefix)
+        return True
         
     async def profile_step(self, request_json: dict):
         batch = request_json['batch']
@@ -196,15 +372,37 @@ class EngineWorker:
         return await self.engine.profile_step(batch, n, verbose)
 
     async def dump_profile_events(self, path: str):
+        energy_summary = {
+            "energy_csv_path": None,
+            "energy_events": [],
+            "per_gpu_joules": [],
+            "total_joules": 0.0,
+            "physical_gpu_ids": [],
+        }
+        if self._energy_profiler is not None:
+            energy_summary = self._energy_profiler.stop()
+        _ensure_parent_dir(path)
         await self.engine.dump_profile_events(path)
         import json
         with open(path, 'r') as f:
             data = json.load(f)
         data.extend(self._profile_events)
+        data.extend(energy_summary["energy_events"])
+        data.sort(key=lambda event: event.get("timestamp", 0.0))
         with open(path, 'w') as f:
-            json.dump(data, f)
+            json.dump(data, f, indent=4)
+        return {
+            "profile_events_path": path,
+            "profile_events": data,
+            "energy_csv_path": energy_summary["energy_csv_path"],
+            "per_gpu_joules": energy_summary["per_gpu_joules"],
+            "total_joules": energy_summary["total_joules"],
+            "physical_gpu_ids": energy_summary["physical_gpu_ids"],
+        }
 
     async def shutdown(self):
+        if self._energy_profiler is not None:
+            self._energy_profiler.stop()
         await self.engine.shutdown()
         self._mux_task.cancel()
         try:
@@ -3082,19 +3280,33 @@ async def handle_completions(request: Request):
 async def dump_profile_events(request: Request):
     request_json = await request.json()
     await request_pool.sync(timeout=request_json.get('timeout', 10.0))
-    filename = request_json.get('filename', 'profile_events.jsonl')
+    filename = os.path.abspath(request_json.get('filename', 'profile_events.jsonl'))
     logger.info(f"Dumping profile events to {filename}")
     import json as _json
     if request_pool is None:
         logger.error("Request pool is not initialized")
         raise RuntimeError("Request pool is not initialized")
     all_events = []
+    per_gpu_energy_consumption: list[float] = []
+    energy_csv_files: list[str] = []
+    worker_event_files: list[str] = []
+    physical_gpu_ids: list[list[int]] = []
     for i, client in enumerate(request_pool.clients):
         try:
             logger.info(f"Dumping profile events from client {client}")
-            await engine_actors[i].engine_actor.dump_profile_events.remote(f'profile_events_{i}.jsonl')
-            with open(f'profile_events_{i}.jsonl', 'r') as f:
-                events = _json.load(f)
+            worker_filename = _build_worker_dump_path(filename, i)
+            dump_result = await engine_actors[i].engine_actor.dump_profile_events.remote(
+                worker_filename)
+            worker_event_files.append(worker_filename)
+            if dump_result.get("energy_csv_path"):
+                energy_csv_files.append(dump_result["energy_csv_path"])
+            physical_gpu_ids.append(dump_result.get("physical_gpu_ids", []))
+            per_gpu_energy_consumption.append(
+                float(dump_result.get("total_joules", 0.0)))
+            events = dump_result.get("profile_events", [])
+            _ensure_parent_dir(worker_filename)
+            with open(worker_filename, 'w') as f:
+                _json.dump(events, f, indent=4)
             for event in events:
                 event['device_id'] = i
             all_events.extend(events)
@@ -3102,20 +3314,56 @@ async def dump_profile_events(request: Request):
             logger.error(f"Error dumping profile events from client {client}, {i}: {e}")
     all_events.extend(request_pool._profile_events)
     all_events.sort(key=lambda x: x['timestamp'])
+    _ensure_parent_dir(filename)
     with open(filename, 'w') as f:
         _json.dump(all_events, f, indent=4)
     logger.info(f"Dumped {len(all_events)} events to {filename}, example: {all_events[0]}")
-    admission_filename = request_json.get('admission_filename', 'admission_history.jsonl')
+    admission_filename = os.path.abspath(
+        request_json.get('admission_filename', 'admission_history.jsonl'))
 
+    _ensure_parent_dir(admission_filename)
     with open(admission_filename, 'w') as f:
         _json.dump(request_pool.admission_history, f, indent=4)
     logger.info(f"Dumped {len(request_pool.admission_history)} admission history to {filename}")
-    return JSONResponse(status_code=200, content={"message": "Profile events dumped."})
+    return JSONResponse(status_code=200, content={
+        "message": "Profile events dumped.",
+        "energy_consumption": sum(per_gpu_energy_consumption),
+        "per_gpu_energy_consumption": per_gpu_energy_consumption,
+        "energy_csv_files": energy_csv_files,
+        "worker_event_files": worker_event_files,
+        "physical_gpu_ids": physical_gpu_ids,
+    })
+
+
+@app.post('/start_energy_profile')
+async def start_energy_profile(request: Request):
+    request_json = await request.json()
+    store_prefix = request_json.get("store_prefix")
+    started = []
+    for i, client in enumerate(request_pool.clients):
+        started.append(
+            await engine_actors[i].engine_actor.start_energy_profiling.remote(
+                store_prefix))
+        logger.info(f"Started energy profiler for {i}th client={client}")
+    return JSONResponse(status_code=200, content={
+        "message": "Energy profiling started.",
+        "started": started,
+    })
 
 
 @app.post('/update_config')
 async def update_config(request: Request):
     request_json = await request.json()
+    requested_tp = int(request_json.get('tensor_parallel_size',
+                                        args.tensor_parallel_size))
+    if requested_tp != args.tensor_parallel_size:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "tensor_parallel_size mismatch",
+                "requested_tensor_parallel_size": requested_tp,
+                "configured_tensor_parallel_size": args.tensor_parallel_size,
+            })
     request_pool.update_config(request_json)
     logger.info(f"Updated router: {request_pool.router}")
 
@@ -3145,12 +3393,12 @@ async def warmup(request: Request):
 @app.post('/update_clients')
 async def update_clients(request: Request):
     request_json = await request.json()
-    clients = request_json['clients'].split(',')
+    clients = _parse_clients_arg(request_json['clients'])
     logger.info(f'existing clients: {request_pool.clients}, new clients: {clients}')
     global engine_actors, engine_tasks
     # Recreate actors if client set changed
     global routing_loop_task
-    if (engine_actors is None) or (set(clients) != set(request_pool.clients)):
+    if (engine_actors is None) or (clients != request_pool.clients):
         old_engine_actors = list(engine_actors) if engine_actors is not None else []
         if routing_loop_task is not None:
             routing_loop_task.cancel()
@@ -3229,6 +3477,8 @@ def parse_args():
     parser.add_argument("--enable_rescheduling", action="store_true", default=False, help="enable rescheduling after a request's P phase finishes")
     parser.add_argument("--admission_mode", type=str, default="anytime", help="admission mode: anytime or arrival, arrival: instant decision at arrival, anytime: admission can be made anytime.")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--tensor_parallel_size", type=int, default=1,
+                        help="number of GPUs per logical replica")
     parser.add_argument("--mock_connector", action="store_true", default=False, help="use mock connector to simulate the network latency")
     parser.add_argument("--ray_address", type=str, default=None)  # NEW: allow Ray cluster connect
     parser.add_argument("--stat_window", type=float, default=0.5, help="stat window for collecting load statistics from backend engine (used for load prediction)")
@@ -3246,9 +3496,11 @@ def start_engine(clients: list):
             ray.init(log_to_driver=True, logging_level=ray_log_level)
 
     n_devices = len(clients)
-    print('clients: ', clients, 'n_devices: ', n_devices)
+    print('clients: ', clients, 'n_devices: ', n_devices,
+          'tensor_parallel_size: ', args.tensor_parallel_size)
 
-    # Create one EngineWorker per device (one model replica per process)
+    # Create one EngineWorker per logical replica. Each actor may use
+    # multiple GPUs via tensor parallelism.
     global engine_actors, engine_tasks, execplan_bus_actor, engine_queues
     if execplan_bus_actor is None:
         execplan_bus_actor = ExecPlanBus.remote()
@@ -3264,14 +3516,17 @@ def start_engine(clients: list):
                 args.mock_connector,
                 mock_engine=True,
                 device_id=device_id,
+                tensor_parallel_size=args.tensor_parallel_size,
                 execplan_bus=execplan_bus_actor,
                 output_queue = output_queue
             )
         else:
-            actor = EngineWorker.options(num_gpus=1).remote(
+            actor = EngineWorker.options(
+                num_gpus=args.tensor_parallel_size).remote(
                 args.model_name,
                 args.mock_connector,
                 device_id=device_id,
+                tensor_parallel_size=args.tensor_parallel_size,
                 execplan_bus=execplan_bus_actor,
                 output_queue = output_queue 
             )
@@ -3287,7 +3542,7 @@ if __name__ == "__main__":
     args = parse_args()
     os.environ["SLOSSERVE_LOG_LEVEL"] = args.log_level.upper()
     setup_logger("SLOsServe.router.api_server", args.log_level)
-    clients = args.clients.split(',')
+    clients = _parse_clients_arg(args.clients)
     logger.info(f"Starting API server on {args.host}:{args.port} with router={args.router} and clients={args.clients}")
     if args.clients:
         start_engine(clients)

@@ -532,10 +532,12 @@ class MockEngine:
                  model_name: str,
                  mock_connector: bool,
                  device_id: int = -1,
+                 tensor_parallel_size: int = 1,
                  device_mem: int = 20e9,
                  execplan_bus=None):
         self._shared_out_q = RayQueue(maxsize = 8192)
         self._local_queues: dict[str, asyncio.Queue] = {}
+        self.tensor_parallel_size = tensor_parallel_size
         '''
         def __init__(self,
                  model_name: str,
