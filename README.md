@@ -58,6 +58,24 @@ python -m SLOsServe.router.api_server_ray --stat_window 2 \
 python motivation/bench_api_server.py --help
 ```
 
+```bash
+curl -X POST http://0.0.0.0:8000/v1/completions \
+:  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "prompt": "how are you?",
+    "max_tokens": 10,
+    "stream": true,
+    "ignore_eos": true,
+    "vllm_xargs": {
+      "input_length": 100,
+      "output_length": 11, "slo_ttft": 1, "slo_tpot": 0.05,
+      "profit": 1.0,
+      "request_id": "5c4e5932-50f4-4546-8325-2a767f403z"
+    }
+  }'
+```
+
 ```sh
 # run on 16 devices, clients 0-15 (the value of the number is not important, but the total counts should be greator than 16), slosserve_planner router, atfc scheduler, 
 # azure_code_23 as length pattern, azure_code_23 as arrival pattern, request 3978 to request 4100 
