@@ -403,7 +403,7 @@ class EngineWorker:
     async def shutdown(self):
         if self._energy_profiler is not None:
             self._energy_profiler.stop()
-        await self.engine.shutdown()
+        self.engine.shutdown()
         self._mux_task.cancel()
         try:
             await self._mux_task
@@ -515,7 +515,7 @@ class EngineWorker:
         prompt = req_data['prompt'] if isinstance(req_data['prompt'], str) \
                  else TokensPrompt(prompt_token_ids=req_data['prompt'])
 
-        admitted, generator = self.engine.add_request(prompt=prompt,
+        admitted, generator = await self.engine.add_request(prompt=prompt,
             request_id=request_id,
             sampling_params=SamplingParams.from_optional(
                 max_tokens=1, ignore_eos=True, extra_args=extra_args

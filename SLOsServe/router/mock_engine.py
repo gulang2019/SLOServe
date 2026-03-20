@@ -589,7 +589,7 @@ class MockEngine:
                 continue
             q.put_nowait(item)  # ✅ don’t await if you want speed
 
-    def add_request(self,
+    async def add_request(self,
         prompt: str | list[int],
         request_id: str, 
         sampling_params: SamplingParams,
@@ -714,7 +714,7 @@ class MockEngine:
         with open(path, 'w') as f:
             json.dump(data, f)
     
-    async def shutdown(self):
+    async def shutdown_async(self):
         await self.engine_core.shutdown.remote()
         if self._demux_task is not None:
             self._demux_task.cancel()
@@ -723,6 +723,9 @@ class MockEngine:
             except asyncio.CancelledError:
                 pass
             self._demux_task = None
+            
+    def shutdown(self):
+        asyncio.run(self.shutdown_async())
         
     async def get_load_statistics(self, n: int = 100):
         return await self.engine_core.get_load_statistics.remote(n)
