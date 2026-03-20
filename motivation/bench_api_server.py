@@ -15,6 +15,7 @@ import random
 import httpx
 import pandas as pd
 from pathlib import Path
+import matplotlib.pyplot as plt
 
 from motivation.events_analysis import analyze_events, analyze_slo_violation
 from motivation.auto_scaling import eval_auto_scaling
@@ -126,8 +127,6 @@ def _plot_batch_time_vs_batch_size(
 ) -> Path | None:
     if not regression_rows:
         return None
-
-    import matplotlib.pyplot as plt
 
     output_path = Path(plot_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -634,8 +633,6 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
     for result in execution_results:
         result.timestamps = [apply_time_offsets(t) for t in result.timestamps]
         
-    import json
-    import os
     i = 0
     filename = f'{problem.store_prefix}.{i}.events.jsonl'
     while os.path.exists(filename):
@@ -1289,7 +1286,6 @@ def run(
     print(f'routing fallback policy: {routing_fallback_policy}')
     print(f'kv_xfer_delay: {kv_xfer_delay}')
     print('--End of Problem Grid--')
-    import os
     results = {}
     if os.path.exists(f'{experiment_dir}/results.jsonl'):
         print(f'Loading cached results from {experiment_dir}/results.jsonl')
@@ -1403,9 +1399,6 @@ def run(
             os.system(f'rm {r.event_file}*')
 
     results = list(results.values())
-
-    import pandas as pd
-    import matplotlib.pyplot as plt
 
     # Convert results to DataFrame and save source data
     df = pd.DataFrame(results)
