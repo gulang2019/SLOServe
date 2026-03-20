@@ -1,6 +1,7 @@
 import tqdm
 import time
 import asyncio
+import os
 from typing import Tuple, List, Dict, Any
 import subprocess
 from dataclasses import dataclass, field, asdict
@@ -13,10 +14,12 @@ import uuid
 import random
 import httpx
 import pandas as pd
+from pathlib import Path
 
 from motivation.events_analysis import analyze_events, analyze_slo_violation
 from motivation.auto_scaling import eval_auto_scaling
 from Dataset.dataset import ArrivalTimes, Requests, Request
+from SLOsServe.fitting_utils import sanitize_filename, write_json
 
 
 logger = logging.getLogger(__name__)
@@ -24,8 +27,173 @@ logger.setLevel(logging.DEBUG)
 
 FRONTEND_DELAY=0.03
 
-from SLOsServe.perf_model import get_model_max_tokens, get_easy_name
-from motivation.energy_measure import EnergyMeter, EnergyHistoryRecorder
+from SLOsServe.perf_model import ASSETS_DIR, get_model_max_tokens, get_easy_name
+PERF_MODEL_REGRESSION_DIR = ASSETS_DIR / "perf_model_regressions"
+
+
+def _extract_batch_regression_row(event: Dict[str, Any]) -> Dict[str, Any] | None:
+    if event.get("event_type") != "batch":
+        return None
+
+    req_ids = event.get("req_ids")
+    computed_tokens = event.get("num_computed_tokens")
+    scheduled_tokens = event.get("num_scheduled_tokens")
+    if not isinstance(req_ids, list) or not isinstance(computed_tokens, list) or not isinstance(scheduled_tokens, dict):
+        return None
+
+    batch = []
+    for idx, req_id in enumerate(req_ids):
+        try:
+            past_tokens = max(0, int(computed_tokens[idx]))
+        except (IndexError, TypeError, ValueError):
+            past_tokens = 0
+        try:
+            current_tokens = max(0, int(scheduled_tokens.get(req_id, 0)))
+        except (TypeError, ValueError):
+            current_tokens = 0
+        if past_tokens == 0 and current_tokens == 0:
+            continue
+        batch.append({
+            "past_tokens": past_tokens,
+            "scheduled_tokens": current_tokens,
+        })
+
+    if not batch:
+        return None
+
+    try:
+        elapsed = float(event.get("elapsed", 0.0))
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    try:
+        scheduling_overhead = float(event.get("scheduling_overhead", 0.0))
+    except (TypeError, ValueError):
+        scheduling_overhead = 0.0
+    try:
+        estimated_time = float(event.get("estimated_time", 0.0))
+    except (TypeError, ValueError):
+        estimated_time = 0.0
+
+    try:
+        device_id = int(event.get("device_id", 0))
+    except (TypeError, ValueError):
+        device_id = 0
+    try:
+        batch_id = int(event.get("batch_id", -1))
+    except (TypeError, ValueError):
+        batch_id = -1
+    try:
+        timestamp = float(event.get("timestamp", 0.0))
+    except (TypeError, ValueError):
+        timestamp = 0.0
+
+    return {
+        "device_id": device_id,
+        "batch_id": batch_id,
+        "timestamp": timestamp,
+        "batch_size": len(batch),
+        "total_current_tokens": sum(item["scheduled_tokens"] for item in batch),
+        "total_past_tokens": sum(item["past_tokens"] for item in batch),
+        "estimated_time": max(0.0, estimated_time),
+        "measured_time": max(0.0, elapsed - scheduling_overhead),
+        "elapsed_time": max(0.0, elapsed),
+        "scheduling_overhead": max(0.0, scheduling_overhead),
+        "batch": batch,
+    }
+
+
+def _collect_batch_regression_rows(events: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], list[tuple[list[tuple[int, int]], float]]]:
+    regression_rows: List[Dict[str, Any]] = []
+    batch_times: list[tuple[list[tuple[int, int]], float]] = []
+
+    for event in events:
+        row = _extract_batch_regression_row(event)
+        if row is None:
+            continue
+        regression_rows.append(row)
+        batch_times.append((
+            [(item["past_tokens"], item["scheduled_tokens"]) for item in row["batch"]],
+            row["measured_time"],
+        ))
+
+    return regression_rows, batch_times
+
+
+def _plot_batch_time_vs_batch_size(
+    regression_rows: List[Dict[str, Any]],
+    plot_path: str | Path,
+    title: str,
+) -> Path | None:
+    if not regression_rows:
+        return None
+
+    import matplotlib.pyplot as plt
+
+    output_path = Path(plot_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df = pd.DataFrame(regression_rows)
+    grouped = (
+        df.groupby("batch_size", as_index=False)[["estimated_time", "measured_time", "predicted_time"]]
+        .mean()
+        .sort_values("batch_size")
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 5), tight_layout=True)
+    for column, label in (
+        ("estimated_time", "Estimated"),
+        ("measured_time", "Measured"),
+        ("predicted_time", "Predicted"),
+    ):
+        ax.plot(grouped["batch_size"], grouped[column], marker="o", label=label)
+    ax.set_xlabel("Batch Size")
+    ax.set_ylabel("Time (s)")
+    ax.set_title(title)
+    ax.legend()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    return output_path
+
+
+def _regress_perf_model_from_batch_events(problem: "Problem", events: List[Dict[str, Any]]) -> Dict[str, str] | None:
+    regression_rows, batch_times = _collect_batch_regression_rows(events)
+    if not batch_times:
+        return None
+
+    from SLOsServe.perf_model import PerfModel
+
+    perf_model = PerfModel.get_perf_model(problem.model_name, problem.length_pattern)
+    fit_result = perf_model.fit(batch_times, tag=problem.length_pattern)
+
+    for row, predicted_time in zip(regression_rows, fit_result["predicted_times"]):
+        row["predicted_time"] = float(predicted_time)
+
+    run_name = sanitize_filename(
+        f"{problem.model_name}__{problem.length_pattern}__{Path(problem.store_prefix).name}"
+    )
+    regression_path = PERF_MODEL_REGRESSION_DIR / f"{run_name}.new_regressed.json"
+    write_json(regression_path, {
+        "model_name": problem.model_name,
+        "task": problem.length_pattern,
+        "store_prefix": problem.store_prefix,
+        "hardware_params": fit_result["hardware_params"],
+        "stats": fit_result["stats"],
+        "new_regressed": regression_rows,
+    })
+
+    figure_path = Path(f"{problem.store_prefix}.batch_time_vs_batch_size.png")
+    _plot_batch_time_vs_batch_size(
+        regression_rows,
+        figure_path,
+        title=f"{get_easy_name(problem.model_name)} [{problem.length_pattern}]",
+    )
+
+    return {
+        "regression_path": str(regression_path),
+        "figure_path": str(figure_path),
+    }
+
+
 @dataclass
 class Problem:
     
@@ -38,7 +206,8 @@ class Problem:
     
     # runtime config
     load_scale: float = 1.0 
-    n_devices: int = 2
+    n_devices: int = 2  # logical replicas
+    tensor_parallel_size: int = 1
     
     # slo model
     ttft_slo_scale: float = 1.0
@@ -223,29 +392,18 @@ async def run_request(client: httpx.AsyncClient,
         # print(f'Request {request_id} finished with {len(timestamps)} timestamps IL: {input_length} OL: {output_length} .')
         return is_rejected, response_text, timestamps
 
-def get_energy_events(csv_path: str) -> List[Dict[str, Any]]:
-    import pandas as pd
-    import os 
-    our_device_id = os.getenv('CUDA_VISIBLE_DEVICES', "0").split(',')
-    our_device_id = [int(_) for _ in our_device_id]
-    # Identify per-GPU columns
-    j_cols = [f"J_gpu{i}" for i in our_device_id]
-    w_cols = [f"W_gpu{i}" for i in our_device_id]
-    mhz_cols = [f"MHz_gpu{i}" for i in our_device_id]
-
-    energy_events = []
-    df = pd.read_csv(csv_path)
-    for _, row in df.iterrows():
-        for device_id, (j_col, w_col, mhz_col) in enumerate(zip(j_cols, w_cols, mhz_cols)):
-            energy_events.append({
-                "event_type": "energy",
-                "device_id": device_id,
-                "timestamp": float(row["ts"]),
-                "energy": float(row.get(j_col, 0)),
-                "power": float(row.get(w_col, 0)),
-                "mhz": float(row.get(mhz_col, 0)),
-            })
-    return energy_events
+def summarize_energy_events(events: List[Dict[str, Any]]) -> tuple[List[float], float]:
+    per_gpu: Dict[int, float] = {}
+    for event in events:
+        if event.get("event_type") != "energy":
+            continue
+        device_id = int(event.get("device_id", 0))
+        per_gpu[device_id] = per_gpu.get(device_id, 0.0) + float(
+            event.get("energy", 0.0))
+    if not per_gpu:
+        return [], 0.0
+    ordered = [per_gpu.get(i, 0.0) for i in range(max(per_gpu) + 1)]
+    return ordered, sum(ordered)
 
 def ensure_prompts_present(requests: List[Request], model_name: str) -> None:
     """Ensure prompts exist for all requests.
@@ -278,7 +436,7 @@ def ensure_prompts_present(requests: List[Request], model_name: str) -> None:
         for i, req_idx in enumerate(indices):
             requests[req_idx].prompt = decoded_batch[i]
 
-async def main(problem: Problem, endpoint: str, clients: str):
+async def main(problem: Problem, endpoint: str, clients: str | None):
     window_start, window_end = problem.window.split(':')
     arrival_times = ArrivalTimes.load(problem.arrival_pattern, 
                                       problem.load_scale, 
@@ -339,6 +497,18 @@ async def main(problem: Problem, endpoint: str, clients: str):
         response.raise_for_status()
         # exit(0)
     time.sleep(10)
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(
+                endpoint + "/start_energy_profile",
+                json={"store_prefix": problem.store_prefix},
+                timeout=aiohttp.ClientTimeout(total=600.0),
+            ) as response:
+                if response.status != 404:
+                    response.raise_for_status()
+        except aiohttp.ClientResponseError as exc:
+            if exc.status != 404:
+                raise
 
     arrival_bar = tqdm.tqdm(total = len(requests), desc = 'Arrival')
     finished_bar = tqdm.tqdm(total = len(requests), desc = 'Finished')
@@ -350,6 +520,7 @@ async def main(problem: Problem, endpoint: str, clients: str):
     time_offset = 0
     time_offsets = [(global_start_time, 0)]
     timeout = 60
+    dump_profile_response: Dict[str, Any] = {}
     
     real_arrival_times = {}
     
@@ -359,108 +530,95 @@ async def main(problem: Problem, endpoint: str, clients: str):
     n_timed_out = 0
     
     async with httpx.AsyncClient(timeout=3600, base_url=endpoint) as client:
-        with EnergyMeter() as energy_meter:
-            rec = EnergyHistoryRecorder(energy_meter, interval_s=0.1, csv_path=f"{problem.store_prefix}.energy.csv")
-            rec.start()
-            while finished_bar.n < len(requests):
-                elapsed_time = time.time() - global_start_time + time_offset
-                
-                while arrival_idx < len(requests) and arrival_times[arrival_idx] <= elapsed_time:
-                    request = requests[arrival_idx]
-                    # if request.prompt is None:
-                    #     prompt = [random.randint(1000, 2000) for _ in range(request.input_length)]
-                    # else:
-                    assert request.prompt is not None
-                    prompt = request.prompt
-                    assert prompt is not None
-                    task_start_time = time.time()
-                    request_id_backend = str(arrival_idx) # str(uuid.uuid4()) # 
-                    request_id = str(arrival_idx)
-                    bid_to_id[request_id_backend] = request_id
-                    
-                    task = asyncio.create_task(run_request(client,
-                                                        request_id_backend,
-                                                        problem.model_name, 
-                                                        prompt,
-                                                        request.input_length,
-                                                        request.output_length,
-                                                        zero_load_ttft = perf_model.get_zero_load_ttft(request.input_length, request.cached_length),
-                                                        ttft_slo_scale = problem.ttft_slo_scale,
-                                                        slo_tpot = problem.slo_tpot,
-                                                        slo_routing_overhead = problem.slo_routing_overhead,
-                                                        expected_profit = problem.get_expected_profit(request.input_length - request.cached_length),
-                                                        real_arrival_times = real_arrival_times))
-
-                    tasks.append((task, request, task_start_time, request_id))
-                    arrival_bar.update(1)
-                    arrival_bar.set_description(f'Arrival Time: {arrival_times[arrival_idx]:.2f}, Elapsed Time: {elapsed_time:.2f}')
-                    arrival_idx += 1
-                    
-                real_time = time.time()
-                elapsed_time = real_time - global_start_time + time_offset
-                if finished_bar.n == arrival_bar.n and arrival_idx < len(requests) and (arrival_times[arrival_idx] - elapsed_time > 10):
-                    time_offset += arrival_times[arrival_idx] - elapsed_time -1
-                    time_offsets.append((real_time, time_offset))
-                    continue
-                # Only check finished requests without waiting, and keep unfinished tasks in the list
-                new_tasks = []
-                current_time = time.time()
-
-                for task, request, task_start_time, request_id in tasks:
-                    if task.done():
-                        timed_out_before = request_id in timed_out_requests
-                        finished_bar.update(1)
-                        finished_bar.set_description(f'Finished: {finished_bar.n}, Rejected: {n_rejected}, Timed Out: {n_timed_out}')
-
-                        # ---- explicit status checks ----
-                        if task.cancelled():
-                            logger.info(f"Request {request_id} cancelled before completion")
-                            execution_results.append(ExecutionResult(request, [task_start_time], request_id))
-                            timed_out_requests.discard(request_id)
-                            continue
-
-                        exc = task.exception()  # safe here because task.done() is True and not cancelled
-                        if exc is not None:
-                            # ===== task FAILED =====
-                            logger.error(f"Task for request {request_id} failed: {exc!r}")
-                            import traceback
-                            logger.error("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
-                            # Record something for failures if you track them
-                            # failed_requests.append((request_id, exc))
-                            timed_out_requests.discard(request_id)
-                            continue
-
-                        # ===== task SUCCEEDED =====
-                        try:
-                            is_rejected, response_text, timestamps = task.result()  # no exception expected now
-                            if is_rejected:
-                                n_rejected += 1
-                            if not len(timestamps):
-                                timestamps = [task_start_time]
-                                # logger.warning(f"Request {request_id} finished with 0 timestamps")
-                            execution_results.append(ExecutionResult(request, timestamps, request_id))
-                            if timed_out_before:
-                                logger.info(f"Request {request_id} returned after timeout")
-                        finally:
-                            timed_out_requests.discard(request_id)
-
-                    elif request_id in timed_out_requests:
-                        new_tasks.append((task, request, task_start_time, request_id))
-
-                    elif current_time - task_start_time > timeout:
-                        # logger.warning(f"Request {request_id} timed out")
-                        n_timed_out += 1
-                        task.cancel()
-                        timed_out_requests.add(request_id)
-                        new_tasks.append((task, request, task_start_time, request_id))
-
-                    else:
-                        new_tasks.append((task, request, task_start_time, request_id))
-                tasks = new_tasks
-                await asyncio.sleep(window_size)
+        while finished_bar.n < len(requests):
+            elapsed_time = time.time() - global_start_time + time_offset
             
-            rec.stop()
-            energy_events = get_energy_events(f"{problem.store_prefix}.energy.csv")
+            while arrival_idx < len(requests) and arrival_times[arrival_idx] <= elapsed_time:
+                request = requests[arrival_idx]
+                assert request.prompt is not None
+                prompt = request.prompt
+                assert prompt is not None
+                task_start_time = time.time()
+                request_id_backend = str(arrival_idx)
+                request_id = str(arrival_idx)
+                bid_to_id[request_id_backend] = request_id
+                
+                task = asyncio.create_task(run_request(client,
+                                                    request_id_backend,
+                                                    problem.model_name, 
+                                                    prompt,
+                                                    request.input_length,
+                                                    request.output_length,
+                                                    zero_load_ttft = perf_model.get_zero_load_ttft(request.input_length, request.cached_length),
+                                                    ttft_slo_scale = problem.ttft_slo_scale,
+                                                    slo_tpot = problem.slo_tpot,
+                                                    slo_routing_overhead = problem.slo_routing_overhead,
+                                                    expected_profit = problem.get_expected_profit(request.input_length - request.cached_length),
+                                                    real_arrival_times = real_arrival_times))
+
+                tasks.append((task, request, task_start_time, request_id))
+                arrival_bar.update(1)
+                arrival_bar.set_description(f'Arrival Time: {arrival_times[arrival_idx]:.2f}, Elapsed Time: {elapsed_time:.2f}')
+                arrival_idx += 1
+                
+            real_time = time.time()
+            elapsed_time = real_time - global_start_time + time_offset
+            if finished_bar.n == arrival_bar.n and arrival_idx < len(requests) and (arrival_times[arrival_idx] - elapsed_time > 10):
+                time_offset += arrival_times[arrival_idx] - elapsed_time -1
+                time_offsets.append((real_time, time_offset))
+                continue
+            # Only check finished requests without waiting, and keep unfinished tasks in the list
+            new_tasks = []
+            current_time = time.time()
+
+            for task, request, task_start_time, request_id in tasks:
+                if task.done():
+                    timed_out_before = request_id in timed_out_requests
+                    finished_bar.update(1)
+                    finished_bar.set_description(f'Finished: {finished_bar.n}, Rejected: {n_rejected}, Timed Out: {n_timed_out}')
+
+                    # ---- explicit status checks ----
+                    if task.cancelled():
+                        logger.info(f"Request {request_id} cancelled before completion")
+                        execution_results.append(ExecutionResult(request, [task_start_time], request_id))
+                        timed_out_requests.discard(request_id)
+                        continue
+
+                    exc = task.exception()  # safe here because task.done() is True and not cancelled
+                    if exc is not None:
+                        # ===== task FAILED =====
+                        logger.error(f"Task for request {request_id} failed: {exc!r}")
+                        import traceback
+                        logger.error("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+                        timed_out_requests.discard(request_id)
+                        continue
+
+                    # ===== task SUCCEEDED =====
+                    try:
+                        is_rejected, response_text, timestamps = task.result()
+                        if is_rejected:
+                            n_rejected += 1
+                        if not len(timestamps):
+                            timestamps = [task_start_time]
+                        execution_results.append(ExecutionResult(request, timestamps, request_id))
+                        if timed_out_before:
+                            logger.info(f"Request {request_id} returned after timeout")
+                    finally:
+                        timed_out_requests.discard(request_id)
+
+                elif request_id in timed_out_requests:
+                    new_tasks.append((task, request, task_start_time, request_id))
+
+                elif current_time - task_start_time > timeout:
+                    n_timed_out += 1
+                    task.cancel()
+                    timed_out_requests.add(request_id)
+                    new_tasks.append((task, request, task_start_time, request_id))
+
+                else:
+                    new_tasks.append((task, request, task_start_time, request_id))
+            tasks = new_tasks
+            await asyncio.sleep(window_size)
 
     arrival_bar.close()
     finished_bar.close()
@@ -493,12 +651,12 @@ async def main(problem: Problem, endpoint: str, clients: str):
             timeout=300.0
         )
         response.raise_for_status()
+        dump_profile_response = response.json()
         
     
     
     with open(filename, 'r') as f:
         events = json.load(f)
-        events.extend(energy_events)
         events = sorted(events, key=lambda x: x['timestamp'])
         # print(bid_to_id.keys())
         backend_id_2_id = lambda id: bid_to_id.get(('-'.join(id.split('-')[1:-1]) if id.startswith('cmpl-') else id), '-1')
@@ -553,6 +711,11 @@ async def main(problem: Problem, endpoint: str, clients: str):
         json.dump(events, f, indent = 4)
     print(f'Saved {filename}')
 
+    regression_artifacts = _regress_perf_model_from_batch_events(problem, events)
+    if regression_artifacts is not None:
+        print(f"Saved perf-model regression data to {regression_artifacts['regression_path']}")
+        print(f"Saved batch-size timing figure to {regression_artifacts['figure_path']}")
+
     # TODO(Yi): add oom fail rate analysis here.
     events, reqs = analyze_events(filename, verbose = True)
     results = analyze_slo_violation(reqs, events, 
@@ -584,7 +747,20 @@ async def main(problem: Problem, endpoint: str, clients: str):
         results['auto_scaling_analysis'] = auto_scaling_analysis
         
     execution_results = sorted(execution_results, key=lambda x: int(x.request_id))
-    results =  ExecutionResults(problem, execution_results, results, f'{problem.store_prefix}.{i}')
+    per_gpu_energy_consumption = dump_profile_response.get(
+        "per_gpu_energy_consumption", [])
+    energy_consumption = dump_profile_response.get("energy_consumption")
+    if energy_consumption is None:
+        per_gpu_energy_consumption, energy_consumption = summarize_energy_events(
+            events)
+    results =  ExecutionResults(
+        problem,
+        execution_results,
+        results,
+        f'{problem.store_prefix}.{i}',
+        energy_consumption=energy_consumption,
+        per_gpu_energy_consumption=per_gpu_energy_consumption,
+    )
     with open(f'{problem.store_prefix}.execution_results.jsonl', 'w') as f:
         json.dump([asdict(execution_result) for execution_result in execution_results], f, indent=4)
     reqs = sorted(list(reqs.values()), key=lambda x: int(x.req_id))
@@ -593,6 +769,41 @@ async def main(problem: Problem, endpoint: str, clients: str):
     print(f'Saved {problem.store_prefix}.{i}.execution_results.jsonl')
     print(f'Saved {problem.store_prefix}.{i}.reqs.jsonl')
     return results
+
+
+def _normalize_router_clients_arg(clients_arg: str | None) -> str | None:
+    if clients_arg is None:
+        return None
+    clients_arg = clients_arg.strip()
+    if not clients_arg:
+        return None
+
+    if "://" in clients_arg:
+        return clients_arg
+
+    if "-" in clients_arg and ":" not in clients_arg and "," not in clients_arg:
+        left, right = clients_arg.split("-", 1)
+        if left.isdigit() and right.isdigit():
+            start = int(left)
+            end = int(right)
+            return ",".join(f"r{i}" for i in range(start, end + 1))
+
+    if ":" in clients_arg and "," not in clients_arg:
+        left, right = clients_arg.split(":", 1)
+        if left.isdigit() and right.isdigit():
+            start = int(left)
+            count = int(right)
+            if start < 10:
+                return ",".join(f"r{i}" for i in range(start, start + count))
+            return ",".join(
+                f"http://localhost:{start + i}" for i in range(count))
+
+    tokens = [token.strip() for token in clients_arg.split(",") if token.strip()]
+    if not tokens:
+        return None
+    if all(token.isdigit() for token in tokens) and int(tokens[0]) < 10:
+        return ",".join(f"r{int(token)}" for token in tokens)
+    return ",".join(tokens)
 
 
 def build_problems(
@@ -604,6 +815,7 @@ def build_problems(
     scheduling_policy: str,
     routing_policy: str,
     n_device: int,  
+    tensor_parallel_size: int,
     window: str,
     load_scale: float,
     experiment_dir: str,
@@ -615,7 +827,10 @@ def build_problems(
     routing_fallback_policy: str = "asap",
     kv_xfer_delay: float = 0.05,
 ):
-    store_prefix = f'{experiment_dir}/{scheduling_policy}_{routing_policy}_{load_scale}_{n_device}_{admission_mode}_{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
+    store_prefix = (
+        f'{experiment_dir}/{scheduling_policy}_{routing_policy}_{load_scale}_'
+        f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
+        f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}')
     
     if ":" in trace: 
         requests_trace, arrival_times_trace = trace.split(":")
@@ -990,6 +1205,7 @@ def build_problems(
         window = window,
         load_scale = load_scale,
         n_devices = n_device,
+        tensor_parallel_size = tensor_parallel_size,
         ttft_slo_scale = ttft_slo_scale,
         slo_ttft_per_token = slo_ttft_per_token,
         slo_ttft_constant = slo_ttft_constant,
@@ -1024,6 +1240,7 @@ def run(
     window: str,
     load_scales: list[float],
     n_devices: list[int],
+    tensor_parallel_size: int,
     endpoint: str,
     clients: str | None,
     policies: list[str],
@@ -1037,7 +1254,7 @@ def run(
     routing_fallback_policy: str,
     kv_xfer_delay: float,
 ):
-    import os
+    output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     
     model_name_easy = get_easy_name(model_name)
@@ -1050,8 +1267,8 @@ def run(
     else:
         _trace_name = trace
         burstiness_level = 0.0
-    experiment_dir = f"{output_dir}/{model_name_easy}_{profit}_{_trace_name}_{window}_{admission_mode}_{burstiness_level}"
-    import os
+    experiment_dir = os.path.abspath(
+        f"{output_dir}/{model_name_easy}_{profit}_{_trace_name}_{window}_{admission_mode}_{burstiness_level}")
     os.makedirs(experiment_dir, exist_ok=True)
     
     print('--Problem Grid--')
@@ -1063,6 +1280,7 @@ def run(
     print(f"window: {window}")
     print(f"load_scales: {load_scales}")
     print(f"n_devices: {n_devices}")
+    print(f"tensor_parallel_size: {tensor_parallel_size}")
     print(f"policies: {policies}")
     print(f"Experiment directory: {experiment_dir}")    
     print(f"admission_mode: {admission_mode}")
@@ -1077,7 +1295,18 @@ def run(
         print(f'Loading cached results from {experiment_dir}/results.jsonl')
         with open(f'{experiment_dir}/results.jsonl', 'r') as f:
             results = [json.loads(line) for line in f]
-            results = {(r['load_scale'], r['n_device'], r['scheduling_policy'], r['routing_policy'], r['ttft_slo_scale'], r['slo_tpot'], r['perf_model_err']): r for r in results}
+            results = {
+                (
+                    r['load_scale'],
+                    r['n_device'],
+                    r.get('tensor_parallel_size', 1),
+                    r['scheduling_policy'],
+                    r['routing_policy'],
+                    r['ttft_slo_scale'],
+                    r['slo_tpot'],
+                    r['perf_model_err'],
+                ): r for r in results
+            }
     else:
         results = {}
     
@@ -1091,7 +1320,17 @@ def run(
         if n_device == 1 and 'disaggregated' in routing_policy:
             print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot} because n_device is 1 and routing policy is disaggregated')
             continue
-        if not overwrite and (load_scale, n_device, scheduling_policy, routing_policy, ttft_slo_scale, slo_tpot, perf_model_err) in results:
+        cache_key = (
+            load_scale,
+            n_device,
+            tensor_parallel_size,
+            scheduling_policy,
+            routing_policy,
+            ttft_slo_scale,
+            slo_tpot,
+            perf_model_err,
+        )
+        if not overwrite and cache_key in results:
             print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot}, {perf_model_err} because it already exists')
             continue
         problems = build_problems(
@@ -1103,6 +1342,7 @@ def run(
             scheduling_policy,
             routing_policy,
             n_device,
+            tensor_parallel_size,
             window,
             load_scale,
             experiment_dir,
@@ -1121,25 +1361,15 @@ def run(
         for problem in problems:
             # print(f"Running problem: {problem}")
             problem.scheduling_kwargs['scheduling_overhead'] = scheduling_overhead
-            with EnergyMeter() as energy_meter:
-                rec = EnergyHistoryRecorder(energy_meter, interval_s=0.5, csv_path=f"{problem.store_prefix}.energy.csv")
-                rec.start()
-                exec_result = asyncio.run(main(problem, endpoint, clients))
-                rec.stop()
-            
-            per_gpu, total = energy_meter.read()
-            if clients and (int(clients.split(',')[0]) < 10) and len(per_gpu) == problem.n_devices:
-                gpu_ids = [int(_) for _ in clients.split(',')][:problem.n_devices]
-                per_gpu = [per_gpu[i] for i in gpu_ids]
-                total = sum(per_gpu)
-            exec_result.energy_consumption = total
-            exec_result.per_gpu_energy_consumption = per_gpu
+            exec_result = asyncio.run(main(problem, endpoint, clients))
             run_results.append(exec_result)
         best_result = max(run_results, key = lambda x: x.profit)
         result = {
             'load_scale': load_scale,
             'rps': best_result.results['rps'],
             'n_device': n_device,
+            'tensor_parallel_size': tensor_parallel_size,
+            'total_gpus': n_device * tensor_parallel_size,
             'scheduling_policy': scheduling_policy,
             'routing_policy': routing_policy,
             'profit': best_result.profit,
@@ -1162,7 +1392,7 @@ def run(
         pprint.pprint(result)
         print('--End of Result--')
         
-        results[(load_scale, n_device, scheduling_policy, routing_policy, ttft_slo_scale, slo_tpot, perf_model_err)] = result
+        results[cache_key] = result
         with open(f'{experiment_dir}/results.jsonl', 'a') as f:
             f.write(json.dumps(result) + '\n')            
             
@@ -1258,10 +1488,11 @@ if __name__ == '__main__':
     parser.add_argument('--profit', type=str, default='constant', choices=['constant', 'weighted'])
     parser.add_argument('--trace', type=str, nargs = '+', default=['azure_code_23'], help = 'list of traces to run LENGTH:ARRIVAL [ARRIVAL:LENGTH ...]')
     parser.add_argument('--window', type=str, default='0:1000', help = 'window of trace to run (inclusive)')
-    parser.add_argument('--n_devices', type=int, default=[1,2,4,8], nargs='+', help = 'list of number of devices to run')
+    parser.add_argument('--n_devices', type=int, default=[1,2,4,8], nargs='+', help = 'list of logical replicas to run')
+    parser.add_argument('--tensor_parallel_size', type=int, default=1, help='number of GPUs per logical replica')
     parser.add_argument('--load_scales', type=float, default=[0.5,1.0,2.0,3.0,4.0], nargs='+', help = 'list of load scales (we rescale the arrival rate by load scale, higher load scale means higher query per second)')
     parser.add_argument('--router_ports', type=str, default='8001:4', help = 'port of router to run (inclusive)')
-    parser.add_argument('--clients', type=str, default=None, help = 'clients to run (inclusive)')
+    parser.add_argument('--clients', type=str, default=None, help = 'logical replica labels (e.g. r0,r1,r2,r3) or legacy URL pool spec')
     parser.add_argument('--run_all', action = 'store_true')
     # parser.add_argument('--scheduling_policies', type=str, default=SCHEDULING_POLICIES, nargs='+')
     # parser.add_argument('--routing_policies', type=str, default=ROUTING_POLICIES, nargs='+')
@@ -1278,22 +1509,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     if not args.run_all:
-        clients = None
-        if args.clients is not None:
-            if '-' in args.clients:
-                l, r = args.clients.split('-')
-                l = int(l)
-                r = int(r)
-                args.clients = ','.join(map(str, range(l, r+1)))
-            if int(args.clients.split(',')[0]) < 10:
-                clients = args.clients
-            elif ':' in args.clients:
-                client_start, n_clients = map(int, args.clients.split(':'))
-                clients = [f'http://localhost:{client_start + i}' for i in range(n_clients)]
-            elif ',' in args.clients:
-                clients = [f'http://localhost:{client}' for client in args.clients.split(',')]
-            else:
-                clients = [f'http://localhost:{args.clients}']
+        clients = _normalize_router_clients_arg(args.clients)
         
         for trace in args.trace:
             run (args.model_name,
@@ -1304,6 +1520,7 @@ if __name__ == '__main__':
                 args.window,
                 args.load_scales,
                 args.n_devices,
+                args.tensor_parallel_size,
                 endpoint = f'http://localhost:{args.port}',
                 clients = clients,
                 policies = args.policies,
@@ -1362,6 +1579,7 @@ if __name__ == '__main__':
                 'window': args.window,
                 'load_scales': args.load_scales,
                 'n_devices': [n_device],
+                'tensor_parallel_size': args.tensor_parallel_size,
                 'endpoint': router,
                 'clients': clients_str,
                 'overwrite': args.overwrite,

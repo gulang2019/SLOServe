@@ -1,0 +1,161 @@
+import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from motivation import bench_api_server
+from SLOsServe.router import api_server_ray
+
+
+@pytest.mark.parametrize(
+    ("raw_clients", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("0-3", "r0,r1,r2,r3"),
+        ("0:4", "r0,r1,r2,r3"),
+        ("0,2,4", "r0,r2,r4"),
+        ("r0,r1", "r0,r1"),
+        ("8001:2", "http://localhost:8001,http://localhost:8002"),
+        (
+            "http://localhost:8001,http://localhost:8002",
+            "http://localhost:8001,http://localhost:8002",
+        ),
+    ],
+)
+def test_normalize_router_clients_arg_preserves_replica_semantics(
+    raw_clients,
+    expected,
+):
+    assert bench_api_server._normalize_router_clients_arg(raw_clients) == expected
+
+
+def test_parse_clients_arg_splits_logical_replica_labels():
+    assert api_server_ray._parse_clients_arg(None) == []
+    assert api_server_ray._parse_clients_arg("r0, r1 ,, r2") == [
+        "r0",
+        "r1",
+        "r2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_update_config_rejects_tensor_parallel_size_mismatch(monkeypatch):
+    fake_pool = SimpleNamespace(update_config=MagicMock())
+
+    monkeypatch.setattr(api_server_ray, "request_pool", fake_pool)
+    monkeypatch.setattr(
+        api_server_ray,
+        "args",
+        SimpleNamespace(tensor_parallel_size=2, mock_connector=False),
+        raising=False,
+    )
+
+    class FakeRequest:
+        async def json(self):
+            return {"tensor_parallel_size": 4}
+
+    response = await api_server_ray.update_config(FakeRequest())
+    payload = json.loads(response.body)
+
+    assert response.status_code == 400
+    assert payload == {
+        "error": "tensor_parallel_size mismatch",
+        "requested_tensor_parallel_size": 4,
+        "configured_tensor_parallel_size": 2,
+    }
+    fake_pool.update_config.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_clients_restarts_when_replica_order_changes(monkeypatch):
+    started = {}
+
+    def fake_start_engine(clients):
+        started["clients"] = clients
+
+    async def fake_routing_loop():
+        return None
+
+    fake_pool = SimpleNamespace(clients=["r0", "r1"])
+
+    monkeypatch.setattr(api_server_ray, "request_pool", fake_pool)
+    monkeypatch.setattr(api_server_ray, "engine_actors", [])
+    monkeypatch.setattr(api_server_ray, "engine_tasks", [])
+    monkeypatch.setattr(api_server_ray, "routing_loop_task", None)
+    monkeypatch.setattr(api_server_ray, "start_engine", fake_start_engine)
+    monkeypatch.setattr(
+        api_server_ray,
+        "routing_loop_with_error_monitoring",
+        fake_routing_loop,
+    )
+
+    class FakeRequest:
+        async def json(self):
+            return {"clients": "r1,r0"}
+
+    response = await api_server_ray.update_clients(FakeRequest())
+
+    assert response.status_code == 200
+    assert started["clients"] == ["r1", "r0"]
+    assert fake_pool.clients == ["r1", "r0"]
+
+
+def test_start_engine_uses_tensor_parallel_gpu_reservations(monkeypatch):
+    queue_sizes = []
+    launches = []
+
+    class FakeQueue:
+        def __init__(self, maxsize):
+            queue_sizes.append(maxsize)
+
+    class FakeEngineWorker:
+        def options(self, **kwargs):
+            launches.append(("options", kwargs))
+
+            class FakeOptions:
+                def remote(self_inner, *args, **remote_kwargs):
+                    launches.append(("remote", args, remote_kwargs))
+                    return f"actor-{len([kind for kind, *_ in launches if kind == 'remote'])}"
+
+            return FakeOptions()
+
+    monkeypatch.setattr(api_server_ray, "args", SimpleNamespace(
+        log_level="INFO",
+        ray_address=None,
+        tensor_parallel_size=2,
+        mock_engine=False,
+        model_name="demo-model",
+        mock_connector=False,
+    ), raising=False)
+    monkeypatch.setattr(api_server_ray.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(api_server_ray, "ExecPlanBus", SimpleNamespace(
+        remote=lambda: "execplan-bus"))
+    monkeypatch.setattr(api_server_ray, "RayQueue", FakeQueue)
+    monkeypatch.setattr(api_server_ray, "EngineWorker", FakeEngineWorker())
+    monkeypatch.setattr(api_server_ray, "execplan_bus_actor", None)
+    monkeypatch.setattr(api_server_ray, "engine_actors", None)
+    monkeypatch.setattr(api_server_ray, "engine_tasks", None)
+
+    api_server_ray.start_engine(["r0", "r1", "r2"])
+
+    option_calls = [entry[1] for entry in launches if entry[0] == "options"]
+    remote_calls = [
+        (entry[1], entry[2]) for entry in launches if entry[0] == "remote"
+    ]
+
+    assert option_calls == [
+        {"num_gpus": 2},
+        {"num_gpus": 2},
+        {"num_gpus": 2},
+    ]
+    assert queue_sizes == [8192, 8192, 8192]
+    assert len(remote_calls) == 3
+    for replica_id, (args, kwargs) in enumerate(remote_calls):
+        assert args == ("demo-model", False)
+        assert kwargs["device_id"] == replica_id
+        assert kwargs["tensor_parallel_size"] == 2
+        assert kwargs["execplan_bus"] == "execplan-bus"
+        assert isinstance(kwargs["output_queue"], FakeQueue)
+    assert len(api_server_ray.engine_actors) == 3
