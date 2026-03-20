@@ -547,7 +547,7 @@ class EngineWorker:
         prompt = req_data['prompt'] if isinstance(req_data['prompt'], str) \
                  else TokensPrompt(prompt_token_ids=req_data['prompt'])
         
-        admitted, generator = self.engine.add_request(prompt=prompt,
+        admitted, generator = await self.engine.add_request(prompt=prompt,
             request_id=request_id,
             sampling_params=SamplingParams.from_optional(
                 max_tokens=req_data['max_tokens'],

@@ -458,6 +458,11 @@ class EnergyHistoryRecorder:
         if self._thread:
             self._thread.join(timeout=2.0)
             self._thread = None
+        if self._last_t is not None and self._last_J is not None:
+            try:
+                self._sample_once()
+            except Exception:
+                pass
         if self._fh:
             self._fh.close()
             self._fh = None
