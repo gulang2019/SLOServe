@@ -20,6 +20,7 @@ SUCCEEDED_LOG="${SUCCEEDED_LOG:-$SCRIPT_DIR/succeeded_runs.log}"
 FAILED_LOG="${FAILED_LOG:-$SCRIPT_DIR/failed_runs.log}"
 RUN_LOG="${RUN_LOG:-$SCRIPT_DIR/all_runs.log}"
 SERVER_ROUTER_KWARGS='{"device_mem":1248576, "block_size":16, "model_name":"Qwen/Qwen2.5-7B-Instruct", "tpot":0.05, "scheduling_overhead":0.005, "max_decode_length":500, "is_pd_disagg":0, "n_prefill_per_group":1, "max_decode_bs":16, "enable_rerouting":0}'
+SERVER_CLIENTS="${SERVER_CLIENTS:-0-7}"
 
 touch "$SUCCEEDED_LOG" "$FAILED_LOG" "$RUN_LOG"
 
@@ -91,6 +92,62 @@ cleanup_server() {
   wait "$server_pid" 2>/dev/null || true
 }
 
+wait_for_server() {
+  local deadline=$((SECONDS + 60))
+  while ((SECONDS < deadline)); do
+    if curl -fsS "http://localhost:8000/health_check" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: server did not become ready within 60s" >&2
+  return 1
+}
+
+count_clients_spec() {
+  local spec="$1"
+  local start
+  local end
+  local count
+
+  if [[ "$spec" == *","* ]]; then
+    awk -F',' 'NF { print NF }' <<< "$spec"
+    return
+  fi
+
+  if [[ "$spec" == *"-"* && "$spec" != *":"* ]]; then
+    start="${spec%-*}"
+    end="${spec#*-}"
+    echo $((end - start + 1))
+    return
+  fi
+
+  if [[ "$spec" == *":"* && "$spec" != *","* ]]; then
+    count="${spec#*:}"
+    echo "$count"
+    return
+  fi
+
+  echo 1
+}
+
+policy_supports_partial_rr() {
+  local policy="$1"
+  local routing="${policy%%:*}"
+  [[ "$routing" == "round_robin" || "$routing" == "round_robin_retry" ]]
+}
+
+max_requested_devices() {
+  local max=0
+  local value
+  for value in "$@"; do
+    if ((value > max)); then
+      max="$value"
+    fi
+  done
+  echo "$max"
+}
+
 run_suite() {
   local trace
   local length_trace
@@ -100,8 +157,31 @@ run_suite() {
   local server_pid
   local bench_status
   local cmd_str
+  local available_clients
+  local max_devices
   local -a server_cmd=()
   local -a cmd=()
+
+  available_clients="$(count_clients_spec "$SERVER_CLIENTS")"
+
+  server_cmd=(
+    python -m SLOsServe.router.api_server_ray
+    --stat_window 2
+    --host 0.0.0.0
+    --port 8000
+    --window_size 0.005
+    --router slosserve
+    --router_kwargs "$SERVER_ROUTER_KWARGS"
+    --clients "$SERVER_CLIENTS"
+    --admission_mode anytime
+    --mock_connector
+    --mock_engine
+  )
+
+  "${server_cmd[@]}" &
+  server_pid=$!
+  trap 'cleanup_server "$server_pid"' EXIT
+  wait_for_server
 
   for trace in "${TRACES[@]}"; do
     length_trace="${trace%%:*}"
@@ -124,25 +204,14 @@ run_suite() {
       echo "  load_scale=$load_scale"
       echo "  n_devices=${n_devices[*]}"
 
-      server_cmd=(
-        python -m SLOsServe.router.api_server_ray
-        --stat_window 2
-        --host 0.0.0.0
-        --port 8000
-        --window_size 0.005
-        --router slosserve
-        --router_kwargs "$SERVER_ROUTER_KWARGS"
-        --clients 0,1
-        --admission_mode anytime
-        --mock_connector
-        --mock_engine
-      )
-
-      "${server_cmd[@]}" &
-      server_pid=$!
-      trap 'cleanup_server "$server_pid"' EXIT
-
-      sleep 30
+      max_devices="$(max_requested_devices "${n_devices[@]}")"
+      if ((max_devices > available_clients)) && ! policy_supports_partial_rr "$policy"; then
+        echo "SKIP (insufficient clients for non-RR policy): $run_key"
+        echo "  available_clients=$available_clients"
+        echo "  max_requested_devices=$max_devices"
+        log_run_cmd "SKIPPED_INCOMPATIBLE" "$run_key" "available_clients=$available_clients max_requested_devices=$max_devices"
+        continue
+      fi
 
       cmd=(
         python motivation/bench_api_server.py
@@ -157,10 +226,10 @@ run_suite() {
         --profit constant
         --admission_mode arrival
         --slo_routing_overhead 0.05
-        --scheduling_overhead 0.005
+        --scheduling_overhead 0.003
         --model_name Qwen/Qwen2.5-7B-Instruct
         --port 8000
-        --clients 0-31
+        --clients "$SERVER_CLIENTS"
         --output_dir experiments_"$EXPERIMENT_NAME"
         --routing_overhead -1.0
         --routing_fallback_policy reject
@@ -173,9 +242,6 @@ run_suite() {
       bench_status=$?
       set -e
 
-      trap - EXIT
-      cleanup_server "$server_pid"
-
       if ((bench_status == 0)); then
         echo "SUCCESS: $run_key"
         echo "$run_key" >> "$SUCCEEDED_LOG"
@@ -187,6 +253,9 @@ run_suite() {
       fi
     done
   done
+
+  trap - EXIT
+  cleanup_server "$server_pid"
 }
 
 POLICIES=(
@@ -214,7 +283,7 @@ TRACES=(
 )
 
 declare -A configs=(
-  ["azure_code_23:azure_code_23"]="t1200:1800 1.0 4 8 12 16 32"
+  ["azure_code_23:azure_code_23"]="t1200:1800 1.0 2 4 8 12 16 32"
   ["sharegpt_code:azure_code_23"]="t1200:1800 1.0 2 4 6 8"
   ["azure_chat_23:azure_chat_23"]="t1200:1800 1.0 2 4 6 8"
   ["sharegpt_chat:azure_chat_23"]="t1200:1800 1.0 2 4 6 8"

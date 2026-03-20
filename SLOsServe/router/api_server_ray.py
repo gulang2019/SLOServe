@@ -287,9 +287,14 @@ class EngineWorker:
                  mock_engine: bool = False,
                  device_id: int = -1,
                  tensor_parallel_size: int = 1,
+                 vllm_port: int | None = None,
                  execplan_bus=None):
         setup_logger("SLOsServe.router.api_server", os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"))
         self.tensor_parallel_size = tensor_parallel_size
+        if vllm_port is not None:
+            os.environ["VLLM_PORT"] = str(vllm_port)
+            logger.info("Replica %s using explicit VLLM_PORT=%s", device_id,
+                        vllm_port)
         if not mock_engine:
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.config import CompilationConfig, KVTransferConfig
@@ -3262,10 +3267,17 @@ app = FastAPI(lifespan=lifespan)
 # =========================
 @app.get('/health_check')
 async def health_check():
+    if engine_actors is None:
+        return JSONResponse(status_code=200, content={'status': 'ok'})
     for actor in engine_actors:
         status = await actor.engine_actor.health_check.remote()
-        if not status['loop_task_done']:
-            return JSONResponse(status_code=500, content=status)
+        if isinstance(status, dict) and 'loop_task_done' in status:
+            if status.get('loop_task_done'):
+                return JSONResponse(status_code=500, content=status)
+            if status.get('loop_task_cancelled'):
+                return JSONResponse(status_code=500, content=status)
+            if status.get('loop_task_exception') is not None:
+                return JSONResponse(status_code=500, content=status)
     return JSONResponse(status_code=200, content={'status': 'ok'})
 
 @app.post("/v1/completions")
@@ -3479,6 +3491,18 @@ def parse_args():
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--tensor_parallel_size", type=int, default=1,
                         help="number of GPUs per logical replica")
+    parser.add_argument(
+        "--vllm_port_base",
+        type=int,
+        default=None,
+        help="base port for per-replica vLLM internal rendezvous; replica i uses base + i * vllm_port_stride",
+    )
+    parser.add_argument(
+        "--vllm_port_stride",
+        type=int,
+        default=64,
+        help="port spacing between logical replicas when --vllm_port_base is set",
+    )
     parser.add_argument("--mock_connector", action="store_true", default=False, help="use mock connector to simulate the network latency")
     parser.add_argument("--ray_address", type=str, default=None)  # NEW: allow Ray cluster connect
     parser.add_argument("--stat_window", type=float, default=0.5, help="stat window for collecting load statistics from backend engine (used for load prediction)")
@@ -3510,6 +3534,9 @@ def start_engine(clients: list):
     engine_tasks = []
     for device_id in range(n_devices):
         output_queue = RayQueue(maxsize=8192)
+        vllm_port = None
+        if args.vllm_port_base is not None:
+            vllm_port = args.vllm_port_base + device_id * args.vllm_port_stride
         if args.mock_engine:
             actor = EngineWorker.remote(
                 args.model_name,
@@ -3517,6 +3544,7 @@ def start_engine(clients: list):
                 mock_engine=True,
                 device_id=device_id,
                 tensor_parallel_size=args.tensor_parallel_size,
+                vllm_port=vllm_port,
                 execplan_bus=execplan_bus_actor,
                 output_queue = output_queue
             )
@@ -3527,6 +3555,7 @@ def start_engine(clients: list):
                 args.mock_connector,
                 device_id=device_id,
                 tensor_parallel_size=args.tensor_parallel_size,
+                vllm_port=vllm_port,
                 execplan_bus=execplan_bus_actor,
                 output_queue = output_queue 
             )

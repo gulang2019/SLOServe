@@ -435,6 +435,30 @@ def ensure_prompts_present(requests: List[Request], model_name: str) -> None:
         for i, req_idx in enumerate(indices):
             requests[req_idx].prompt = decoded_batch[i]
 
+async def _wait_for_server_ready(
+    endpoint: str,
+    timeout_s: float = 30.0,
+    interval_s: float = 0.25,
+) -> None:
+    deadline = time.time() + timeout_s
+    last_error: Exception | None = None
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        while time.time() < deadline:
+            try:
+                response = await client.get(f"{endpoint}/health_check")
+                if response.status_code == 200:
+                    return
+            except Exception as exc:
+                last_error = exc
+            await asyncio.sleep(interval_s)
+    if last_error is not None:
+        raise RuntimeError(
+            f"Server at {endpoint} did not become ready within {timeout_s}s"
+        ) from last_error
+    raise RuntimeError(
+        f"Server at {endpoint} did not become ready within {timeout_s}s"
+    )
+
 async def main(problem: Problem, endpoint: str, clients: str | None):
     window_start, window_end = problem.window.split(':')
     arrival_times = ArrivalTimes.load(problem.arrival_pattern, 
@@ -451,7 +475,41 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
         req.cached_length = 0
     requests = requests.requests
     arrival_times = arrival_times.arrival_times
-    arrival_times = [t - arrival_times[0] for t in arrival_times]
+    arrival_base_time = arrival_times[0]
+    requested_n_devices = problem.n_devices
+    original_request_count = len(requests)
+    effective_n_devices, rr_sliced = _resolve_rr_effective_n_devices(
+        requested_n_devices,
+        problem.routing_policy,
+        problem.routing_kwargs,
+        clients,
+    )
+    if rr_sliced:
+        requests, arrival_times, _ = _slice_rr_workload(
+            requests,
+            arrival_times,
+            requested_n_devices,
+            effective_n_devices,
+        )
+        routing_kwargs = _routing_kwargs_to_dict(problem.routing_kwargs)
+        if "group_size" in routing_kwargs:
+            routing_kwargs["group_size"] = min(
+                int(routing_kwargs["group_size"]),
+                effective_n_devices,
+            )
+        problem.routing_kwargs = routing_kwargs
+        problem.n_devices = effective_n_devices
+        problem.store_prefix = (
+            f"{problem.store_prefix}_rrslice_eff{effective_n_devices}"
+        )
+        print(
+            "RR slicing enabled:",
+            f"requested_n_devices={requested_n_devices}",
+            f"effective_n_devices={effective_n_devices}",
+            f"kept_requests={len(requests)}",
+            f"original_requests={original_request_count}",
+        )
+    arrival_times = [t - arrival_base_time for t in arrival_times]
     rps = len(arrival_times) / (arrival_times[-1] - arrival_times[0])
     
     from SLOsServe.perf_model import PerfModel
@@ -494,8 +552,7 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
         # await session.post(endpoint + "/warmup", json={'model': problem.model_name})
         response = await session.post(endpoint + "/update_config", json=asdict(problem))
         response.raise_for_status()
-        # exit(0)
-    time.sleep(10)
+    await _wait_for_server_ready(endpoint)
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(
@@ -726,6 +783,11 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
                                     n_device = problem.n_devices,
                                     draw = True)
     results['rps'] = rps
+    results['requested_n_device'] = requested_n_devices
+    results['effective_n_device'] = problem.n_devices
+    results['rr_sliced'] = rr_sliced
+    results['rr_slice_kept_request_count'] = len(requests)
+    results['rr_slice_total_request_count'] = original_request_count
     if os.path.exists(admission_filename):
         with open(admission_filename, 'r') as f:
             admission_history = json.load(f)
@@ -801,6 +863,73 @@ def _normalize_router_clients_arg(clients_arg: str | None) -> str | None:
     if all(token.isdigit() for token in tokens) and int(tokens[0]) < 10:
         return ",".join(f"r{int(token)}" for token in tokens)
     return ",".join(tokens)
+
+
+def _count_router_clients_arg(clients_arg: str | None) -> int | None:
+    if clients_arg is None:
+        return None
+    tokens = [token.strip() for token in clients_arg.split(",") if token.strip()]
+    if not tokens:
+        return None
+    return len(tokens)
+
+
+def _routing_kwargs_to_dict(
+    routing_kwargs: dict[str, Any] | str | None,
+) -> dict[str, Any]:
+    if routing_kwargs is None:
+        return {}
+    if isinstance(routing_kwargs, str):
+        return json.loads(routing_kwargs)
+    return dict(routing_kwargs)
+
+
+def _supports_rr_workload_slicing(
+    routing_policy: str,
+    routing_kwargs: dict[str, Any] | str | None,
+) -> bool:
+    if routing_policy not in {"round_robin", "round_robin_retry"}:
+        return False
+    return not _routing_kwargs_to_dict(routing_kwargs).get("is_pd_disagg", False)
+
+
+def _resolve_rr_effective_n_devices(
+    requested_n_devices: int,
+    routing_policy: str,
+    routing_kwargs: dict[str, Any] | str | None,
+    clients_arg: str | None,
+) -> tuple[int, bool]:
+    if not _supports_rr_workload_slicing(routing_policy, routing_kwargs):
+        return requested_n_devices, False
+    available_clients = _count_router_clients_arg(clients_arg)
+    if available_clients is None or available_clients <= 0:
+        return requested_n_devices, False
+    if available_clients >= requested_n_devices:
+        return requested_n_devices, False
+    return available_clients, True
+
+
+def _slice_rr_workload(
+    requests: list[Any],
+    arrival_times: list[float],
+    requested_n_devices: int,
+    effective_n_devices: int,
+) -> tuple[list[Any], list[float], list[int]]:
+    assert len(requests) == len(arrival_times), (
+        f"{len(requests)=} != {len(arrival_times)=}")
+    if effective_n_devices >= requested_n_devices:
+        kept_indices = list(range(len(requests)))
+        return list(requests), list(arrival_times), kept_indices
+
+    kept_indices = [
+        idx for idx in range(len(requests))
+        if idx % requested_n_devices < effective_n_devices
+    ]
+    return (
+        [requests[idx] for idx in kept_indices],
+        [arrival_times[idx] for idx in kept_indices],
+        kept_indices,
+    )
 
 
 def build_problems(
@@ -1294,7 +1423,8 @@ def run(
             results = {
                 (
                     r['load_scale'],
-                    r['n_device'],
+                    r.get('requested_n_device', r['n_device']),
+                    r.get('effective_n_device', r['n_device']),
                     r.get('tensor_parallel_size', 1),
                     r['scheduling_policy'],
                     r['routing_policy'],
@@ -1316,9 +1446,16 @@ def run(
         if n_device == 1 and 'disaggregated' in routing_policy:
             print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot} because n_device is 1 and routing policy is disaggregated')
             continue
+        effective_n_device, _ = _resolve_rr_effective_n_devices(
+            n_device,
+            routing_policy,
+            None,
+            clients,
+        )
         cache_key = (
             load_scale,
             n_device,
+            effective_n_device,
             tensor_parallel_size,
             scheduling_policy,
             routing_policy,
@@ -1360,12 +1497,18 @@ def run(
             exec_result = asyncio.run(main(problem, endpoint, clients))
             run_results.append(exec_result)
         best_result = max(run_results, key = lambda x: x.profit)
+        requested_n_device = best_result.results.get('requested_n_device', n_device)
+        effective_n_device = best_result.results.get('effective_n_device', n_device)
         result = {
             'load_scale': load_scale,
             'rps': best_result.results['rps'],
-            'n_device': n_device,
+            'n_device': effective_n_device,
+            'requested_n_device': requested_n_device,
+            'effective_n_device': effective_n_device,
+            'rr_sliced': best_result.results.get('rr_sliced', False),
             'tensor_parallel_size': tensor_parallel_size,
-            'total_gpus': n_device * tensor_parallel_size,
+            'total_gpus': effective_n_device * tensor_parallel_size,
+            'requested_total_gpus': requested_n_device * tensor_parallel_size,
             'scheduling_policy': scheduling_policy,
             'routing_policy': routing_policy,
             'profit': best_result.profit,
@@ -1379,6 +1522,10 @@ def run(
             'per_gpu_energy_consumption': best_result.per_gpu_energy_consumption,
             'scheduling_overhead': slo_routing_overhead,
             'burstiness_level': burstiness_level,
+            'rr_slice_kept_request_count': best_result.results.get(
+                'rr_slice_kept_request_count'),
+            'rr_slice_total_request_count': best_result.results.get(
+                'rr_slice_total_request_count'),
         }
         if 'auto_scaling_analysis' in best_result.results:
             result.update(best_result.results['auto_scaling_analysis'])
