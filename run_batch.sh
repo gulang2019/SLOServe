@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+EXPERIMENT_NAME="emulation_0316"
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -53,7 +55,8 @@ make_run_key() {
   shift 3
   local devices=("$@")
 
-  printf '%s|%s|%s|%s|%s\n' \
+  printf '%s|%s|%s|%s|%s|%s\n' \
+    "$EXPERIMENT_NAME" \
     "$length_trace" \
     "$arrival_trace" \
     "$policy" \
@@ -158,8 +161,9 @@ run_suite() {
         --model_name Qwen/Qwen2.5-7B-Instruct
         --port 8000
         --clients 0-31
-        --output_dir experiments_emulation_0313
+        --output_dir experiments_"$EXPERIMENT_NAME"
         --routing_overhead -1.0
+        --routing_fallback_policy reject
       )
 
       printf -v cmd_str '%q ' "${cmd[@]}"
@@ -186,30 +190,39 @@ run_suite() {
 }
 
 POLICIES=(
-  "slosserve_planner:atfc"
-  "round_robin:atfc"
   "round_robin:sarathi+"
+  "llumnix_load:sarathi+"
+  "round_robin:atfc"
+  "slosserve_planner:atfc"
+  "round_robin-disagg:sarathi+"
+  "llumnix_load-disagg:sarathi+"
+  "round_robin-disagg:atfc"
+  "slosserve_disagg_planner:atfc"
+  # "round_robin-disagg:atfc"
 )
 
 TRACES=(
+  azure_chat:azure_chat
+  azure_code_23:azure_code_23
   sharegpt_code:azure_code_23
-  sharegpt_chat:azure_chat_23
   azure_chat_23:azure_chat_23
+  sharegpt_chat:azure_chat_23
   sharegpt_code:azure_code
   azure_code:azure_code
   sharegpt_chat:azure_chat
-  azure_chat:azure_chat
+  reasoning:azure_chat_23
 )
 
 declare -A configs=(
-  # ["azure_code_23:azure_code_23"]="t0:600 1.0 4 8 12 16 32"
-  ["sharegpt_code:azure_code_23"]="t0:600 1.0 2 4 6 8"
-  ["azure_chat_23:azure_chat_23"]="t0:600 1.0 2 4 6 8"
-  ["sharegpt_chat:azure_chat_23"]="t0:600 1.0 2 4 6 8"
-  ["azure_code:azure_code"]="t0:600 1.0 4 8 12 16 32"
-  ["sharegpt_code:azure_code"]="t0:600 1.0 4 8 12 16 32"
-  ["azure_chat:azure_chat"]="t0:600 1.0 4 8 12 16 32"
-  ["sharegpt_chat:azure_chat"]="t0:600 1.0 4 8 12 16 32"
+  ["azure_code_23:azure_code_23"]="t1200:1800 1.0 4 8 12 16 32"
+  ["sharegpt_code:azure_code_23"]="t1200:1800 1.0 2 4 6 8"
+  ["azure_chat_23:azure_chat_23"]="t1200:1800 1.0 2 4 6 8"
+  ["sharegpt_chat:azure_chat_23"]="t1200:1800 1.0 2 4 6 8"
+  ["azure_code:azure_code"]="t1200:1800 1.0 4 8 12 16 32"
+  ["sharegpt_code:azure_code"]="t1200:1800 1.0 4 8 12 16 32"
+  ["azure_chat:azure_chat"]="t1200:1800 1.0 4 8 12 16 32"
+  ["sharegpt_chat:azure_chat"]="t1200:1800 1.0 4 8 12 16 32"
+  ["reasoning:azure_chat_23"]="t1200:1800 1.0 4 8 12 16 32"
 )
 
 run_suite
