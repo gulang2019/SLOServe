@@ -14,6 +14,32 @@ from SLOsServe.router.mock_engine import (_get_scheduler_exec_plan_snapshot,
                                           _get_scheduler_load_stats_snapshot)
 
 
+def _make_router_request(request_id: str, *, session_id: str | None = None,
+                         cached_tokens: int = 0):
+    payload = {
+        "model": "test-model",
+        "prompt": [1, 2, 3],
+        "max_tokens": 8,
+        "stream": True,
+        "vllm_xargs": {
+            "input_length": 64,
+            "output_length": 8,
+            "prefill_ddl": 50.0,
+            "profit": 1.0,
+            "slo_tpot": 0.05,
+            "cached_tokens": cached_tokens,
+        },
+    }
+    if session_id is not None:
+        payload["vllm_xargs"]["session_id"] = session_id
+    return api_server_ray.RequestInstance(
+        request_id=request_id,
+        payload=payload,
+        response_queue=None,
+        arrival_time=0.0,
+    )
+
+
 def test_make_engine_state_entry_defaults_load_stats():
     plan = ExecPlan()
 
@@ -217,7 +243,7 @@ def test_slosserve_router_run_with_planner_passes_engine_state():
 
     router._run_pre_adm_planner = fake_run_pre_adm_planner
 
-    waiting_request = SimpleNamespace(prefill_device_id=-1)
+    waiting_request = SimpleNamespace(prefill_device_id=-1, session_id=None)
 
     api_server_ray.SLOsServeRouter.run_with_planner(router,
                                                     [waiting_request], [])
@@ -273,3 +299,88 @@ def test_slosserve_router_applies_perf_model_err_to_control_model(monkeypatch):
     assert len(captured_hardware_params) == 2
     for hardware_params in captured_hardware_params:
         assert hardware_params == pytest.approx(expected_params)
+
+
+def test_slosserve_router_run_with_planner_prefers_session_home_device():
+    router = api_server_ray.SLOsServeRouter.__new__(api_server_ray.SLOsServeRouter)
+    router.n_devices = 2
+    router.n_group = 2
+    router.group_size = 1
+    router.is_pd_disagg = False
+    router.group_idx = 1
+    router._session_prefill_device_map = {"session-1": 0}
+    router._session_decode_device_map = {"session-1": 0}
+
+    engine_state = api_server_ray.EngineState(next_batch_time=1.0,
+                                              num_free_blocks=5)
+    router.get_engine_states = lambda: {0: engine_state, 1: engine_state}
+
+    captured: dict[str, object] = {}
+
+    def fake_run_pre_adm_planner(did, running_requests, waiting_requests,
+                                 engine_state, mode):
+        if waiting_requests:
+            captured["did"] = did
+            captured["waiting_requests"] = waiting_requests
+        return []
+
+    router._run_pre_adm_planner = fake_run_pre_adm_planner
+
+    waiting_request = _make_router_request("req-0", session_id="session-1",
+                                           cached_tokens=16)
+
+    api_server_ray.SLOsServeRouter.run_with_planner(router,
+                                                    [waiting_request], [])
+
+    assert captured["did"] == 0
+    assert captured["waiting_requests"] == [waiting_request]
+
+
+def test_slosserve_router_pre_adm_planner_uses_cached_tokens_on_home_device(
+    monkeypatch,
+):
+    router = api_server_ray.SLOsServeRouter.__new__(api_server_ray.SLOsServeRouter)
+    router.ablation = False
+    router.kv_xfer_delay = 0.05
+    router.block_size = 16
+    router.max_decode_length = 32
+    router.oracle_mem = False
+    router.is_pd_disagg = False
+    router._session_prefill_device_map = {"session-hit": 1}
+    router._session_decode_device_map = {"session-hit": 1}
+
+    captured: dict[str, object] = {}
+
+    class FakeCRequest:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeAdmPlanner:
+        def adm_ctrl(self, c_reqs, num_free_blocks, now):
+            captured["c_reqs"] = c_reqs
+            return True, [False for _ in c_reqs]
+
+    monkeypatch.setattr(api_server_ray.SLOsServe_C, "Request", FakeCRequest)
+    router.adm_planner = FakeAdmPlanner()
+
+    hit_request = _make_router_request("req-hit", session_id="session-hit",
+                                       cached_tokens=16)
+    miss_request = _make_router_request("req-miss", session_id="session-miss",
+                                        cached_tokens=16)
+
+    router._run_pre_adm_planner(
+        did=1,
+        running_requests=[],
+        waiting_requests=[hit_request, miss_request],
+        engine_state=api_server_ray.EngineState(next_batch_time=0.0,
+                                                num_free_blocks=128),
+        mode="normal",
+    )
+
+    c_reqs = captured["c_reqs"]
+    assert c_reqs[0].id == "req-hit"
+    assert c_reqs[0].n_computed_tokens == 16
+    assert c_reqs[0].mem == 5
+    assert c_reqs[1].id == "req-miss"
+    assert c_reqs[1].n_computed_tokens == 0
+    assert c_reqs[1].mem == 6

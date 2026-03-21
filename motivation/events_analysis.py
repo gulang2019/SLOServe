@@ -194,6 +194,7 @@ class RouterArrival(Event):
     profit: float
     prompt_tokens: int
     max_tokens: int
+    num_cached_tokens: int = 0
     zero_load_ttft: float = 0
     
 @dataclass(kw_only=True)
@@ -539,6 +540,7 @@ def analyze_events(filepath, start_time = None, verbose = False):
                 req.prefill_device_id = event.prefill_device_id
                 req.decode_device_id = event.decode_device_id
             if event.event_type == 'arrival-router':
+                req.num_cached_tokens = max(req.num_cached_tokens, event.num_cached_tokens)
                 req.prompt_tokens = event.prompt_tokens
                 req.output_tokens = event.max_tokens
             if event.event_type == 'arrival':
@@ -1471,6 +1473,8 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
                           slo_tpot: float,
                           length_pattern: str,
                           slo_ttft_overhead: float = 0.0,
+                          slo_ttft_per_token: float | None = None,
+                          slo_ttft_constant: float | None = None,
                           routing_overhead: float = -1.0,
                           n_device: int = -1,
                           prefix = 'trace_analysis',
@@ -1492,7 +1496,14 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
         print('total_lengths', np.percentile(total_lengths, 99))
     
     perf_model = PerfModel.get_perf_model(model_name, length_pattern)
-    slo_ttft_fn = lambda req: req.zero_load_ttft * ttft_slo_scale + slo_ttft_overhead
+    if slo_ttft_per_token is not None and slo_ttft_constant is not None:
+        slo_ttft_fn = lambda req: (
+            float(slo_ttft_constant)
+            + float(slo_ttft_per_token) * max(req.prompt_tokens - req.num_cached_tokens, 0)
+            + float(slo_ttft_overhead)
+        )
+    else:
+        slo_ttft_fn = lambda req: req.zero_load_ttft * ttft_slo_scale + slo_ttft_overhead
     # slo_ttft_fn = lambda req: req.prefill_ddl - req.arrival_time 
     events = []
     

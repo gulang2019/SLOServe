@@ -155,6 +155,7 @@ class Request:
     input_length: int 
     output_length: int 
     cached_length: int = 0
+    session_id: Optional[str] = None
     
     prompt: Optional[str] = None 
     thinking: Optional[str] = None 
@@ -220,15 +221,15 @@ class Requests:
             r.prompt = text
 
         return reqs
-    
+
     @staticmethod
     def merge(requests1: 'Requests', requests2: 'Requests'):
         return Requests(f'{requests1.name}-{requests2.name}', requests1.requests + requests2.requests)
-    
+
     @staticmethod
     @lru_cache(maxsize=None)
-    def load(name: str, max_tokens: int = None, window_start: int = 0, window_end: int = None): 
-        if window_start is not None: 
+    def load(name: str, max_tokens: int = None, window_start: int = 0, window_end: int = None) -> 'Requests':
+        if window_start is not None:
             window_start = int(window_start)
         if window_end is not None: window_end = int(window_end)
         path = os.path.join(DATASET_DIR, f'{name}.requests.pkl')
@@ -323,7 +324,7 @@ class ArrivalTimes:
     
     @staticmethod
     @lru_cache(maxsize=None)
-    def load(name: str, load_scale: float = 1, window_start: int = 0, window_end: int = None):
+    def load(name: str, load_scale: float = 1, window_start: int = 0, window_end: int = None) -> 'ArrivalTimes':
         use_timing = False 
         if isinstance(window_start, str): 
             if window_start.startswith('t'):

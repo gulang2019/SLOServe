@@ -744,6 +744,17 @@ class RequestInstance:
     def num_prompt_tokens(self):
         return self.payload['vllm_xargs']['input_length']
 
+    @property
+    def session_id(self) -> str | None:
+        return self.payload.get('vllm_xargs', {}).get('session_id')
+
+    @property
+    def cached_tokens(self) -> int:
+        try:
+            return max(0, int(self.payload.get('vllm_xargs', {}).get('cached_tokens', 0)))
+        except (TypeError, ValueError):
+            return 0
+
     
     @property
     def is_slo_violation(self):
@@ -1021,6 +1032,11 @@ class LoadStat:
         self.version_id += 1
 
 class Router(ABC):
+    def _ensure_session_maps(self):
+        if not hasattr(self, "_session_prefill_device_map"):
+            self._session_prefill_device_map: dict[str, int] = {}
+            self._session_decode_device_map: dict[str, int] = {}
+
     def set_load_stat(self, load_stat: LoadStat):
         self.load_stat = load_stat
     
@@ -1044,6 +1060,30 @@ class Router(ABC):
         Optional update for the router to keep track of the request state.
         '''
         pass
+
+    def get_session_home_prefill_device(self, session_id: str | None) -> int | None:
+        if not session_id:
+            return None
+        self._ensure_session_maps()
+        return self._session_prefill_device_map.get(session_id)
+
+    def get_session_home_decode_device(self, session_id: str | None) -> int | None:
+        if not session_id:
+            return None
+        self._ensure_session_maps()
+        return self._session_decode_device_map.get(session_id)
+
+    def note_request_state(self, request: RequestInstance, new_state: RequestState):
+        session_id = request.session_id
+        if not session_id:
+            return
+        if new_state not in (RequestState.PREFILL_FINISHED, RequestState.DECODE_FINISHED):
+            return
+        self._ensure_session_maps()
+        if request.prefill_device_id >= 0:
+            self._session_prefill_device_map[session_id] = request.prefill_device_id
+        if request.decode_device_id >= 0:
+            self._session_decode_device_map[session_id] = request.decode_device_id
 
     def update_json(self, request_json: dict, i: int):
         '''
@@ -1194,6 +1234,7 @@ class RoundRobinRouter(Router):
     def __init__(self, n_devices: int, router_kwargs: dict):
         self.n_devices = n_devices
         self.group_i = 0
+        self.sticky_sessions = bool(router_kwargs.get('sticky_sessions', False))
         self.is_pd_disagg = router_kwargs.get('is_pd_disagg', False)
         self.group_size = router_kwargs.get('group_size', self.n_devices)
         assert self.n_devices % self.group_size == 0
@@ -1211,6 +1252,17 @@ class RoundRobinRouter(Router):
         # if not self.is_pd_disagg:
         for request in waiting_requests:
             request.admitted = True
+            if self.sticky_sessions and request.session_id:
+                home_prefill = self.get_session_home_prefill_device(request.session_id)
+                if home_prefill is not None:
+                    request.prefill_device_id = home_prefill
+                    if not self.is_pd_disagg:
+                        request.decode_device_id = home_prefill
+                    else:
+                        home_decode = self.get_session_home_decode_device(request.session_id)
+                        if home_decode is not None:
+                            request.decode_device_id = home_decode
+                    continue
             group_i = self.group_i
             idx = self.per_group_indices[group_i]
             request.prefill_device_id = group_i * self.group_size + idx 
@@ -1623,6 +1675,25 @@ class SLOsServeRouter(Router):
         prefill_mem = math.ceil(input_length / self.block_size)
         mem = math.ceil((input_length + self._get_decode_length_ub(request)) / self.block_size)
         return prefill_ddl, input_length, profit, prefill_mem, mem
+
+    def _effective_cached_tokens(
+        self,
+        request: RequestInstance,
+        did: int,
+        mode: str = 'normal',
+    ) -> int:
+        if mode == 'decode_only':
+            return 0
+        cached_tokens = min(request.cached_tokens, request.num_prompt_tokens)
+        if cached_tokens <= 0:
+            return 0
+        session_id = request.session_id
+        if not session_id:
+            return 0
+        home_prefill_device = self.get_session_home_prefill_device(session_id)
+        if home_prefill_device != did:
+            return 0
+        return cached_tokens
     
     def _run_pre_adm_planner(
         self, 
@@ -1676,9 +1747,10 @@ class SLOsServeRouter(Router):
                 continue
             prefill_ddl, input_length, profit, prefill_mem, _ = self.get_req_data(req)
             if mode == 'prefill_only': prefill_ddl -= self.kv_xfer_delay
-            num_computed = req.num_prompt_tokens if mode == 'decode_only' else 0
+            num_computed = req.num_prompt_tokens if mode == 'decode_only' else self._effective_cached_tokens(req, did, mode)
             decode_length_ub = self._get_decode_length_ub(req)
-            n_block_ub = math.ceil((req.num_prompt_tokens + decode_length_ub) / self.block_size)
+            remaining_prompt_tokens = max(req.num_prompt_tokens - num_computed, 0)
+            n_block_ub = math.ceil((remaining_prompt_tokens + decode_length_ub) / self.block_size)
             c_reqs.append(
                 SLOsServe_C.Request(
                     id=req.request_id,
@@ -1949,8 +2021,12 @@ class SLOsServeRouter(Router):
             did = None 
             if not self.is_pd_disagg or req.is_prefill:
                 if req.prefill_device_id == -1:
-                    did = self.group_idx * self.group_size
-                    self.group_idx = (self.group_idx + 1) % self.n_group
+                    home_prefill_device = self.get_session_home_prefill_device(req.session_id)
+                    if home_prefill_device is not None:
+                        did = home_prefill_device
+                    else:
+                        did = self.group_idx * self.group_size
+                        self.group_idx = (self.group_idx + 1) % self.n_group
                 elif (req.prefill_device_id + 1) % self.group_size: 
                     did = req.prefill_device_id + 1
                 else:
@@ -2045,13 +2121,15 @@ class SLOsServeRouter(Router):
             if req.admitted: continue
             prefill_ddl, input_length, profit, prefill_mem, mem = self.get_req_data(req)
             decode_length_ub = self._get_decode_length_ub(req)
-            n_block_ub = math.ceil((req.num_prompt_tokens + decode_length_ub) / self.block_size)
+            num_computed_tokens = self._effective_cached_tokens(req, did, 'prefill_only' if prefill_only else 'normal')
+            remaining_prompt_tokens = max(req.num_prompt_tokens - num_computed_tokens, 0)
+            n_block_ub = math.ceil((remaining_prompt_tokens + decode_length_ub) / self.block_size)
             c_req = SLOsServe_C.Request(
                 id = req.request_id,
                 is_new_req = True,
                 ddl = prefill_ddl,
                 input_length = input_length,
-                n_computed_tokens = 0,
+                n_computed_tokens = num_computed_tokens,
                 profit = profit,
                 mem = n_block_ub,
                 tpot_idx = 0,
@@ -2195,9 +2273,13 @@ class SLOsServeRouter(Router):
         device_to_waiting_reqs = [[] for i in range(self.n_devices)]
         for req in waiting_requests: 
             if req.prefill_device_id == -1: 
-                did = self.group_idx * self.group_size + self.lb_indices_per_group[self.group_idx]
-                self.lb_indices_per_group[self.group_idx] = (self.lb_indices_per_group[self.group_idx] + 1) % self.n_lb
-                self.group_idx = (self.group_idx + 1) % self.n_group
+                home_prefill_device = self.get_session_home_prefill_device(req.session_id)
+                if home_prefill_device is not None:
+                    did = home_prefill_device
+                else:
+                    did = self.group_idx * self.group_size + self.lb_indices_per_group[self.group_idx]
+                    self.lb_indices_per_group[self.group_idx] = (self.lb_indices_per_group[self.group_idx] + 1) % self.n_lb
+                    self.group_idx = (self.group_idx + 1) % self.n_group
             else:
                 if ((req.prefill_device_id % self.group_size) < self.n_lb) and (self.n_lb < self.n_prefill_or_mixed_per_group):
                     did = (req.prefill_device_id // self.group_size * self.group_size) + self.n_lb
@@ -2589,6 +2671,7 @@ class RequestPool:
         response_queue = Queue()
         current_time = time.time()
         request_id = request_json['vllm_xargs'].get('request_id', str(uuid.uuid4()))
+        request_json['vllm_xargs']['cached_tokens'] = int(request_json['vllm_xargs'].get('cached_tokens', 0) or 0)
         request_json['vllm_xargs']['router_arrival_time'] = current_time
         if 'prefill_ddl' not in request_json['vllm_xargs']:
             request_json['vllm_xargs']['prefill_ddl'] = current_time + request_json['vllm_xargs']['slo_ttft']
@@ -2606,7 +2689,11 @@ class RequestPool:
             "prefill_ddl": request_json['vllm_xargs'].get('prefill_ddl', 0),
             "profit": request_json['vllm_xargs'].get('profit', 1),
             "prompt_tokens": request_json['vllm_xargs'].get('input_length', 0),
+            "num_cached_tokens": request_json['vllm_xargs'].get('cached_tokens', 0),
             "max_tokens": request_json['max_tokens'],
+            "extra_args": {
+                "session_id": request_json['vllm_xargs'].get('session_id'),
+            },
         })
 
         async def gen():
@@ -2642,6 +2729,7 @@ class RequestPool:
 
     def update_req_state(self, request: RequestInstance, state: RequestState):
         self.router.update(request, state)
+        self.router.note_request_state(request, state)
         request.state = state
         self.changed_requests.add(request)
 

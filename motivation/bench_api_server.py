@@ -214,6 +214,8 @@ class Problem:
     slo_ttft_constant: float = 0.1
     slo_tpot: float = 0.05
     slo_routing_overhead: float = 0.16
+    enable_session_replay: bool = False
+    session_pause_s: float = 0.0
      
     # profit model 
     profit_per_input_token: float = 0.0
@@ -238,6 +240,85 @@ class Problem:
 
     def get_expected_profit(self, input_length: int):
         return float(self.profit_per_input_token * input_length + self.profit_per_output_token * average_output_length + self.profit_base)
+
+
+def compute_ttft_slo(
+    prompt_tokens: int,
+    cached_tokens: int,
+    *,
+    slo_ttft_per_token: float,
+    slo_ttft_constant: float,
+    slo_routing_overhead: float,
+) -> float:
+    new_tokens = max(int(prompt_tokens) - int(cached_tokens), 0)
+    return (
+        float(slo_ttft_constant)
+        + float(slo_ttft_per_token) * new_tokens
+        + float(slo_routing_overhead)
+    )
+
+
+def _build_request_payload(
+    *,
+    model_name: str,
+    prompt: str | list[int],
+    input_length: int,
+    output_length: int,
+    zero_load_ttft: float,
+    cached_tokens: int,
+    session_id: str | None,
+    ttft_slo: float,
+    slo_tpot: float,
+    expected_profit: float,
+    request_id: str,
+) -> dict[str, Any]:
+    vllm_xargs = {
+        'input_length': input_length,
+        'output_length': output_length,
+        'zero_load_ttft': zero_load_ttft,
+        'cached_tokens': cached_tokens,
+        'slo_ttft': ttft_slo,
+        'slo_tpot': slo_tpot,
+        'profit': expected_profit,
+        'request_id': request_id,
+    }
+    if session_id is not None:
+        vllm_xargs['session_id'] = session_id
+    return {
+        "model": model_name,
+        "prompt": prompt,
+        "max_tokens": output_length,
+        "stream": True,
+        "ignore_eos": True,
+        "vllm_xargs": vllm_xargs,
+    }
+
+
+def _split_ready_request_indices(
+    pending_indices: list[int],
+    requests: list[Request],
+    elapsed_time: float,
+    session_ready_at: dict[str, float],
+    enable_session_replay: bool,
+) -> tuple[list[int], list[int]]:
+    if not enable_session_replay:
+        return list(pending_indices), []
+
+    ready_indices: list[int] = []
+    blocked_indices: list[int] = []
+    occupied_sessions: set[str] = set()
+    for idx in pending_indices:
+        session_id = getattr(requests[idx], "session_id", None)
+        if not session_id:
+            ready_indices.append(idx)
+            continue
+        ready_at = session_ready_at.get(session_id, 0.0)
+        if session_id in occupied_sessions or elapsed_time < ready_at:
+            blocked_indices.append(idx)
+            continue
+        ready_indices.append(idx)
+        occupied_sessions.add(session_id)
+    return ready_indices, blocked_indices
     
 @dataclass
 class ExecutionResult:
@@ -264,11 +345,13 @@ class ExecutionResults:
     profit: float = field(init=False)
     
     def get_slo_result(self, exec_result: ExecutionResult):
-        from SLOsServe.perf_model import PerfModel
-        perf_model = PerfModel.get_perf_model(self.problem.model_name, self.problem.length_pattern)
-        slo_ttft = perf_model.get_zero_load_ttft(exec_result.request.input_length, 
-                                                 exec_result.request.cached_length) * \
-                    self.problem.ttft_slo_scale + self.problem.slo_routing_overhead
+        slo_ttft = compute_ttft_slo(
+            exec_result.request.input_length,
+            exec_result.request.cached_length,
+            slo_ttft_per_token=self.problem.slo_ttft_per_token,
+            slo_ttft_constant=self.problem.slo_ttft_constant,
+            slo_routing_overhead=self.problem.slo_routing_overhead,
+        )
         # print('slo_ttft', slo_ttft, 'input_length', exec_result.request.input_length)
         expected_finish_time = [exec_result.timestamps[0], exec_result.timestamps[0] + slo_ttft]
         
@@ -315,8 +398,9 @@ async def run_request(client: httpx.AsyncClient,
                     input_length: int,
                     output_length: int,
                     zero_load_ttft: float,
-                    ttft_slo_scale: float,
-                    slo_routing_overhead: float,
+                    cached_tokens: int,
+                    session_id: str | None,
+                    ttft_slo: float,
                     slo_tpot: float, 
                     expected_profit: float,
                     real_arrival_times: dict) -> Tuple[str, List[float]]:
@@ -328,24 +412,19 @@ async def run_request(client: httpx.AsyncClient,
             "Content-Type": "application/json",
             "X-Request-Id": request_id
         }
-        payload = {
-            "model": model_name,
-            "prompt": prompt,
-            "max_tokens": output_length,
-            "stream": True,
-            "ignore_eos": True,
-            # "priority": - prefill_ddl, # higher priority means earlier handling
-            'vllm_xargs': {
-                'input_length': input_length,
-                'output_length': output_length,
-                # 'prefill_ddl': arrival_time + ttft_slo,
-                'zero_load_ttft': zero_load_ttft,
-                'slo_ttft': zero_load_ttft * ttft_slo_scale + slo_routing_overhead,
-                'slo_tpot': slo_tpot,
-                'profit': expected_profit,
-                'request_id': request_id
-            }
-        }
+        payload = _build_request_payload(
+            model_name=model_name,
+            prompt=prompt,
+            input_length=input_length,
+            output_length=output_length,
+            zero_load_ttft=zero_load_ttft,
+            cached_tokens=cached_tokens,
+            session_id=session_id,
+            ttft_slo=ttft_slo,
+            slo_tpot=slo_tpot,
+            expected_profit=expected_profit,
+            request_id=request_id,
+        )
         
         chunks = []
         is_rejected = False
@@ -471,9 +550,7 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
                             window_start = 0,
                             window_end = len(arrival_times.arrival_times),
                             max_tokens = get_model_max_tokens(problem.model_name))
-    for req in requests.requests:
-        req.input_length -= req.cached_length 
-        req.cached_length = 0
+
     requests = requests.requests
     arrival_times = arrival_times.arrival_times
     arrival_base_time = arrival_times[0]
@@ -574,6 +651,7 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
     print(f'global_start_time: {global_start_time}')
     
     tasks = []
+    pending_indices: list[int] = []
     time_offset = 0
     time_offsets = [(global_start_time, 0)]
     timeout = 60
@@ -583,6 +661,7 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
     
     bid_to_id = {}
     timed_out_requests: set[str] = set()
+    session_ready_at: dict[str, float] = {}
     n_rejected = 0
     n_timed_out = 0
     
@@ -591,32 +670,58 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
             elapsed_time = time.time() - global_start_time + time_offset
             
             while arrival_idx < len(requests) and arrival_times[arrival_idx] <= elapsed_time:
-                request = requests[arrival_idx]
+                pending_indices.append(arrival_idx)
+                arrival_bar.update(1)
+                arrival_bar.set_description(f'Arrival Time: {arrival_times[arrival_idx]:.2f}, Elapsed Time: {elapsed_time:.2f}')
+                arrival_idx += 1
+
+            ready_indices, pending_indices = _split_ready_request_indices(
+                pending_indices,
+                requests,
+                elapsed_time,
+                session_ready_at,
+                problem.enable_session_replay,
+            )
+            for request_idx in ready_indices:
+                request = requests[request_idx]
                 assert request.prompt is not None
                 prompt = request.prompt
                 assert prompt is not None
                 task_start_time = time.time()
-                request_id_backend = str(arrival_idx)
-                request_id = str(arrival_idx)
+                request_id_backend = str(request_idx)
+                request_id = str(request_idx)
                 bid_to_id[request_id_backend] = request_id
-                
-                task = asyncio.create_task(run_request(client,
-                                                    request_id_backend,
-                                                    problem.model_name, 
-                                                    prompt,
-                                                    request.input_length,
-                                                    request.output_length,
-                                                    zero_load_ttft = perf_model.get_zero_load_ttft(request.input_length, request.cached_length),
-                                                    ttft_slo_scale = problem.ttft_slo_scale,
-                                                    slo_tpot = problem.slo_tpot,
-                                                    slo_routing_overhead = problem.slo_routing_overhead,
-                                                    expected_profit = problem.get_expected_profit(request.input_length - request.cached_length),
-                                                    real_arrival_times = real_arrival_times))
+                if problem.enable_session_replay and request.session_id:
+                    session_ready_at[request.session_id] = float("inf")
+
+                task = asyncio.create_task(run_request(
+                    client,
+                    request_id_backend,
+                    problem.model_name,
+                    prompt,
+                    request.input_length,
+                    request.output_length,
+                    zero_load_ttft=perf_model.get_zero_load_ttft(
+                        request.input_length,
+                        request.cached_length,
+                    ),
+                    cached_tokens=request.cached_length,
+                    session_id=request.session_id,
+                    ttft_slo=compute_ttft_slo(
+                        request.input_length,
+                        request.cached_length,
+                        slo_ttft_per_token=problem.slo_ttft_per_token,
+                        slo_ttft_constant=problem.slo_ttft_constant,
+                        slo_routing_overhead=problem.slo_routing_overhead,
+                    ),
+                    slo_tpot=problem.slo_tpot,
+                    expected_profit=problem.get_expected_profit(
+                        request.input_length - request.cached_length,
+                    ),
+                    real_arrival_times=real_arrival_times,
+                ))
 
                 tasks.append((task, request, task_start_time, request_id))
-                arrival_bar.update(1)
-                arrival_bar.set_description(f'Arrival Time: {arrival_times[arrival_idx]:.2f}, Elapsed Time: {elapsed_time:.2f}')
-                arrival_idx += 1
                 
             real_time = time.time()
             elapsed_time = real_time - global_start_time + time_offset
@@ -630,6 +735,7 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
 
             for task, request, task_start_time, request_id in tasks:
                 if task.done():
+                    completion_elapsed_time = current_time - global_start_time + time_offset
                     timed_out_before = request_id in timed_out_requests
                     finished_bar.update(1)
                     finished_bar.set_description(f'Finished: {finished_bar.n}, Rejected: {n_rejected}, Timed Out: {n_timed_out}')
@@ -638,6 +744,8 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
                     if task.cancelled():
                         logger.info(f"Request {request_id} cancelled before completion")
                         execution_results.append(ExecutionResult(request, [task_start_time], request_id))
+                        if problem.enable_session_replay and request.session_id:
+                            session_ready_at[request.session_id] = completion_elapsed_time + problem.session_pause_s
                         timed_out_requests.discard(request_id)
                         continue
 
@@ -647,6 +755,8 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
                         logger.error(f"Task for request {request_id} failed: {exc!r}")
                         import traceback
                         logger.error("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+                        if problem.enable_session_replay and request.session_id:
+                            session_ready_at[request.session_id] = completion_elapsed_time + problem.session_pause_s
                         timed_out_requests.discard(request_id)
                         continue
 
@@ -660,6 +770,8 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
                         execution_results.append(ExecutionResult(request, timestamps, request_id))
                         if timed_out_before:
                             logger.info(f"Request {request_id} returned after timeout")
+                        if problem.enable_session_replay and request.session_id:
+                            session_ready_at[request.session_id] = completion_elapsed_time + problem.session_pause_s
                     finally:
                         timed_out_requests.discard(request_id)
 
@@ -670,6 +782,8 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
                     n_timed_out += 1
                     task.cancel()
                     timed_out_requests.add(request_id)
+                    if problem.enable_session_replay and request.session_id:
+                        session_ready_at[request.session_id] = elapsed_time + problem.session_pause_s
                     new_tasks.append((task, request, task_start_time, request_id))
 
                 else:
@@ -779,6 +893,8 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
                                     ttft_slo_scale = problem.ttft_slo_scale, 
                                     slo_tpot = problem.slo_tpot, 
                                     slo_ttft_overhead = problem.slo_routing_overhead,
+                                    slo_ttft_per_token = problem.slo_ttft_per_token,
+                                    slo_ttft_constant = problem.slo_ttft_constant,
                                     prefix = problem.store_prefix, 
                                     routing_overhead = problem.routing_overhead,
                                     n_device = problem.n_devices,
@@ -1075,6 +1191,9 @@ def build_problems(
         profit_base = 0
     
     max_num_batched_tokens_vllm = min(max_decode_batch_size - 10, 16384)
+    ablation_no_global = False
+    ablation_no_local = False
+    oracle_mem = False
     scheduling_kwargss = []
     if scheduling_policy == 'vllm':
         scheduling_kwargss.append({
@@ -1293,10 +1412,22 @@ def build_problems(
         # - slosserve_<n_group>[_<n_lb>]
         # - slosserve[_<n_group>[_<n_lb>]]_(disagg|diagg)_<n_prefill_per_group>
         # - any above + _planner suffix (planner path enabled)
-        # - any above + _ablation suffix (without any global admission)
+        # - any above + _oracle_mem suffix (use per-request decode length for memory bounds)
+        # - any above + _ablation_no_global suffix (without any global admission)
+        # - any above + _ablation_no_local suffix (ATFC accepts regardless of local feasibility)
+        # - plain _ablation is kept as an alias for _ablation_no_global
         # Also accepts '-' as separator.
         logger.info(f'parsing routing policy {routing_policy}')
         normalized_policy = routing_policy.replace('-', '_')
+        if 'oracle_mem' in normalized_policy:
+            oracle_mem = True
+            normalized_policy = normalized_policy.replace('_oracle_mem', '')
+        if 'ablation_no_global' in normalized_policy:
+            ablation_no_global = True
+            normalized_policy = normalized_policy.replace('_ablation_no_global', '')
+        if 'ablation_no_local' in normalized_policy:
+            ablation_no_local = True
+            normalized_policy = normalized_policy.replace('_ablation_no_local', '')
         _args = [x for x in normalized_policy.split('_') if x]
         if not _args or _args[0] != 'slosserve':
             raise ValueError(f"Invalid slosserve routing policy: {routing_policy}")
@@ -1308,9 +1439,8 @@ def build_problems(
         if 'planner' in _args:
             use_planner = True
             _args = [x for x in _args if x != 'planner']
-        ablation = False 
         if 'ablation' in _args:
-            ablation = True 
+            ablation_no_global = True
             _args = [x for x in _args if x != 'ablation']
         disagg_tokens = [tok for tok in ('disagg', 'diagg') if tok in _args]
         if disagg_tokens:
@@ -1339,7 +1469,7 @@ def build_problems(
                 'max_decode_bs': max_num_batched_tokens_vllm,
                 "enable_rerouting": True,
                 'use_planner': use_planner,
-                'ablation': ablation
+                'ablation': ablation_no_global
             }
         else:
             numeric_fields = _args[1:]
@@ -1364,9 +1494,15 @@ def build_problems(
             'group_size': group_size,
             'n_lb': n_lb,
             'use_planner': use_planner,
-            'ablation': ablation
+            'oracle_mem': oracle_mem,
+            'ablation': ablation_no_global
             # 'routing_overhead': slo_routing_overhead
         } | extra_kwargs)
+
+    if scheduling_policy == 'atfc':
+        for sch_kwargs in scheduling_kwargss:
+            sch_kwargs['ablation_no_local'] = ablation_no_local
+            sch_kwargs['oracle_mem'] = oracle_mem
 
     for routing_kwargs in routing_kwargss:
         if isinstance(routing_kwargs, dict):

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Iterable, List, Optional
 import pickle
 import os
 import datasets
@@ -14,19 +14,59 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-tokenizer = AutoTokenizer.from_pretrained('deepseek-ai/DeepSeek-R1')
+tokenizer = None
 
 DATASET_DIR = 'assets/datasets'
 
 os.makedirs(DATASET_DIR, exist_ok=True)
 
+
+def _build_sharegpt_chat_requests(
+    dataset: Iterable[dict],
+    count_length_fn,
+    session_prefix: str = "sharegpt_chat",
+) -> list[Request]:
+    def format_conversation(conversation):
+        return '\n'.join(
+            [f'{item.get("role", "")}: {item.get("content", "")}' for item in conversation]
+        )
+
+    built_requests: list[Request] = []
+    for conv_idx, ex in enumerate(dataset):
+        session_id = f"{session_prefix}-{conv_idx}"
+        for i, item in enumerate(ex['conversation']):
+            if item.get('role') != 'assistant':
+                continue
+            previous_items = ex['conversation'][:i]
+            if i - 2 >= 0:
+                cached_contents = format_conversation(ex['conversation'][:i-2])
+            else:
+                cached_contents = ""
+            prompt = format_conversation(previous_items)
+            response = item.get("content", "")
+            built_requests.append(Request(
+                prompt=prompt,
+                answer=response,
+                cached_length=count_length_fn(cached_contents),
+                input_length=count_length_fn(prompt),
+                output_length=count_length_fn(response),
+                session_id=session_id,
+            ))
+    return built_requests
+
 def download_dataset(dataset_name: str): 
     logger.info(f"Starting download for dataset: {dataset_name}")
+
+    def get_tokenizer():
+        global tokenizer
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained('deepseek-ai/DeepSeek-R1')
+        return tokenizer
 
     def count_length(text: str): 
         if text is None:
             return 0
-        length = len(tokenizer.encode(text))
+        length = len(get_tokenizer().encode(text))
         logger.debug(f"Counted {length} tokens for text: {text[:50]}..." if text else "None")
         return length
     
@@ -159,44 +199,7 @@ def download_dataset(dataset_name: str):
         dataset = dataset['train']
         dataset = dataset.select(range(3000))
         logger.info(f"Loaded dataset with {len(dataset)} examples.")
-        def format_conversation(conversation):
-            return '\n'.join([f'{item.get("role", "")}: {item.get("content", "")}' for item in conversation])
-
-        # Collect all valid conversations first
-        valid_conversations = []
-        for idx, ex in enumerate(dataset):
-            for i, item in enumerate(ex['conversation']):
-                if item['role'] == 'assistant':
-                    previous_items = ex['conversation'][:i]
-                    if i - 2 >= 0:
-                        cached_contents = format_conversation(ex['conversation'][:i-2])
-                    else: 
-                        cached_contents = ""
-                    prompt = format_conversation(previous_items)
-                    response = item.get("content", "")
-                    valid_conversations.append((cached_contents, prompt, response))
-
-        # Process conversations in parallel
-        import concurrent.futures
-        def create_sharegpt_request(prompt_response):
-            cached_contents, prompt, response = prompt_response
-            return Request(
-                prompt=prompt,
-                answer=response,
-                cached_length = count_length(cached_contents),
-                input_length=count_length(prompt),
-                output_length=count_length(response)
-            )
-
-        logger.info("Creating Request objects in parallel...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            request_futures = [executor.submit(create_sharegpt_request, conv) for conv in valid_conversations]
-
-            for idx, future in enumerate(concurrent.futures.as_completed(request_futures)):
-                if idx % 1000 == 0 and idx > 0:
-                    logger.info(f"Processed {idx} requests so far...")
-                requests.append(future.result())
-            random.shuffle(requests)
+        requests = _build_sharegpt_chat_requests(dataset, count_length)
         logger.info(f"Finished processing all requests for {dataset_name}.")
     elif dataset_name == 'sharegpt_code':
         dataset_id = 'QuixiAI/Code-290k-ShareGPT-Vicuna'
