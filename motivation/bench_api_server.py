@@ -812,6 +812,13 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
     if energy_consumption is None:
         per_gpu_energy_consumption, energy_consumption = summarize_energy_events(
             events)
+    results, energy_consumption = _scale_rr_energy_results(
+        results=results,
+        energy_consumption=energy_consumption,
+        requested_n_devices=requested_n_devices,
+        effective_n_devices=problem.n_devices,
+        rr_sliced=rr_sliced,
+    )
     results =  ExecutionResults(
         problem,
         execution_results,
@@ -930,6 +937,45 @@ def _slice_rr_workload(
         [arrival_times[idx] for idx in kept_indices],
         kept_indices,
     )
+
+
+def _rr_slice_energy_multiplier(
+    requested_n_devices: int,
+    effective_n_devices: int,
+    rr_sliced: bool,
+) -> float:
+    if not rr_sliced:
+        return 1.0
+    if effective_n_devices <= 0 or effective_n_devices >= requested_n_devices:
+        return 1.0
+    return requested_n_devices / effective_n_devices
+
+
+def _scale_rr_energy_results(
+    results: dict[str, Any],
+    energy_consumption: float,
+    requested_n_devices: int,
+    effective_n_devices: int,
+    rr_sliced: bool,
+) -> tuple[dict[str, Any], float]:
+    multiplier = _rr_slice_energy_multiplier(
+        requested_n_devices=requested_n_devices,
+        effective_n_devices=effective_n_devices,
+        rr_sliced=rr_sliced,
+    )
+    if multiplier == 1.0:
+        return results, float(energy_consumption)
+
+    scaled_results = dict(results)
+    extra_metrics = scaled_results.get("extra_metrics")
+    if isinstance(extra_metrics, dict):
+        scaled_extra_metrics = dict(extra_metrics)
+        if "energy_est" in scaled_extra_metrics:
+            scaled_extra_metrics["energy_est"] = (
+                float(scaled_extra_metrics["energy_est"]) * multiplier
+            )
+        scaled_results["extra_metrics"] = scaled_extra_metrics
+    return scaled_results, float(energy_consumption) * multiplier
 
 
 def build_problems(
