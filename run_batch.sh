@@ -137,15 +137,15 @@ policy_supports_partial_rr() {
   [[ "$routing" == "round_robin" || "$routing" == "round_robin_retry" ]]
 }
 
-max_requested_devices() {
-  local max=0
+filter_compatible_devices() {
+  local available_clients="$1"
+  shift
   local value
   for value in "$@"; do
-    if ((value > max)); then
-      max="$value"
+    if ((value <= available_clients)); then
+      printf '%s\n' "$value"
     fi
   done
-  echo "$max"
 }
 
 run_suite() {
@@ -158,9 +158,9 @@ run_suite() {
   local bench_status
   local cmd_str
   local available_clients
-  local max_devices
   local -a server_cmd=()
   local -a cmd=()
+  local -a run_devices=()
 
   available_clients="$(count_clients_spec "$SERVER_CLIENTS")"
 
@@ -190,7 +190,20 @@ run_suite() {
     load_config "$length_trace" "$arrival_trace"
 
     for policy in "${POLICIES[@]}"; do
-      run_key="$(make_run_key "$length_trace" "$arrival_trace" "$policy" "${n_devices[@]}")"
+      run_devices=("${n_devices[@]}")
+      if ! policy_supports_partial_rr "$policy"; then
+        mapfile -t run_devices < <(filter_compatible_devices "$available_clients" "${n_devices[@]}")
+        if ((${#run_devices[@]} == 0)); then
+          run_key="$(make_run_key "$length_trace" "$arrival_trace" "$policy" "${n_devices[@]}")"
+          echo "SKIP (no compatible client counts for non-RR policy): $run_key"
+          echo "  available_clients=$available_clients"
+          echo "  requested_n_devices=${n_devices[*]}"
+          log_run_cmd "SKIPPED_INCOMPATIBLE" "$run_key" "available_clients=$available_clients requested_n_devices=${n_devices[*]}"
+          continue
+        fi
+      fi
+
+      run_key="$(make_run_key "$length_trace" "$arrival_trace" "$policy" "${run_devices[@]}")"
 
       if already_succeeded "$run_key"; then
         echo "SKIP (already succeeded): $run_key"
@@ -202,21 +215,16 @@ run_suite() {
       echo "  policy=$policy"
       echo "  window=$window"
       echo "  load_scale=$load_scale"
-      echo "  n_devices=${n_devices[*]}"
-
-      max_devices="$(max_requested_devices "${n_devices[@]}")"
-      if ((max_devices > available_clients)) && ! policy_supports_partial_rr "$policy"; then
-        echo "SKIP (insufficient clients for non-RR policy): $run_key"
+      echo "  n_devices=${run_devices[*]}"
+      if ((${#run_devices[@]} != ${#n_devices[@]})); then
+        echo "  requested_n_devices=${n_devices[*]}"
         echo "  available_clients=$available_clients"
-        echo "  max_requested_devices=$max_devices"
-        log_run_cmd "SKIPPED_INCOMPATIBLE" "$run_key" "available_clients=$available_clients max_requested_devices=$max_devices"
-        continue
       fi
 
       cmd=(
         python motivation/bench_api_server.py
         --overwrite
-        --n_devices "${n_devices[@]}"
+        --n_devices "${run_devices[@]}"
         --policies "$policy"
         --load_scales "$load_scale"
         --slo_tpots 0.05
@@ -284,12 +292,12 @@ TRACES=(
 
 declare -A configs=(
   ["azure_code_23:azure_code_23"]="t1200:1800 1.0 2 4 8 12 16 32"
-  ["sharegpt_code:azure_code_23"]="t1200:1800 1.0 2 4 6 8"
   ["azure_chat_23:azure_chat_23"]="t1200:1800 1.0 2 4 6 8"
+  ["azure_code:azure_code"]="t1200:1800 1.0 2 4 8 12 16 32"
+  ["azure_chat:azure_chat"]="t1200:1800 1.0 2 4 8 12 16 32"
+  ["sharegpt_code:azure_code_23"]="t1200:1800 1.0 2 4 6 8"
   ["sharegpt_chat:azure_chat_23"]="t1200:1800 1.0 2 4 6 8"
-  ["azure_code:azure_code"]="t1200:1800 1.0 4 8 12 16 32"
   ["sharegpt_code:azure_code"]="t1200:1800 1.0 4 8 12 16 32"
-  ["azure_chat:azure_chat"]="t1200:1800 1.0 4 8 12 16 32"
   ["sharegpt_chat:azure_chat"]="t1200:1800 1.0 4 8 12 16 32"
   ["reasoning:azure_chat_23"]="t1200:1800 1.0 4 8 12 16 32"
 )
