@@ -257,6 +257,7 @@ class ExecutionResults:
     event_file: str
     energy_consumption: float = field(default=0.0)
     per_gpu_energy_consumption: List[float] = field(default_factory=list)
+    energy_csv_files: List[str] = field(default_factory=list)
     
     # stats
     slo_violation_rate: float = field(init=False)
@@ -826,6 +827,7 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
         f'{problem.store_prefix}.{i}',
         energy_consumption=energy_consumption,
         per_gpu_energy_consumption=per_gpu_energy_consumption,
+        energy_csv_files=dump_profile_response.get("local_energy_csv_files", []),
     )
     with open(f'{problem.store_prefix}.execution_results.jsonl', 'w') as f:
         json.dump([asdict(execution_result) for execution_result in execution_results], f, indent=4)
@@ -1369,6 +1371,7 @@ def build_problems(
     for routing_kwargs in routing_kwargss:
         if isinstance(routing_kwargs, dict):
             routing_kwargs.setdefault("kv_xfer_delay", kv_xfer_delay)
+            routing_kwargs.setdefault("perf_model_err", perf_model_err)
     
     return [Problem(
         model_name = model_name,
@@ -1566,6 +1569,7 @@ def run(
             'event_file': f'{problems[0].store_prefix}.events.jsonl',
             'energy_consumption': best_result.energy_consumption,
             'per_gpu_energy_consumption': best_result.per_gpu_energy_consumption,
+            'energy_csv_files': best_result.energy_csv_files,
             'scheduling_overhead': slo_routing_overhead,
             'burstiness_level': burstiness_level,
             'rr_slice_kept_request_count': best_result.results.get(
@@ -1612,7 +1616,7 @@ def run(
         n_groups = len(df.groupby(other_features))
         ncols = min(3, n_groups)
         nrows = math.ceil(n_groups / ncols)
-        for ylabel in ['energy_est', 'slo_violation_rate']:
+        for ylabel in ['energy_est', 'slo_violation_rate', 'energy_consumption']:
             fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows), squeeze=False)
             idx = 0
             for other_feature_values, group in df.groupby(other_features):
