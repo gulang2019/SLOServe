@@ -733,7 +733,7 @@ class MockEngine:
     async def abort(self, request_id: str):
         await self.engine_core.abort_request.remote(request_id)
     
-    async def health_check(self) -> dict[str, Any]:
+    async def check_health(self) -> dict[str, Any]:
         """Expose the loop task status from the Ray actor."""
         return await self.engine_core.health_check.remote()
     

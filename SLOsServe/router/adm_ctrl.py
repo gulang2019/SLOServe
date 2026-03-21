@@ -75,6 +75,7 @@ class BatchPlanner:
     _max_lookahead: int = 5000
     _block_size: int
     _max_decode_length: int
+    _max_batch_size: int | None = None
     _profile_events: list = field(default_factory=list)
     _is_oracle: bool = False
     _now = time.time
@@ -98,6 +99,12 @@ class BatchPlanner:
         # Initialize C++ admission controller; TPOT is set lazily per request mix.
         self._adm_ctrler = SLOsServe_C.AdmCtrlScheduler("edf_sim", self._block_size, False, False)
         self._adm_ctrler_tpot = None
+
+    def _cap_batch_size(self, batch_size: int) -> int:
+        batch_size = max(0, int(batch_size))
+        if self._max_batch_size is not None:
+            batch_size = min(batch_size, self._max_batch_size)
+        return batch_size
 
     def _get_batch_time(self, batch: Batch):
         return self._perf_model.get_batch_time([(self._requests[req_id].num_computed_tokens, v) for req_id, v in batch.n_scheduled_tokens.items()])
@@ -137,7 +144,11 @@ class BatchPlanner:
                 f.write("scheduler_continuous 0\n")
                 f.write("planner_type \"ar\"\n")
                 f.write("planner_fixed_bs 0\n")
-                f.write("planner_max_bs 16384\n")
+                planner_max_bs = (
+                    self._max_batch_size
+                    if self._max_batch_size is not None else 16384
+                )
+                f.write(f"planner_max_bs {planner_max_bs}\n")
                 tpot = self._adm_ctrler_tpot if self._adm_ctrler_tpot is not None else 0.0
                 f.write(f"tpots 1 {tpot}\n")
                 hardware_params = self._perf_model.hardware_params
@@ -362,9 +373,12 @@ class BatchPlanner:
 
         if feasible_load_ddls:
             batch_time_budget = feasible_load_ddls[0][1]
-            batch_size = max(0, self._perf_model.get_bs(batch_time_budget, num_reqs=1))
+            batch_size = self._cap_batch_size(
+                self._perf_model.get_bs(batch_time_budget, num_reqs=1))
         else:
-            batch_size = 16384  # Recover overdue work aggressively when no request is still feasible.
+            # Recover overdue work aggressively without exceeding the engine
+            # token budget.
+            batch_size = self._cap_batch_size(16384)
             batch_time_budget = self._perf_model.get_batch_time([(0, batch_size)])
 
         b = Batch(start_time=now, unscheduled_tokens=batch_size)
@@ -431,6 +445,7 @@ class BatchPlanner:
         py_batches: list[Batch] = []
         for c_batch in c_batches:
             n_scheduled_tokens: dict[str, int] = {}
+            remaining_batch_tokens = self._max_batch_size
             for req_batch in c_batch.req_batches:
                 n = req_batch.n
                 if n <= 0:
@@ -446,6 +461,12 @@ class BatchPlanner:
                     continue
                 if n > max_sched:
                     n = max_sched
+                if remaining_batch_tokens is not None:
+                    if remaining_batch_tokens <= 0:
+                        break
+                    if n > remaining_batch_tokens:
+                        n = remaining_batch_tokens
+                    remaining_batch_tokens -= n
                 prev = n_scheduled_tokens.get(req_batch.id)
                 n_scheduled_tokens[req_batch.id] = n if prev is None else (prev + n)
 

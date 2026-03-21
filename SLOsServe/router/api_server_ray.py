@@ -114,11 +114,23 @@ def _parse_energy_csv(csv_path: str) -> tuple[list[dict[str, Any]], list[float],
     return events, per_gpu, sum(per_gpu)
 
 
+def _read_text_if_exists(path: str | None) -> str | None:
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
 def _build_worker_dump_path(filename: str, device_id: int) -> str:
     base, ext = os.path.splitext(filename)
     if not ext:
         ext = ".json"
     return f"{base}.device{device_id}{ext}"
+
+
+def _build_worker_energy_csv_path(filename: str, device_id: int) -> str:
+    base, _ = os.path.splitext(filename)
+    return f"{base}.device{device_id}.energy.csv"
 
 
 class WorkerEnergyProfiler:
@@ -194,9 +206,11 @@ class WorkerEnergyProfiler:
             per_gpu_joules, total_joules = meter.stop()
 
         energy_events: list[dict[str, Any]] = []
+        energy_csv_content: str | None = None
         if was_started and csv_path:
             energy_events, csv_per_gpu_joules, csv_total_joules = _parse_energy_csv(
                 csv_path)
+            energy_csv_content = _read_text_if_exists(csv_path)
             if not per_gpu_joules:
                 per_gpu_joules = csv_per_gpu_joules
             if total_joules == 0.0:
@@ -204,6 +218,7 @@ class WorkerEnergyProfiler:
 
         return {
             "energy_csv_path": csv_path if was_started else None,
+            "energy_csv_content": energy_csv_content,
             "energy_events": energy_events,
             "per_gpu_joules": per_gpu_joules,
             "total_joules": total_joules,
@@ -379,6 +394,7 @@ class EngineWorker:
     async def dump_profile_events(self, path: str):
         energy_summary = {
             "energy_csv_path": None,
+            "energy_csv_content": None,
             "energy_events": [],
             "per_gpu_joules": [],
             "total_joules": 0.0,
@@ -400,6 +416,7 @@ class EngineWorker:
             "profile_events_path": path,
             "profile_events": data,
             "energy_csv_path": energy_summary["energy_csv_path"],
+            "energy_csv_content": energy_summary["energy_csv_content"],
             "per_gpu_joules": energy_summary["per_gpu_joules"],
             "total_joules": energy_summary["total_joules"],
             "physical_gpu_ids": energy_summary["physical_gpu_ids"],
@@ -1514,8 +1531,13 @@ class SLOsServeRouter(Router):
         self.n_devices = n_devices
         from SLOsServe.perf_model import PerfModel
         self.model_name = router_kwargs['model_name']
+        self.perf_model_err = float(router_kwargs.get('perf_model_err', 1.0))
         perf_model = PerfModel.get_perf_model(self.model_name)
-        perf_model.hardware_params[4] += router_kwargs['scheduling_overhead'] + PERF_MODEL_HEADROOM
+        perf_model = perf_model.copy_with_adjustments(
+            scale=self.perf_model_err,
+            constant_offset=router_kwargs['scheduling_overhead']
+            + PERF_MODEL_HEADROOM,
+        )
         self.hardware_params = perf_model.hardware_params
         self.tpot = router_kwargs['tpot']
         self.n_block = router_kwargs['device_mem']
@@ -1582,7 +1604,8 @@ class SLOsServeRouter(Router):
             f'SLOServeRouter: n_group: {self.n_group}, n_lb: {self.n_lb}, '
             f'group_size: {self.group_size}, n_prefill_or_mixed: {self.n_prefill_or_mixed_per_group}, '
             f'use_planner: {self.use_planner}, ablation: {self.ablation}' 
-            f'hardware_params: {self.hardware_params}, scheduling_overhead: {router_kwargs["scheduling_overhead"]}'
+            f'perf_model_err: {self.perf_model_err}, hardware_params: {self.hardware_params}, '
+            f'scheduling_overhead: {router_kwargs["scheduling_overhead"]}'
         )
         
     def get_req_data(self, request: RequestInstance):
@@ -3301,6 +3324,7 @@ async def dump_profile_events(request: Request):
     all_events = []
     per_gpu_energy_consumption: list[float] = []
     energy_csv_files: list[str] = []
+    local_energy_csv_files: list[str] = []
     worker_event_files: list[str] = []
     physical_gpu_ids: list[list[int]] = []
     for i, client in enumerate(request_pool.clients):
@@ -3312,6 +3336,13 @@ async def dump_profile_events(request: Request):
             worker_event_files.append(worker_filename)
             if dump_result.get("energy_csv_path"):
                 energy_csv_files.append(dump_result["energy_csv_path"])
+            energy_csv_content = dump_result.get("energy_csv_content")
+            if energy_csv_content is not None:
+                local_energy_csv = _build_worker_energy_csv_path(filename, i)
+                _ensure_parent_dir(local_energy_csv)
+                with open(local_energy_csv, "w", encoding="utf-8") as f:
+                    f.write(energy_csv_content)
+                local_energy_csv_files.append(local_energy_csv)
             physical_gpu_ids.append(dump_result.get("physical_gpu_ids", []))
             per_gpu_energy_consumption.append(
                 float(dump_result.get("total_joules", 0.0)))
@@ -3342,6 +3373,7 @@ async def dump_profile_events(request: Request):
         "energy_consumption": sum(per_gpu_energy_consumption),
         "per_gpu_energy_consumption": per_gpu_energy_consumption,
         "energy_csv_files": energy_csv_files,
+        "local_energy_csv_files": local_energy_csv_files,
         "worker_event_files": worker_event_files,
         "physical_gpu_ids": physical_gpu_ids,
     })

@@ -57,6 +57,21 @@ class PerfModel:
     
     def get_max_decode_batch_size(self, t: float, average_context_length: float = 0.0) -> int:
         return int((t - self.hardware_params[4] - self.hardware_params[3] - self._online_spike_slack) / (self.hardware_params[0] + self.hardware_params[1] + self.hardware_params[2] * average_context_length))
+
+    def copy_with_adjustments(
+        self,
+        *,
+        scale: float = 1.0,
+        constant_offset: float = 0.0,
+    ) -> 'PerfModel':
+        adjusted = copy.deepcopy(self)
+        if scale != 1.0:
+            adjusted.hardware_params = [
+                param * scale for param in adjusted.hardware_params
+            ]
+        if constant_offset != 0.0:
+            adjusted.hardware_params[4] += constant_offset
+        return adjusted
     
     @staticmethod
     def get_perf_model(model_name: str, task: str = 'default') -> 'PerfModel':
