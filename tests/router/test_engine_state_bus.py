@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from SLOsServe import perf_model as perf_model_module
 from SLOsServe.router import api_server_ray
 from SLOsServe.router.execplan_bus import (ExecPlan, extract_load_statistics,
                                            make_engine_state_entry,
@@ -225,3 +226,50 @@ def test_slosserve_router_run_with_planner_passes_engine_state():
     assert captured["waiting_requests"] == [waiting_request]
     assert captured["engine_state"] is engine_state
     assert captured["mode"] == "normal"
+
+
+def test_slosserve_router_applies_perf_model_err_to_control_model(monkeypatch):
+    captured_hardware_params: list[list[float]] = []
+    base_params = [1.0, 2.0, 3.0, 4.0, 5.0]
+
+    class FakeAdmCtrlScheduler:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def set_ar_planner(self, *, tpots, hardware_params, fixed_bs, max_bs=None):
+            captured_hardware_params.append(list(hardware_params))
+
+    monkeypatch.setattr(api_server_ray.SLOsServe_C, "AdmCtrlScheduler",
+                        FakeAdmCtrlScheduler)
+    monkeypatch.setattr(
+        perf_model_module.PerfModel,
+        "get_perf_model",
+        staticmethod(
+            lambda model_name, task="default": perf_model_module.PerfModel(
+                model_name,
+                base_params,
+            )),
+    )
+
+    router = api_server_ray.SLOsServeRouter(2, {
+        "model_name": "Qwen/Qwen2.5-7B-Instruct",
+        "tpot": 0.05,
+        "device_mem": 16,
+        "block_size": 16,
+        "max_decode_length": 128,
+        "scheduling_overhead": 0.3,
+        "perf_model_err": 1.2,
+    })
+
+    expected_params = [
+        1.2,
+        2.4,
+        3.6,
+        4.8,
+        6.0 + 0.3 + api_server_ray.PERF_MODEL_HEADROOM,
+    ]
+
+    assert router.hardware_params == pytest.approx(expected_params)
+    assert len(captured_hardware_params) == 2
+    for hardware_params in captured_hardware_params:
+        assert hardware_params == pytest.approx(expected_params)

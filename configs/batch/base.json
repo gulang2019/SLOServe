@@ -1,0 +1,29 @@
+{
+  "server_clients": "0-7",
+  "defaults": {
+    "model_name": "Qwen/Qwen2.5-7B-Instruct",
+    "profit": "constant",
+    "admission_mode": "arrival",
+    "slo_routing_overhead": 0.05,
+    "scheduling_overhead": 0.003,
+    "routing_overhead": -1.0,
+    "routing_fallback_policy": "reject",
+    "tensor_parallel_size": 1,
+    "load_scales": [1.0],
+    "ttft_slo_scales": [5.0],
+    "slo_tpots": [0.05],
+    "perf_model_errs": [1.0]
+  },
+  "server_router_kwargs": {
+    "device_mem": 1248576,
+    "block_size": 16,
+    "model_name": "Qwen/Qwen2.5-7B-Instruct",
+    "tpot": 0.05,
+    "scheduling_overhead": 0.005,
+    "max_decode_length": 500,
+    "is_pd_disagg": 0,
+    "n_prefill_per_group": 1,
+    "max_decode_bs": 16,
+    "enable_rerouting": 0
+  }
+}

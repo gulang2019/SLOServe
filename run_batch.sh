@@ -16,6 +16,9 @@ source "$SCRIPT_DIR/.venv/bin/activate"
 
 export PYTHONPATH="$SCRIPT_DIR"
 
+BATCH_CONFIG_PATH="${BATCH_CONFIG_PATH:-${1:-}}"
+RUN_BATCH_PORT="${RUN_BATCH_PORT:-8000}"
+
 SUCCEEDED_LOG="${SUCCEEDED_LOG:-$SCRIPT_DIR/succeeded_runs.log}"
 FAILED_LOG="${FAILED_LOG:-$SCRIPT_DIR/failed_runs.log}"
 RUN_LOG="${RUN_LOG:-$SCRIPT_DIR/all_runs.log}"
@@ -24,12 +27,53 @@ SERVER_CLIENTS="${SERVER_CLIENTS:-0-7}"
 
 touch "$SUCCEEDED_LOG" "$FAILED_LOG" "$RUN_LOG"
 
+BATCH_CONFIG_LOADED=0
+
+DEFAULT_MODEL_NAME="Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_PROFIT="constant"
+DEFAULT_ADMISSION_MODE="arrival"
+DEFAULT_SLO_ROUTING_OVERHEAD="0.05"
+DEFAULT_SCHEDULING_OVERHEAD="0.003"
+DEFAULT_ROUTING_OVERHEAD="-1.0"
+DEFAULT_ROUTING_FALLBACK_POLICY="reject"
+DEFAULT_TENSOR_PARALLEL_SIZE="1"
+DEFAULT_LOAD_SCALES=("1.0")
+DEFAULT_TTFT_SLO_SCALES=("5.0")
+DEFAULT_SLO_TPOTS=("0.05")
+DEFAULT_PERF_MODEL_ERRS=("1.0")
+
 load_config() {
   local length_trace="$1"
   local arrival_trace="$2"
   local key="${length_trace}:${arrival_trace}"
   local cfg
   local -a cfg_parts=()
+
+  if [[ "$BATCH_CONFIG_LOADED" == "1" ]]; then
+    if [[ -z "${TRACE_WINDOW[$key]:-}" ]]; then
+      echo "ERROR: Missing normalized trace config for ${key}" >&2
+      exit 1
+    fi
+
+    window="${TRACE_WINDOW[$key]}"
+    read -r -a n_devices <<< "${TRACE_N_DEVICES[$key]}"
+    read -r -a load_scales <<< "${TRACE_LOAD_SCALES[$key]}"
+    read -r -a ttft_slo_scales <<< "${TRACE_TTFT_SLO_SCALES[$key]}"
+    read -r -a slo_tpots <<< "${TRACE_SLO_TPOTS[$key]}"
+    read -r -a perf_model_errs <<< "${TRACE_PERF_MODEL_ERRS[$key]}"
+    read -r -a trace_policies <<< "${TRACE_POLICIES[$key]}"
+
+    model_name="${TRACE_MODEL_NAME[$key]}"
+    profit="${TRACE_PROFIT[$key]}"
+    admission_mode="${TRACE_ADMISSION_MODE[$key]}"
+    slo_routing_overhead="${TRACE_SLO_ROUTING_OVERHEAD[$key]}"
+    scheduling_overhead="${TRACE_SCHEDULING_OVERHEAD[$key]}"
+    routing_overhead="${TRACE_ROUTING_OVERHEAD[$key]}"
+    routing_fallback_policy="${TRACE_ROUTING_FALLBACK_POLICY[$key]}"
+    tensor_parallel_size="${TRACE_TENSOR_PARALLEL_SIZE[$key]}"
+    output_dir="${TRACE_OUTPUT_DIR[$key]:-experiments_${EXPERIMENT_NAME}}"
+    return
+  fi
 
   if [[ -z "${configs[$key]:-}" ]]; then
     echo "ERROR: Missing config for ${key}" >&2
@@ -45,8 +89,21 @@ load_config() {
   fi
 
   window="${cfg_parts[0]}"
-  load_scale="${cfg_parts[1]}"
+  load_scales=("${cfg_parts[1]}")
   n_devices=("${cfg_parts[@]:2}")
+  ttft_slo_scales=("${DEFAULT_TTFT_SLO_SCALES[@]}")
+  slo_tpots=("${DEFAULT_SLO_TPOTS[@]}")
+  perf_model_errs=("${DEFAULT_PERF_MODEL_ERRS[@]}")
+  trace_policies=("${POLICIES[@]}")
+  model_name="$DEFAULT_MODEL_NAME"
+  profit="$DEFAULT_PROFIT"
+  admission_mode="$DEFAULT_ADMISSION_MODE"
+  slo_routing_overhead="$DEFAULT_SLO_ROUTING_OVERHEAD"
+  scheduling_overhead="$DEFAULT_SCHEDULING_OVERHEAD"
+  routing_overhead="$DEFAULT_ROUTING_OVERHEAD"
+  routing_fallback_policy="$DEFAULT_ROUTING_FALLBACK_POLICY"
+  tensor_parallel_size="$DEFAULT_TENSOR_PARALLEL_SIZE"
+  output_dir="experiments_${EXPERIMENT_NAME}"
 }
 
 make_run_key() {
@@ -61,7 +118,7 @@ make_run_key() {
     "$length_trace" \
     "$arrival_trace" \
     "$policy" \
-    "$window" \
+    "$window|load_scales=${load_scales[*]}|ttft_slo_scales=${ttft_slo_scales[*]}|slo_tpots=${slo_tpots[*]}|perf_model_errs=${perf_model_errs[*]}|model_name=${model_name}|tensor_parallel_size=${tensor_parallel_size}|profit=${profit}|admission_mode=${admission_mode}|slo_routing_overhead=${slo_routing_overhead}|scheduling_overhead=${scheduling_overhead}|routing_overhead=${routing_overhead}|routing_fallback_policy=${routing_fallback_policy}|output_dir=${output_dir}" \
     "${devices[*]}"
 }
 
@@ -93,14 +150,14 @@ cleanup_server() {
 }
 
 wait_for_server() {
-  local deadline=$((SECONDS + 60))
+  local deadline=$((SECONDS + 3000))
   while ((SECONDS < deadline)); do
-    if curl -fsS "http://localhost:8000/health_check" >/dev/null 2>&1; then
+    if curl -fsS "http://localhost:${RUN_BATCH_PORT}/health_check" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
   done
-  echo "ERROR: server did not become ready within 60s" >&2
+  echo "ERROR: server did not become ready within 3000s" >&2
   return 1
 }
 
@@ -161,6 +218,7 @@ run_suite() {
   local -a server_cmd=()
   local -a cmd=()
   local -a run_devices=()
+  local -a trace_policies=()
 
   available_clients="$(count_clients_spec "$SERVER_CLIENTS")"
 
@@ -168,14 +226,13 @@ run_suite() {
     python -m SLOsServe.router.api_server_ray
     --stat_window 2
     --host 0.0.0.0
-    --port 8000
+    --port "$RUN_BATCH_PORT"
     --window_size 0.005
     --router slosserve
     --router_kwargs "$SERVER_ROUTER_KWARGS"
     --clients "$SERVER_CLIENTS"
     --admission_mode anytime
     --mock_connector
-    --mock_engine
   )
 
   "${server_cmd[@]}" &
@@ -189,7 +246,7 @@ run_suite() {
 
     load_config "$length_trace" "$arrival_trace"
 
-    for policy in "${POLICIES[@]}"; do
+    for policy in "${trace_policies[@]}"; do
       run_devices=("${n_devices[@]}")
       if ! policy_supports_partial_rr "$policy"; then
         mapfile -t run_devices < <(filter_compatible_devices "$available_clients" "${n_devices[@]}")
@@ -214,8 +271,20 @@ run_suite() {
       echo "RUNNING: ${length_trace}:${arrival_trace}"
       echo "  policy=$policy"
       echo "  window=$window"
-      echo "  load_scale=$load_scale"
+      echo "  load_scales=${load_scales[*]}"
       echo "  n_devices=${run_devices[*]}"
+      echo "  ttft_slo_scales=${ttft_slo_scales[*]}"
+      echo "  slo_tpots=${slo_tpots[*]}"
+      echo "  perf_model_errs=${perf_model_errs[*]}"
+      echo "  model_name=$model_name"
+      echo "  tensor_parallel_size=$tensor_parallel_size"
+      echo "  profit=$profit"
+      echo "  admission_mode=$admission_mode"
+      echo "  slo_routing_overhead=$slo_routing_overhead"
+      echo "  scheduling_overhead=$scheduling_overhead"
+      echo "  routing_overhead=$routing_overhead"
+      echo "  routing_fallback_policy=$routing_fallback_policy"
+      echo "  output_dir=$output_dir"
       if ((${#run_devices[@]} != ${#n_devices[@]})); then
         echo "  requested_n_devices=${n_devices[*]}"
         echo "  available_clients=$available_clients"
@@ -226,21 +295,23 @@ run_suite() {
         --overwrite
         --n_devices "${run_devices[@]}"
         --policies "$policy"
-        --load_scales "$load_scale"
-        --slo_tpots 0.05
-        --ttft_slo_scales 5.0
+        --load_scales "${load_scales[@]}"
+        --slo_tpots "${slo_tpots[@]}"
+        --ttft_slo_scales "${ttft_slo_scales[@]}"
+        --perf_model_err "${perf_model_errs[@]}"
         --window "$window"
         --trace "${length_trace}:${arrival_trace}"
-        --profit constant
-        --admission_mode arrival
-        --slo_routing_overhead 0.05
-        --scheduling_overhead 0.003
-        --model_name Qwen/Qwen2.5-7B-Instruct
-        --port 8000
+        --profit "$profit"
+        --admission_mode "$admission_mode"
+        --slo_routing_overhead "$slo_routing_overhead"
+        --scheduling_overhead "$scheduling_overhead"
+        --model_name "$model_name"
+        --tensor_parallel_size "$tensor_parallel_size"
+        --port "$RUN_BATCH_PORT"
         --clients "$SERVER_CLIENTS"
-        --output_dir experiments_"$EXPERIMENT_NAME"
-        --routing_overhead -1.0
-        --routing_fallback_policy reject
+        --output_dir "$output_dir"
+        --routing_overhead "$routing_overhead"
+        --routing_fallback_policy "$routing_fallback_policy"
       )
 
       printf -v cmd_str '%q ' "${cmd[@]}"
@@ -271,11 +342,13 @@ POLICIES=(
   "llumnix_load:sarathi+"
   "round_robin:atfc"
   "slosserve_planner:atfc"
+  "slosserve_planner_ablation-no_global:atfc"
+  "slosserve_planner_ablation-no_local:atfc"
   "round_robin-disagg:sarathi+"
   "llumnix_load-disagg:sarathi+"
   "round_robin-disagg:atfc"
   "slosserve_disagg_planner:atfc"
-  # "round_robin-disagg:atfc"
+  "slosserve_disagg_planner_oracle_mem:atfc"
 )
 
 TRACES=(
@@ -301,5 +374,17 @@ declare -A configs=(
   ["sharegpt_chat:azure_chat"]="t1200:1800 1.0 4 8 12 16 32"
   ["reasoning:azure_chat_23"]="t1200:1800 1.0 4 8 12 16 32"
 )
+
+if [[ -n "$BATCH_CONFIG_PATH" ]]; then
+  if [[ ! -f "$BATCH_CONFIG_PATH" ]]; then
+    echo "ERROR: Missing batch config at $BATCH_CONFIG_PATH" >&2
+    exit 1
+  fi
+
+  echo "Loading batch config: $BATCH_CONFIG_PATH"
+  eval "$(
+    python -m SLOsServe.batch_config --shell "$BATCH_CONFIG_PATH"
+  )"
+fi
 
 run_suite

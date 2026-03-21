@@ -1549,6 +1549,7 @@ class SLOsServeRouter(Router):
         self.n_lb = router_kwargs.get('n_lb', 1)
         self.use_planner = router_kwargs.get('use_planner', False)
         self.ablation = router_kwargs.get('ablation', False)
+        self.oracle_mem = router_kwargs.get('oracle_mem', router_kwargs.get('is_oracle', False))
         assert self.group_size >= 1
         assert self.n_devices % self.group_size == 0 
         self.n_group = self.n_devices // self.group_size
@@ -1579,7 +1580,7 @@ class SLOsServeRouter(Router):
             hardware_params = self.hardware_params,
             fixed_bs = False 
         )
-        self.is_oracle = router_kwargs.get('is_oracle', False)
+        self.is_oracle = self.oracle_mem
         
         self.adm_planner = SLOsServe_C.AdmCtrlScheduler(
             "edf_sim", # policy
@@ -1603,10 +1604,16 @@ class SLOsServeRouter(Router):
         logger.info(
             f'SLOServeRouter: n_group: {self.n_group}, n_lb: {self.n_lb}, '
             f'group_size: {self.group_size}, n_prefill_or_mixed: {self.n_prefill_or_mixed_per_group}, '
-            f'use_planner: {self.use_planner}, ablation: {self.ablation}' 
+            f'use_planner: {self.use_planner}, ablation: {self.ablation}, oracle_mem: {self.oracle_mem}, '
             f'perf_model_err: {self.perf_model_err}, hardware_params: {self.hardware_params}, '
             f'scheduling_overhead: {router_kwargs["scheduling_overhead"]}'
         )
+
+    def _get_decode_length_ub(self, request: RequestInstance) -> int:
+        if not self.oracle_mem:
+            return self.max_decode_length
+        extra_args = request.payload.get('vllm_xargs', {})
+        return int(extra_args.get('output_length', request.payload.get('max_tokens', self.max_decode_length)))
         
     def get_req_data(self, request: RequestInstance):
         extra_args = request.payload['vllm_xargs']
@@ -1614,7 +1621,7 @@ class SLOsServeRouter(Router):
         input_length = extra_args['input_length']
         profit = extra_args['profit']
         prefill_mem = math.ceil(input_length / self.block_size)
-        mem = math.ceil((input_length + request.payload['max_tokens']) / self.block_size)
+        mem = math.ceil((input_length + self._get_decode_length_ub(request)) / self.block_size)
         return prefill_ddl, input_length, profit, prefill_mem, mem
     
     def _run_pre_adm_planner(
@@ -1670,7 +1677,8 @@ class SLOsServeRouter(Router):
             prefill_ddl, input_length, profit, prefill_mem, _ = self.get_req_data(req)
             if mode == 'prefill_only': prefill_ddl -= self.kv_xfer_delay
             num_computed = req.num_prompt_tokens if mode == 'decode_only' else 0
-            n_block_ub = math.ceil((req.num_prompt_tokens + self.max_decode_length) / self.block_size)
+            decode_length_ub = self._get_decode_length_ub(req)
+            n_block_ub = math.ceil((req.num_prompt_tokens + decode_length_ub) / self.block_size)
             c_reqs.append(
                 SLOsServe_C.Request(
                     id=req.request_id,
@@ -1678,7 +1686,7 @@ class SLOsServeRouter(Router):
                     ddl=prefill_ddl - now,
                     input_length=input_length,
                     n_computed_tokens=num_computed,
-                    max_tokens = 1 if mode == 'prefill_only' else self.max_decode_length,
+                    max_tokens = 1 if mode == 'prefill_only' else decode_length_ub,
                     profit=profit,
                     mem=n_block_ub,
                     tpot_idx=0,
@@ -1697,7 +1705,8 @@ class SLOsServeRouter(Router):
                 num_computed = max(engine_state.num_computed_tokens.get(req.request_id, 0), num_computed)
             if (self.is_pd_disagg and req.is_decode):
                 num_computed = max(num_computed, req.num_prompt_tokens)
-            n_block_ub = math.ceil((self.max_decode_length + req.num_prompt_tokens - num_computed) / self.block_size)
+            decode_length_ub = self._get_decode_length_ub(req)
+            n_block_ub = math.ceil((decode_length_ub + req.num_prompt_tokens - num_computed) / self.block_size)
             prefill_only = self.is_pd_disagg and req.is_prefill
             if prefill_only: prefill_ddl -= self.kv_xfer_delay
             c_reqs.append(
@@ -1707,7 +1716,7 @@ class SLOsServeRouter(Router):
                     ddl=prefill_ddl - now,
                     input_length=input_length,
                     n_computed_tokens=num_computed,
-                    max_tokens = 1 if prefill_only else self.max_decode_length,
+                    max_tokens = 1 if prefill_only else decode_length_ub,
                     profit=profit,
                     mem=n_block_ub,
                     tpot_idx=0,
@@ -2035,7 +2044,8 @@ class SLOsServeRouter(Router):
         for req in waiting_requests:
             if req.admitted: continue
             prefill_ddl, input_length, profit, prefill_mem, mem = self.get_req_data(req)
-            n_block_ub = math.ceil((req.num_prompt_tokens + self.max_decode_length) / self.block_size)
+            decode_length_ub = self._get_decode_length_ub(req)
+            n_block_ub = math.ceil((req.num_prompt_tokens + decode_length_ub) / self.block_size)
             c_req = SLOsServe_C.Request(
                 id = req.request_id,
                 is_new_req = True,
@@ -2059,7 +2069,8 @@ class SLOsServeRouter(Router):
             prefill_ddl, input_length, profit, prefill_mem, mem = self.get_req_data(req)
             num_computed_token = max(num_computed_tokens.get(req.request_id, 0), req.num_computed_tokens)
             num_output_tokens = max(num_computed_token - input_length, 0) + 1
-            num_block_ub = math.ceil((self.max_decode_length + req.num_prompt_tokens - num_computed_token) / self.block_size)
+            decode_length_ub = self._get_decode_length_ub(req)
+            num_block_ub = math.ceil((decode_length_ub + req.num_prompt_tokens - num_computed_token) / self.block_size)
             c_req = SLOsServe_C.Request(
                 id = req.request_id,
                 is_new_req = False,
@@ -2144,13 +2155,15 @@ class SLOsServeRouter(Router):
             
         for req in running_requests:
             num_computed_tokens = max(req2num_computed_tokens.get(req.request_id, 0), req.num_computed_tokens)
-            num_block_ub = math.ceil((self.max_decode_length + req.num_prompt_tokens - num_computed_tokens) / self.block_size)
+            decode_length_ub = self._get_decode_length_ub(req)
+            num_block_ub = math.ceil((decode_length_ub + req.num_prompt_tokens - num_computed_tokens) / self.block_size)
             num_free_blocks -= num_block_ub
             
         idx = 0
         while idx < len(waiting_requests) and ((idx + len(running_requests) + 1) <= self.max_decode_bs):
             req = waiting_requests[idx]
-            num_block_ub = math.ceil((self.max_decode_length + req.num_prompt_tokens) / self.block_size)
+            decode_length_ub = self._get_decode_length_ub(req)
+            num_block_ub = math.ceil((decode_length_ub + req.num_prompt_tokens) / self.block_size)
             if num_free_blocks - num_block_ub >= 0:
                 num_free_blocks -= num_block_ub
                 

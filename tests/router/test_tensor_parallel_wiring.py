@@ -105,10 +105,20 @@ async def test_update_clients_restarts_when_replica_order_changes(monkeypatch):
 def test_start_engine_uses_tensor_parallel_gpu_reservations(monkeypatch):
     queue_sizes = []
     launches = []
+    ready_waits = []
 
     class FakeQueue:
         def __init__(self, maxsize):
             queue_sizes.append(maxsize)
+
+    class FakeActorHandle:
+        def __init__(self, actor_id):
+            self.actor_id = actor_id
+            self.wait_until_ready = self
+
+        def remote(self):
+            ready_waits.append(self.actor_id)
+            return f"ready-{self.actor_id}"
 
     class FakeEngineWorker:
         def options(self, **kwargs):
@@ -117,7 +127,8 @@ def test_start_engine_uses_tensor_parallel_gpu_reservations(monkeypatch):
             class FakeOptions:
                 def remote(self_inner, *args, **remote_kwargs):
                     launches.append(("remote", args, remote_kwargs))
-                    return f"actor-{len([kind for kind, *_ in launches if kind == 'remote'])}"
+                    actor_id = len([kind for kind, *_ in launches if kind == 'remote'])
+                    return FakeActorHandle(actor_id)
 
             return FakeOptions()
 
@@ -125,11 +136,14 @@ def test_start_engine_uses_tensor_parallel_gpu_reservations(monkeypatch):
         log_level="INFO",
         ray_address=None,
         tensor_parallel_size=2,
+        vllm_port_base=31000,
+        vllm_port_stride=32,
         mock_engine=False,
         model_name="demo-model",
         mock_connector=False,
     ), raising=False)
     monkeypatch.setattr(api_server_ray.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(api_server_ray.ray, "get", lambda obj: obj)
     monkeypatch.setattr(api_server_ray, "ExecPlanBus", SimpleNamespace(
         remote=lambda: "execplan-bus"))
     monkeypatch.setattr(api_server_ray, "RayQueue", FakeQueue)
@@ -156,6 +170,8 @@ def test_start_engine_uses_tensor_parallel_gpu_reservations(monkeypatch):
         assert args == ("demo-model", False)
         assert kwargs["device_id"] == replica_id
         assert kwargs["tensor_parallel_size"] == 2
+        assert kwargs["vllm_port"] == 31000 + replica_id * 32
         assert kwargs["execplan_bus"] == "execplan-bus"
         assert isinstance(kwargs["output_queue"], FakeQueue)
+    assert ready_waits == [1, 2, 3]
     assert len(api_server_ray.engine_actors) == 3

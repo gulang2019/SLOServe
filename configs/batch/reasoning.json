@@ -1,0 +1,24 @@
+{
+  "experiment_name": "e2e",
+  "extends": [
+    "base.json"
+  ],
+  "policies": [
+    "round_robin:sarathi+",
+    "llumnix_load:sarathi+",
+    "round_robin:atfc",
+    "slosserve_planner:atfc",
+    "slosserve_planner_oracle_mem:atfc"
+  ],
+  "traces": [
+    "reasoning:azure_chat_23"
+  ],
+  "configs": {
+    "reasoning:azure_chat_23": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [2, 4, 8, 12, 16, 32]
+    }
+  }
+}
+

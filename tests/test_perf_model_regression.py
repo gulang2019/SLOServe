@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -101,6 +102,54 @@ def test_perf_model_fit_persists_params_and_plot(tmp_path, monkeypatch):
     assert persisted["Qwen/Qwen2.5-7B-Instruct"]["unit_test_trace"] == pytest.approx(
         TRUE_HW_PARAMS
     )
+
+
+def test_perf_model_copy_with_adjustments_keeps_source_model_unchanged():
+    model = perf_model.PerfModel(
+        "Qwen/Qwen2.5-7B-Instruct",
+        [1.0, 2.0, 3.0, 4.0, 5.0],
+    )
+
+    adjusted = model.copy_with_adjustments(scale=1.2, constant_offset=0.7)
+
+    assert adjusted.hardware_params == pytest.approx([1.2, 2.4, 3.6, 4.8, 6.7])
+    assert model.hardware_params == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0])
+
+
+def test_build_problems_propagates_perf_model_err_to_router_kwargs(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        bench_api_server.ArrivalTimes,
+        "load",
+        staticmethod(lambda *args, **kwargs: SimpleNamespace(arrival_times=[0.0, 1.0])),
+    )
+    monkeypatch.setattr(
+        bench_api_server.Requests,
+        "load",
+        staticmethod(
+            lambda *args, **kwargs: SimpleNamespace(requests=[
+                SimpleNamespace(input_length=16, output_length=32),
+                SimpleNamespace(input_length=8, output_length=24),
+            ])),
+    )
+
+    problems = bench_api_server.build_problems(
+        model_name="Qwen/Qwen2.5-7B-Instruct",
+        trace="azure_chat_23",
+        ttft_slo_scale=5.0,
+        slo_tpot=0.5,
+        profit="constant",
+        scheduling_policy="atfc",
+        routing_policy="slosserve",
+        n_device=2,
+        tensor_parallel_size=1,
+        window="0:2",
+        load_scale=1.0,
+        experiment_dir=str(tmp_path),
+        perf_model_err=1.2,
+    )
+
+    assert problems
+    assert problems[0].routing_kwargs["perf_model_err"] == pytest.approx(1.2)
 
 
 def test_extract_batch_regression_row_derives_batch_fields():

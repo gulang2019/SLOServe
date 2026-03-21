@@ -1,0 +1,21 @@
+{
+  "extends": [
+    "base.json"
+  ],
+  "policies": [
+    "round_robin:atfc",
+    "slosserve_planner:atfc"
+  ],
+  "traces": [
+    "azure_code_23:azure_code_23"
+  ],
+  "configs": {
+    "azure_code_23:azure_code_23": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [8],
+      "perf_model_errs": [0.4, 0.6, 0.8, 1.0, 1.2, 1.4]
+    }
+  }
+}
+

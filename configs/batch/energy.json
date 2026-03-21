@@ -1,0 +1,20 @@
+{
+  "experiment_name": "energy",
+  "extends": [
+    "base.json"
+  ],
+  "policies": [
+    "round_robin:sarathi+",
+    "round_robin-disagg:sarathi+"
+  ],
+  "traces": [
+    "azure_chat_23:azure_chat_23"
+  ],
+  "configs": {
+    "azure_chat_23:azure_chat_23": {
+      "window": "t1200:1800",
+      "load_scales": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+      "n_devices": [1]
+    }
+  }
+}

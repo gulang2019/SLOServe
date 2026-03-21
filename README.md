@@ -1,4 +1,15 @@
 # TODOs
+
+3.21 
+Finish the expeirment section: coding + writing + evaluation;
+Multi-node experiment;
+Tensor Parallel experiment (need a MoE model if possible);  
+ShareGPT experiment; KV Cache;
+Memory experiment w/ Reasoning;
+Writing from the experiment section; Finalize the figures;
+Routing Overhead experiment;
+
+
 For Yi
 - []  run through the router/benchmark detailed below; 
 - [] open a new branch, add memory feasibility check to the feasibility check in csrc/adm_ctrl_scheduler.cc; (csrc/adm_ctrl_scheduler.cc:1254)
@@ -52,6 +63,99 @@ python -m SLOsServe.router.api_server_ray --stat_window 2 \
     --mock_engine 2>&1 | tee out.txt
 ```
 
+### Multi-node experiment (no shared filesystem)
+
+The Ray-based router can place engine actors across multiple machines via
+`--ray_address`. A shared filesystem is **not** required, but every node
+must have:
+
+- the same code checkout (same path is the safest option),
+- the same Python environment / dependencies,
+- access to the same model (either via Hugging Face download or a copied local path).
+
+If you only need one-way code sync from the head node to a worker node, `rsync`
+is enough:
+
+```sh
+rsync -ah --delete \
+  --exclude '.venv' \
+  --exclude '__pycache__' \
+  --exclude 'experiments*' \
+  /path/to/SLOServe/ \
+  user@worker:/path/to/SLOServe/
+```
+
+On **every node**:
+
+```sh
+cd /path/to/SLOServe
+conda activate sloserve
+export PYTHONPATH=$PWD
+```
+
+Start the Ray head on node 0:
+
+```sh
+HEAD_IP=<node0-ip>
+ray stop -f || true
+ray start --head --node-ip-address "$HEAD_IP" --port 6379
+```
+
+Join node 1 (and every other worker node):
+
+```sh
+HEAD_IP=<node0-ip>
+MY_IP=<node1-ip>
+ray stop -f || true
+ray start --address "$HEAD_IP:6379" --node-ip-address "$MY_IP"
+```
+
+Then launch the router on the head node. In the example below, we run
+8 logical replicas (`r0`-`r7`) with tensor parallel size 1:
+
+```sh
+python -m SLOsServe.router.api_server_ray \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --ray_address "$HEAD_IP:6379" \
+    --tensor_parallel_size 1 \
+    --stat_window 2 \
+    --window_size 0.005 \
+    --router slosserve \
+    --router_kwargs "{\"device_mem\":1248576, \"block_size\": 16, \"model_name\": \"Qwen/Qwen2.5-7B-Instruct\", \"tpot\":0.05, \"scheduling_overhead\": 0.005, \"max_decode_length\": 500, \"is_pd_disagg\": 0, \"n_prefill_per_group\": 1, \"max_decode_bs\": 16, \"enable_rerouting\": 0}" \
+    --clients r0,r1,r2,r3,r4,r5,r6,r7 \
+    --admission_mode anytime
+```
+
+`--tensor_parallel_size` is the number of GPUs per logical replica. It must
+fit within a single node. For example, with 2 nodes x 4 GPUs each:
+
+- `--n_devices 8 --tensor_parallel_size 1` uses 8 replicas over 8 GPUs.
+- `--n_devices 4 --tensor_parallel_size 2` uses 4 replicas over 8 GPUs.
+
+Run the benchmark from the head node:
+
+```sh
+python motivation/bench_api_server.py --overwrite \
+      --n_devices 8 \
+      --tensor_parallel_size 1 \
+      --policies slosserve_planner:atfc \
+      --load_scales 1.0 \
+      --slo_tpots 0.05 \
+      --ttft_slo_scales 5.0 \
+      --window "t800:1000" \
+      --trace "azure_code_23:azure_code_23" \
+      --profit constant --admission_mode arrival \
+      --slo_routing_overhead 0.05 --scheduling_overhead 0.005 \
+      --model_name Qwen/Qwen2.5-7B-Instruct \
+      --port 8000 --clients 0-7 \
+      --output_dir experiments_emulation_new \
+      --routing_overhead -1.0 --routing_fallback_policy reject --kv_xfer_delay 0.05
+```
+
+The benchmark driver writes merged results on the head node. It also copies
+per-worker energy CSVs back to the head when dumping profile events, so raw
+energy profiling does not require a shared filesystem either.
 
 ## Step 3: Run benchmark.
 ```sh

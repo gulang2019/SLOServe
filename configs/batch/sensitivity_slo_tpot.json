@@ -1,0 +1,22 @@
+{
+  "experiment_name": "slo_tpot",
+  "extends": [
+    "base.json"
+  ],
+  "policies": [
+    "round_robin:sarathi+",
+    "round_robin:atfc",
+    "slosserve_planner:atfc"
+  ],
+  "traces": [
+    "azure_code_23:azure_code_23"
+  ],
+  "configs": {
+    "azure_code_23:azure_code_23": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [8],
+      "slo_tpot": [0.025, 0.05, 0.10, 0.2]
+    }
+  }
+}

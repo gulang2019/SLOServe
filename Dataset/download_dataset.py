@@ -365,10 +365,10 @@ if __name__ == '__main__':
         # 'reasoning'
         # 'azure_code',
         # 'azure_chat', 
-        # 'azure_chat_23',
-        # 'azure_code_23',
+        'azure_chat_23',
+        'azure_code_23',
         # 'sharegpt_chat',
-        "reasoning",
+        # "reasoning",
         # 'sharegpt_code',
         # 'burstgpt',
         # 'humaneval',
