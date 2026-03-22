@@ -514,10 +514,9 @@ def ensure_prompts_present(requests: List[Request], model_name: str) -> None:
     """Ensure prompts exist for all requests.
 
     Assumes homogeneity: either all requests already have prompts or none do.
-    If none have prompts, synthesize random token sequences per input length
-    bucket and batch-decode for efficiency.
+    If none have prompts, synthesize random token-id sequences per input length
+    bucket and pass them through directly as list[int].
     """
-    import tiktoken
     if not requests:
         return
     first_has_prompt = requests[0].prompt is not None
@@ -529,7 +528,6 @@ def ensure_prompts_present(requests: List[Request], model_name: str) -> None:
     # Verify assumption: none have prompt
     for req in requests:
         assert req.prompt is None, "Mixed prompt presence encountered; expected homogeneity."
-    tokenizer = tiktoken.get_encoding("cl100k_base")
     rng = np.random.default_rng()
     indices_by_length: Dict[int, List[int]] = {}
     for idx, req in enumerate(requests):
@@ -537,9 +535,8 @@ def ensure_prompts_present(requests: List[Request], model_name: str) -> None:
     for length, indices in indices_by_length.items():
         num = len(indices)
         tokens_batch = rng.integers(1000, 2001, size=(num, length), dtype=np.int64)
-        decoded_batch = tokenizer.batch_decode(tokens_batch.tolist(), skip_special_tokens=True)
         for i, req_idx in enumerate(indices):
-            requests[req_idx].prompt = decoded_batch[i]
+            requests[req_idx].prompt = tokens_batch[i].tolist()
 
 
 def _generate_random_prompt_tokens(length: int, rng: random.Random) -> list[int]:

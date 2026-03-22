@@ -157,7 +157,7 @@ class Request:
     cached_length: int = 0
     session_id: Optional[str] = None
     
-    prompt: Optional[str] = None 
+    prompt: Optional[str | list[int]] = None
     thinking: Optional[str] = None 
     answer: Optional[str] = None 
 
