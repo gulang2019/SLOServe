@@ -189,7 +189,12 @@ class WorkerEnergyProfiler:
             self.csv_path,
         )
 
-    def stop(self) -> dict[str, Any]:
+    def stop(
+        self,
+        *,
+        keep_csv: bool = True,
+        include_csv_content: bool = True,
+    ) -> dict[str, Any]:
         recorder = self._recorder
         meter = self._meter
         csv_path = self.csv_path
@@ -210,14 +215,24 @@ class WorkerEnergyProfiler:
         if was_started and csv_path:
             energy_events, csv_per_gpu_joules, csv_total_joules = _parse_energy_csv(
                 csv_path)
-            energy_csv_content = _read_text_if_exists(csv_path)
+            if include_csv_content:
+                energy_csv_content = _read_text_if_exists(csv_path)
             if not per_gpu_joules:
                 per_gpu_joules = csv_per_gpu_joules
             if total_joules == 0.0:
                 total_joules = csv_total_joules
+            if not keep_csv and os.path.exists(csv_path):
+                try:
+                    os.remove(csv_path)
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to remove worker energy CSV %s: %s",
+                        csv_path,
+                        exc,
+                    )
 
         return {
-            "energy_csv_path": csv_path if was_started else None,
+            "energy_csv_path": csv_path if was_started and keep_csv else None,
             "energy_csv_content": energy_csv_content,
             "energy_events": energy_events,
             "per_gpu_joules": per_gpu_joules,
@@ -391,7 +406,7 @@ class EngineWorker:
         verbose = request_json['verbose']
         return await self.engine.profile_step(batch, n, verbose)
 
-    async def dump_profile_events(self, path: str):
+    async def dump_profile_events(self, path: str, include_energy_csv: bool = True):
         energy_summary = {
             "energy_csv_path": None,
             "energy_csv_content": None,
@@ -401,7 +416,10 @@ class EngineWorker:
             "physical_gpu_ids": [],
         }
         if self._energy_profiler is not None:
-            energy_summary = self._energy_profiler.stop()
+            energy_summary = self._energy_profiler.stop(
+                keep_csv=include_energy_csv,
+                include_csv_content=include_energy_csv,
+            )
         _ensure_parent_dir(path)
         await self.engine.dump_profile_events(path)
         import json
@@ -2733,6 +2751,22 @@ class RequestPool:
         request.state = state
         self.changed_requests.add(request)
 
+    def _emit_rescheduling_event(
+        self,
+        *,
+        request_id: str,
+        prefill_device_id: int,
+        decode_device_id: int,
+    ) -> None:
+        self._profile_events.append({
+            "event_type": "rescheduling",
+            "timestamp": time.time(),
+            "request_id": request_id,
+            "prefill_device_id": prefill_device_id,
+            "decode_device_id": decode_device_id,
+            "device_id": -1,
+        })
+
     async def _emit_request_error(self, request: RequestInstance, reason: str, exc: Exception | None = None):
         error_type = type(exc).__name__ if exc is not None else "RuntimeError"
         error_message = f"{error_type}: {exc}" if exc is not None else reason
@@ -3120,6 +3154,8 @@ class RequestPool:
         # logger.info(f"Dispatching request {request.request_id}: prefill_device_id={request.prefill_device_id}, decode_device_id={request.decode_device_id}")
         # Single-device fast path
         if not self.enable_rerouting and request.prefill_device_id == request.decode_device_id:
+            attempted_prefill_device_id = request.prefill_device_id
+            attempted_decode_device_id = request.decode_device_id
             self.load_stat.add_event({
                 'type': 'arrival',
                 'timestamp': time.time(),
@@ -3169,14 +3205,11 @@ class RequestPool:
                     request.prefill_device_id = request.decode_device_id = -1
                     self.update_req_state(request, RequestState.WAITING)
                     # request.payload['vllm_xargs']['prefill_ddl'] = time.time() + request.payload['vllm_xargs']['slo_ttft']
-                    self._profile_events.append({
-                        "event_type": "rescheduling",
-                        "timestamp": time.time(),
-                        "request_id": request.request_id,
-                        "prefill_device_id": request.prefill_device_id,
-                        "decode_device_id": request.decode_device_id,
-                        "device_id": -1
-                    })
+                    self._emit_rescheduling_event(
+                        request_id=request.request_id,
+                        prefill_device_id=attempted_prefill_device_id,
+                        decode_device_id=attempted_decode_device_id,
+                    )
                 else:
                     await request.response_queue.put({'finish_reason': 'rejected'})
                     await request.response_queue.put(None)
@@ -3197,6 +3230,8 @@ class RequestPool:
         
         if request.state < RequestState.PREFILL_FINISHED:
             # Disaggregated path: prefill → kv → decode
+            attempted_prefill_device_id = request.prefill_device_id
+            attempted_decode_device_id = request.decode_device_id
             self.load_stat.add_event({
                 'type': 'arrival',
                 'timestamp': time.time(),
@@ -3236,6 +3271,11 @@ class RequestPool:
                     self.running_pool.remove(request)
                     request.prefill_device_id = -1
                     request.admitted = None
+                    self._emit_rescheduling_event(
+                        request_id=request.request_id,
+                        prefill_device_id=attempted_prefill_device_id,
+                        decode_device_id=attempted_decode_device_id,
+                    )
                 else:
                     await request.response_queue.put({'finish_reason': 'rejected'})
                     await request.response_queue.put(None)
@@ -3295,6 +3335,8 @@ class RequestPool:
         # Stream response from decode service
         logger.debug(f"Request {request.request_id} streaming from decode device {request.decode_device_id}")
         is_rejected = False
+        attempted_prefill_device_id = request.prefill_device_id
+        attempted_decode_device_id = request.decode_device_id
         admitted, generator = await stream_service_response_engine(request.decode_device_id,
                                                         request.payload,
                                                         request_id=request.request_id)
@@ -3314,6 +3356,11 @@ class RequestPool:
                 self.running_pool.remove(request)
                 request.admitted = None
                 request.decode_device_id = -1
+                self._emit_rescheduling_event(
+                    request_id=request.request_id,
+                    prefill_device_id=attempted_prefill_device_id,
+                    decode_device_id=attempted_decode_device_id,
+                )
                 logger.debug(f"Request {request.request_id} waiting for rescheduling")
             else:
                 await request.response_queue.put({'finish_reason': 'rejected'})
@@ -3417,6 +3464,7 @@ async def dump_profile_events(request: Request):
     request_json = await request.json()
     await request_pool.sync(timeout=request_json.get('timeout', 10.0))
     filename = os.path.abspath(request_json.get('filename', 'profile_events.jsonl'))
+    include_energy_csv = bool(request_json.get('include_energy_csv', True))
     logger.info(f"Dumping profile events to {filename}")
     import json as _json
     if request_pool is None:
@@ -3433,7 +3481,9 @@ async def dump_profile_events(request: Request):
             logger.info(f"Dumping profile events from client {client}")
             worker_filename = _build_worker_dump_path(filename, i)
             dump_result = await engine_actors[i].engine_actor.dump_profile_events.remote(
-                worker_filename)
+                worker_filename,
+                include_energy_csv,
+            )
             worker_event_files.append(worker_filename)
             if dump_result.get("energy_csv_path"):
                 energy_csv_files.append(dump_result["energy_csv_path"])

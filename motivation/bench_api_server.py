@@ -338,7 +338,6 @@ class ExecutionResults:
     event_file: str
     energy_consumption: float = field(default=0.0)
     per_gpu_energy_consumption: List[float] = field(default_factory=list)
-    energy_csv_files: List[str] = field(default_factory=list)
     
     # stats
     slo_violation_rate: float = field(init=False)
@@ -816,7 +815,12 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{endpoint}/dump_profile_events",
-            json={"filename": filename, "admission_filename": admission_filename, "timeout": 300.0},
+            json={
+                "filename": filename,
+                "admission_filename": admission_filename,
+                "timeout": 300.0,
+                "include_energy_csv": False,
+            },
             timeout=300.0
         )
         response.raise_for_status()
@@ -898,6 +902,7 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
                                     prefix = problem.store_prefix, 
                                     routing_overhead = problem.routing_overhead,
                                     n_device = problem.n_devices,
+                                    group_size = problem.routing_kwargs.get('group_size'),
                                     draw = True)
     results['rps'] = rps
     results['requested_n_device'] = requested_n_devices
@@ -943,7 +948,6 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
         f'{problem.store_prefix}.{i}',
         energy_consumption=energy_consumption,
         per_gpu_energy_consumption=per_gpu_energy_consumption,
-        energy_csv_files=dump_profile_response.get("local_energy_csv_files", []),
     )
     with open(f'{problem.store_prefix}.execution_results.jsonl', 'w') as f:
         json.dump([asdict(execution_result) for execution_result in execution_results], f, indent=4)
@@ -1705,7 +1709,6 @@ def run(
             'event_file': f'{problems[0].store_prefix}.events.jsonl',
             'energy_consumption': best_result.energy_consumption,
             'per_gpu_energy_consumption': best_result.per_gpu_energy_consumption,
-            'energy_csv_files': best_result.energy_csv_files,
             'scheduling_overhead': slo_routing_overhead,
             'burstiness_level': burstiness_level,
             'rr_slice_kept_request_count': best_result.results.get(

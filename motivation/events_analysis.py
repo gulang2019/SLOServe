@@ -1,4 +1,5 @@
 import json 
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Tuple, Any, Optional
 import numpy as np
@@ -1465,6 +1466,226 @@ def calc_device_stats(events: List[Event], reqs: List[RequestInstance], n_device
     
     return device_stats
 
+
+def _summarize_samples(values: List[float]) -> Dict[str, Any]:
+    if not values:
+        return {
+            'count': 0,
+            'mean': None,
+            'std': None,
+            'min': None,
+            'max': None,
+            'p50': None,
+            'p90': None,
+            'p99': None,
+        }
+    arr = np.asarray(values, dtype=np.float64)
+    return {
+        'count': int(arr.size),
+        'mean': float(np.mean(arr)),
+        'std': float(np.std(arr)),
+        'min': float(np.min(arr)),
+        'max': float(np.max(arr)),
+        'p50': float(np.percentile(arr, 50)),
+        'p90': float(np.percentile(arr, 90)),
+        'p99': float(np.percentile(arr, 99)),
+    }
+
+
+def _get_dispatch_target_device(event: Dispatch) -> int:
+    if event.type == 'decode':
+        return int(event.decode_device_id)
+    return int(event.prefill_device_id)
+
+
+def _classify_dispatch_scope(
+    device_id: int,
+    *,
+    n_device: int,
+    group_size: int | None,
+    local_group_idx: int,
+) -> str:
+    if device_id < 0:
+        return 'unknown'
+    if group_size is None or group_size <= 0 or n_device <= 0 or group_size >= n_device:
+        return f'device-{device_id}'
+    group_idx = device_id // group_size
+    return 'local-node' if group_idx == local_group_idx else 'remote-node'
+
+
+def _scope_label_sort_key(label: str) -> Tuple[int, Any]:
+    if label == 'local-node':
+        return (0, 0)
+    if label == 'remote-node':
+        return (1, 0)
+    if label.startswith('device-'):
+        try:
+            return (2, int(label.split('-', 1)[1]))
+        except ValueError:
+            return (2, label)
+    if label == 'unknown':
+        return (3, 0)
+    return (4, label)
+
+
+def _sorted_scope_labels(labels: Set[str]) -> List[str]:
+    return sorted(labels, key=_scope_label_sort_key)
+
+
+def analyze_cross_node_admission(
+    reqs: Dict[str, RequestInstance],
+    *,
+    n_device: int = -1,
+    group_size: int | None = None,
+    local_group_idx: int = 0,
+    prefix: str = 'trace_analysis',
+    draw: bool = False,
+) -> Dict[str, Any]:
+    try:
+        group_size = int(group_size) if group_size is not None else None
+    except (TypeError, ValueError):
+        group_size = None
+
+    retry_counts: List[int] = []
+    admission_overhead_by_scope: Dict[str, List[float]] = defaultdict(list)
+    admission_overhead_by_device: Dict[int, List[float]] = defaultdict(list)
+
+    for req in reqs.values():
+        req_events = list(req.events)
+        if not any(event.event_type == 'dispatch' for event in req_events):
+            continue
+
+        retry_counts.append(sum(event.event_type == 'rescheduling' for event in req_events))
+
+        for i, event in enumerate(req_events):
+            if event.event_type != 'dispatch':
+                continue
+            assert isinstance(event, Dispatch)
+            target_device = _get_dispatch_target_device(event)
+            if target_device < 0:
+                continue
+
+            terminal_event = None
+            for next_event in req_events[i + 1:]:
+                if next_event.event_type == 'dispatch':
+                    break
+                if next_event.event_type == 'rescheduling':
+                    terminal_event = next_event
+                    break
+                if next_event.event_type == 'finish' and 'reject' in getattr(next_event, 'finish_reason', ''):
+                    terminal_event = next_event
+                    break
+            if terminal_event is None:
+                continue
+
+            overhead = max(0.0, float(terminal_event.timestamp - event.timestamp))
+            admission_overhead_by_device[target_device].append(overhead)
+            scope = _classify_dispatch_scope(
+                target_device,
+                n_device=n_device,
+                group_size=group_size,
+                local_group_idx=local_group_idx,
+            )
+            admission_overhead_by_scope[scope].append(overhead)
+
+    retry_distribution = dict(sorted(Counter(retry_counts).items()))
+    retry_distribution_pct = {
+        retry_count: count / len(retry_counts)
+        for retry_count, count in retry_distribution.items()
+    } if retry_counts else {}
+    retry_stats = _summarize_samples(retry_counts)
+    scope_stats = {
+        scope: _summarize_samples(values)
+        for scope, values in sorted(
+            admission_overhead_by_scope.items(),
+            key=lambda item: _scope_label_sort_key(item[0]),
+        )
+    }
+    device_stats = {
+        device_id: _summarize_samples(values)
+        for device_id, values in sorted(admission_overhead_by_device.items())
+    }
+
+    if retry_distribution:
+        print('cross-node retry distribution', retry_distribution)
+        print('cross-node retry stats', retry_stats)
+    for scope, stats in scope_stats.items():
+        print(f'{scope} admission overhead', stats)
+
+    figure_path = None
+    if draw:
+        figure_path = f'{prefix}.cross_node_admission.png'
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5), tight_layout=True)
+
+        retry_ax, overhead_ax = axes
+        if retry_distribution:
+            retry_x = list(retry_distribution.keys())
+            retry_y = [retry_distribution[key] for key in retry_x]
+            retry_ax.bar(retry_x, retry_y, color='tab:blue', alpha=0.85)
+            retry_ax.set_xticks(retry_x)
+        else:
+            retry_ax.text(
+                0.5,
+                0.5,
+                'No dispatched requests',
+                ha='center',
+                va='center',
+                transform=retry_ax.transAxes,
+            )
+        retry_ax.set_xlabel('# retries before destination')
+        retry_ax.set_ylabel('# requests')
+        retry_ax.set_title('Retry Distribution')
+
+        scope_labels = _sorted_scope_labels(set(admission_overhead_by_scope.keys()))
+        if scope_labels:
+            scope_values = [admission_overhead_by_scope[label] for label in scope_labels]
+            box = overhead_ax.boxplot(
+                scope_values,
+                labels=scope_labels,
+                patch_artist=True,
+                showfliers=False,
+            )
+            for patch in box['boxes']:
+                patch.set(facecolor='tab:orange', alpha=0.6)
+            for idx, values in enumerate(scope_values, start=1):
+                if not values:
+                    continue
+                jitter = np.linspace(-0.08, 0.08, len(values)) if len(values) > 1 else np.array([0.0])
+                overhead_ax.scatter(
+                    np.full(len(values), idx, dtype=np.float64) + jitter,
+                    values,
+                    color='tab:red',
+                    s=18,
+                    alpha=0.65,
+                )
+        else:
+            overhead_ax.text(
+                0.5,
+                0.5,
+                'No rejected/rescheduled dispatches',
+                ha='center',
+                va='center',
+                transform=overhead_ax.transAxes,
+            )
+        overhead_ax.set_ylabel('Dispatch -> reject/reschedule (s)')
+        overhead_ax.set_title('Admission Overhead')
+        overhead_ax.tick_params(axis='x', rotation=15)
+
+        fig.savefig(figure_path, dpi=300, bbox_inches='tight')
+        print(f'Saved {figure_path}')
+        plt.close(fig)
+
+    return {
+        'retry_distribution': retry_distribution,
+        'retry_distribution_pct': retry_distribution_pct,
+        'retry_stats': retry_stats,
+        'admission_overhead': {
+            'scope': scope_stats,
+            'device': device_stats,
+        },
+        'figure': figure_path,
+    }
+
  
 def analyze_slo_violation(reqs: Dict[str, RequestInstance],
                           all_events: List[Event],
@@ -1477,6 +1698,8 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
                           slo_ttft_constant: float | None = None,
                           routing_overhead: float = -1.0,
                           n_device: int = -1,
+                          group_size: int | None = None,
+                          local_group_idx: int = 0,
                           prefix = 'trace_analysis',
                           draw = False,
                           verbose = False):
@@ -1536,7 +1759,6 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
     events = sorted(events, key=lambda x: x['arrival_time'])
     
     violations = [e['violation'] for e in events]
-    from collections import Counter
     violations = Counter(violations)
     total = sum(violations.values())
     violations = {k: v / total for k, v in violations.items()}
@@ -1569,6 +1791,14 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
         all_events, reqs.values(), n_device
     )
     finish_reasons = sum([[e.finish_reason for e in req.events if e.event_type == 'finish'] for req in reqs.values()], start = [])
+    cross_node_admission = analyze_cross_node_admission(
+        reqs,
+        n_device=n_device,
+        group_size=group_size,
+        local_group_idx=local_group_idx,
+        prefix=prefix,
+        draw=draw,
+    )
     
     if not draw:
         
@@ -1589,6 +1819,7 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
                 'device_stats': device_stats,
                 'energy_est': sum(energies),
                 'finish_reasons': dict(Counter(finish_reasons)),
+                'cross_node_admission': cross_node_admission,
                 **breakdown
             }
         }
@@ -1791,6 +2022,7 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
                 'device_stats': device_stats,
                 'energy_est': sum(energies),
                 'finish_reasons': dict(Counter(finish_reasons)),
+                'cross_node_admission': cross_node_admission,
                 **breakdown
             }
         
