@@ -1017,7 +1017,7 @@ def _supports_rr_workload_slicing(
     routing_policy: str,
     routing_kwargs: dict[str, Any] | str | None,
 ) -> bool:
-    if routing_policy not in {"round_robin", "round_robin_retry"}:
+    if routing_policy not in {"round_robin", "round_robin_retry", "round_robin_session"}:
         return False
     return not _routing_kwargs_to_dict(routing_kwargs).get("is_pd_disagg", False)
 
@@ -1100,6 +1100,13 @@ def _scale_rr_energy_results(
     return scaled_results, float(energy_consumption) * multiplier
 
 
+def _session_replay_suffix(enable_session_replay: bool, session_pause_s: float) -> str:
+    if not enable_session_replay:
+        return ""
+    pause = str(session_pause_s).replace("-", "m").replace(".", "p")
+    return f"_sessionreplay_{pause}s"
+
+
 def build_problems(
     model_name: str,
     trace: str,
@@ -1120,11 +1127,18 @@ def build_problems(
     scheduling_overhead: float = 0.0,
     routing_fallback_policy: str = "asap",
     kv_xfer_delay: float = 0.05,
+    enable_session_replay: bool = False,
+    session_pause_s: float = 0.0,
 ):
+    session_replay_suffix = _session_replay_suffix(
+        enable_session_replay,
+        session_pause_s,
+    )
     store_prefix = (
         f'{experiment_dir}/{scheduling_policy}_{routing_policy}_{load_scale}_'
         f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
-        f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}')
+        f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
+        f'{session_replay_suffix}')
     
     if ":" in trace: 
         requests_trace, arrival_times_trace = trace.split(":")
@@ -1305,7 +1319,14 @@ def build_problems(
         sch_kwargs['max_decoding_length'] = max_output_length
     
     routing_kwargss = []
-    if 'round_robin' in routing_policy:
+    if routing_policy == 'round_robin_session':
+        admission_mode = "off" # w/ round robin, we let each request ends
+        routing_kwargss = [{
+            "enable_rerouting": False,
+            "enable_rescheduling": False,
+            "sticky_sessions": True,
+        }]
+    elif 'round_robin' in routing_policy:
         _args = routing_policy.split('-')
         routing_policy = 'round_robin'
         admission_mode = "off" # w/ round robin, we let each request ends 
@@ -1537,14 +1558,16 @@ def build_problems(
         admission_mode = admission_mode,
         perf_model_err = perf_model_err,
         routing_overhead = routing_overhead,
-        routing_fallback_policy = routing_fallback_policy
+        routing_fallback_policy = routing_fallback_policy,
+        enable_session_replay = enable_session_replay,
+        session_pause_s = session_pause_s,
     ) for (scheduling_kwargs, routing_kwargs) in product(
         scheduling_kwargss, routing_kwargss)]
 
 
 
 SCHEDULING_POLICIES = ['vllm-no_rejection', 'vllm-fcfs', 'vllm-edf', 'slosserve-edf', 'slosserve-dp']
-ROUTING_POLICIES = ['round_robin', 'disaggregated', 'disaggregated-edf', 'slosserve', 'renaming']
+ROUTING_POLICIES = ['round_robin', 'round_robin_session', 'disaggregated', 'disaggregated-edf', 'slosserve', 'renaming']
 
 def run(
     model_name: str,
@@ -1568,6 +1591,8 @@ def run(
     routing_overhead: float,
     routing_fallback_policy: str,
     kv_xfer_delay: float,
+    enable_session_replay: bool,
+    session_pause_s: float,
 ):
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -1603,6 +1628,8 @@ def run(
     print(f'performance model errors: {perf_model_errs}')
     print(f'routing fallback policy: {routing_fallback_policy}')
     print(f'kv_xfer_delay: {kv_xfer_delay}')
+    print(f'enable_session_replay: {enable_session_replay}')
+    print(f'session_pause_s: {session_pause_s}')
     print('--End of Problem Grid--')
     results = {}
     if os.path.exists(f'{experiment_dir}/results.jsonl'):
@@ -1620,6 +1647,8 @@ def run(
                     r['ttft_slo_scale'],
                     r['slo_tpot'],
                     r['perf_model_err'],
+                    r.get('enable_session_replay', False),
+                    r.get('session_pause_s', 0.0),
                 ): r for r in results
             }
     else:
@@ -1651,6 +1680,8 @@ def run(
             ttft_slo_scale,
             slo_tpot,
             perf_model_err,
+            enable_session_replay,
+            session_pause_s,
         )
         if not overwrite and cache_key in results:
             print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot}, {perf_model_err} because it already exists')
@@ -1675,6 +1706,8 @@ def run(
             scheduling_overhead = scheduling_overhead,
             routing_fallback_policy=routing_fallback_policy,
             kv_xfer_delay=kv_xfer_delay,
+            enable_session_replay=enable_session_replay,
+            session_pause_s=session_pause_s,
         )
         if not len(problems):
             logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
@@ -1705,6 +1738,8 @@ def run(
             'slo_tpot': slo_tpot,
             'slo_violation_rate': 1 - best_result.results['slo_attainment_rate'],
             'perf_model_err': perf_model_err,
+            'enable_session_replay': enable_session_replay,
+            'session_pause_s': session_pause_s,
             
             'event_file': f'{problems[0].store_prefix}.events.jsonl',
             'energy_consumption': best_result.energy_consumption,
@@ -1835,6 +1870,10 @@ if __name__ == '__main__':
     parser.add_argument('--routing_overhead', type = float, default = -1.0, help = "mocked overhead from at engine.")
     parser.add_argument('--routing_fallback_policy', type = str, default = 'asap', choices = ['asap', 'reject'])
     parser.add_argument('--kv_xfer_delay', type=float, default=0.05, help='KV transfer delay budget in seconds')
+    parser.add_argument('--enable_session_replay', action='store_true', default=False,
+                        help='serialize turns within each session and delay later turns until the previous one finishes')
+    parser.add_argument('--session_pause_s', type=float, default=0.0,
+                        help='fixed think-time delay between turns of the same session when replay is enabled')
     args = parser.parse_args()
     
     if not args.run_all:
@@ -1862,6 +1901,8 @@ if __name__ == '__main__':
                 routing_overhead = args.routing_overhead,
                 routing_fallback_policy = args.routing_fallback_policy,
                 kv_xfer_delay = args.kv_xfer_delay,
+                enable_session_replay = args.enable_session_replay,
+                session_pause_s = args.session_pause_s,
             )
         exit(0)
     
@@ -1920,6 +1961,8 @@ if __name__ == '__main__':
                 'output_dir': args.output_dir,
                 'perf_model_errs': args.perf_model_err,
                 'kv_xfer_delay': args.kv_xfer_delay,
+                'enable_session_replay': args.enable_session_replay,
+                'session_pause_s': args.session_pause_s,
             })
         p.start()
         running_jobs.append((p, clients_str, router))

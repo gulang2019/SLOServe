@@ -2488,10 +2488,17 @@ class RenamingRouter(Router):
             if device.n_decode_reqs == 0:
                 device.state = 'idle'
 
-def create_router(t: str, n_devices: int, router_kwargs: str) -> Router:
+def create_router(t: str, n_devices: int, router_kwargs: str | dict[str, Any]) -> Router:
     logger.info(f"Creating router of type {t} with {n_devices} devices and kwargs: {router_kwargs}")
+    if isinstance(router_kwargs, str):
+        router_kwargs = json.loads(router_kwargs)
     if t == 'round_robin':
         return RoundRobinRouter(n_devices, router_kwargs)
+    elif t == 'round_robin_session':
+        return RoundRobinRouter(
+            n_devices,
+            dict(router_kwargs) | {'sticky_sessions': True},
+        )
     elif 'disaggregated-edf' in t:
         return DisaggregatedEDFRouter(n_devices, router_kwargs)
     elif 'disaggregated' in t:
