@@ -9,6 +9,7 @@ from typing import Any
 
 LIST_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "policies": ("policy",),
+    "extra_args": ("bench_extra_args", "cli_args"),
     "n_devices": ("n_device",),
     "load_scales": ("load_scale",),
     "ttft_slo_scales": ("ttft_slo_scale", "slo_ttft", "slo_ttfts"),
@@ -46,6 +47,7 @@ DEFAULT_TRACE_SPEC: dict[str, Any] = {
     "ttft_slo_scales": ["5.0"],
     "slo_tpots": ["0.05"],
     "perf_model_errs": ["1.0"],
+    "extra_args": [],
 }
 
 
@@ -140,6 +142,8 @@ def _pick_field_value(spec: dict[str, Any], canonical: str, aliases: tuple[str, 
 def _normalize_list_value(value: Any, *, field_name: str) -> list[str]:
     if value is None:
         return []
+    if field_name == "extra_args" and isinstance(value, str):
+        return shlex.split(value)
     if isinstance(value, list):
         if not value:
             raise ValueError(f"{field_name} must be a non-empty list.")
@@ -303,12 +307,20 @@ def render_bash_assignments(config: dict[str, Any]) -> str:
     lines.extend(_render_shell_list("TRACES", normalized["traces"]))
 
     for field_name in LIST_FIELD_ALIASES:
-        assoc_name = f"TRACE_{field_name.upper()}"
-        assoc_values = {
-            trace: " ".join(spec[field_name])
-            for trace, spec in trace_specs.items()
-            if field_name in spec
-        }
+        if field_name == "extra_args":
+            assoc_name = "TRACE_EXTRA_ARGS_SHELL"
+            assoc_values = {
+                trace: " ".join(_quote_shell(arg) for arg in spec[field_name])
+                for trace, spec in trace_specs.items()
+                if field_name in spec
+            }
+        else:
+            assoc_name = f"TRACE_{field_name.upper()}"
+            assoc_values = {
+                trace: " ".join(spec[field_name])
+                for trace, spec in trace_specs.items()
+                if field_name in spec
+            }
         lines.extend(_render_shell_assoc_array(assoc_name, assoc_values))
 
     for field_name in SCALAR_FIELD_ALIASES:

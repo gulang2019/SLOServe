@@ -1,0 +1,25 @@
+{
+  "experiment_name": "e2e",
+  "extends": [
+    "base.json"
+  ],
+  "policies": [
+    "round_robin:qlm",
+    "round_robin:atfc",
+    "round_robin_session:qlm",
+    "round_robin_session:atfc",
+    "slosserve_planner:atfc"
+  ],
+  "traces": [
+    "sharegpt_chat:azure_chat_23"
+  ],
+  "configs": {
+    "sharegpt_chat:azure_chat_23": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [8]
+    }
+  },
+  "extra_args": "--enable_session_replay --session_pause_s 5.0"
+}
+

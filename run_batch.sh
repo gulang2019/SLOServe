@@ -62,6 +62,10 @@ load_config() {
     read -r -a slo_tpots <<< "${TRACE_SLO_TPOTS[$key]}"
     read -r -a perf_model_errs <<< "${TRACE_PERF_MODEL_ERRS[$key]}"
     read -r -a trace_policies <<< "${TRACE_POLICIES[$key]}"
+    extra_bench_args=()
+    if [[ -n "${TRACE_EXTRA_ARGS_SHELL[$key]:-}" ]]; then
+      eval "extra_bench_args=(${TRACE_EXTRA_ARGS_SHELL[$key]})"
+    fi
 
     model_name="${TRACE_MODEL_NAME[$key]}"
     profit="${TRACE_PROFIT[$key]}"
@@ -95,6 +99,7 @@ load_config() {
   slo_tpots=("${DEFAULT_SLO_TPOTS[@]}")
   perf_model_errs=("${DEFAULT_PERF_MODEL_ERRS[@]}")
   trace_policies=("${POLICIES[@]}")
+  extra_bench_args=()
   model_name="$DEFAULT_MODEL_NAME"
   profit="$DEFAULT_PROFIT"
   admission_mode="$DEFAULT_ADMISSION_MODE"
@@ -118,7 +123,7 @@ make_run_key() {
     "$length_trace" \
     "$arrival_trace" \
     "$policy" \
-    "$window|load_scales=${load_scales[*]}|ttft_slo_scales=${ttft_slo_scales[*]}|slo_tpots=${slo_tpots[*]}|perf_model_errs=${perf_model_errs[*]}|model_name=${model_name}|tensor_parallel_size=${tensor_parallel_size}|profit=${profit}|admission_mode=${admission_mode}|slo_routing_overhead=${slo_routing_overhead}|scheduling_overhead=${scheduling_overhead}|routing_overhead=${routing_overhead}|routing_fallback_policy=${routing_fallback_policy}|output_dir=${output_dir}" \
+    "$window|load_scales=${load_scales[*]}|ttft_slo_scales=${ttft_slo_scales[*]}|slo_tpots=${slo_tpots[*]}|perf_model_errs=${perf_model_errs[*]}|model_name=${model_name}|tensor_parallel_size=${tensor_parallel_size}|profit=${profit}|admission_mode=${admission_mode}|slo_routing_overhead=${slo_routing_overhead}|scheduling_overhead=${scheduling_overhead}|routing_overhead=${routing_overhead}|routing_fallback_policy=${routing_fallback_policy}|output_dir=${output_dir}|extra_args=${extra_bench_args[*]}" \
     "${devices[*]}"
 }
 
@@ -219,6 +224,7 @@ run_suite() {
   local -a cmd=()
   local -a run_devices=()
   local -a trace_policies=()
+  local -a extra_bench_args=()
 
   available_clients="$(count_clients_spec "$SERVER_CLIENTS")"
 
@@ -285,6 +291,7 @@ run_suite() {
       echo "  routing_overhead=$routing_overhead"
       echo "  routing_fallback_policy=$routing_fallback_policy"
       echo "  output_dir=$output_dir"
+      echo "  extra_args=${extra_bench_args[*]}"
       if ((${#run_devices[@]} != ${#n_devices[@]})); then
         echo "  requested_n_devices=${n_devices[*]}"
         echo "  available_clients=$available_clients"
@@ -312,6 +319,7 @@ run_suite() {
         --output_dir "$output_dir"
         --routing_overhead "$routing_overhead"
         --routing_fallback_policy "$routing_fallback_policy"
+        "${extra_bench_args[@]}"
       )
 
       printf -v cmd_str '%q ' "${cmd[@]}"

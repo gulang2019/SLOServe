@@ -121,12 +121,35 @@ def test_render_bash_assignments_emits_trace_arrays():
     assert "SERVER_ROUTER_KWARGS=" in rendered
     assert "TRACES=(" in rendered
     assert "declare -gA TRACE_POLICIES=(" in rendered
+    assert "declare -gA TRACE_EXTRA_ARGS_SHELL=(" in rendered
     assert "declare -gA TRACE_LOAD_SCALES=(" in rendered
     assert "declare -gA TRACE_SLO_TPOTS=(" in rendered
     assert "declare -gA TRACE_WINDOW=(" in rendered
     assert "azure_chat:azure_chat" in rendered
     assert "2.0 3.0" in rendered
     assert "0.05 0.1" in rendered
+
+
+def test_normalize_batch_config_supports_extra_args_string_alias():
+    normalized = normalize_batch_config(
+        {
+            "policies": ["round_robin:atfc"],
+            "extra_args": "--enable_session_replay --session_pause_s 5.0",
+            "configs": {
+                "azure_chat:azure_chat": {
+                    "window": "t10:20",
+                    "n_devices": [2],
+                }
+            },
+        }
+    )
+
+    spec = normalized["trace_specs"]["azure_chat:azure_chat"]
+    assert spec["extra_args"] == [
+        "--enable_session_replay",
+        "--session_pause_s",
+        "5.0",
+    ]
 
 
 def test_normalize_batch_config_rejects_missing_required_fields():
