@@ -50,6 +50,10 @@ DEFAULT_TRACE_SPEC: dict[str, Any] = {
     "extra_args": [],
 }
 
+TOP_LEVEL_SCALAR_ALIASES: dict[str, tuple[str, ...]] = {
+    "server_clients": ("clients",),
+}
+
 
 def _deep_merge(base: Any, override: Any) -> Any:
     if isinstance(base, dict) and isinstance(override, dict):
@@ -94,7 +98,7 @@ def combine_batch_configs(config_dir: str | Path) -> dict[str, Any]:
         raise NotADirectoryError(f"Batch config directory not found: {root}")
 
     combined: dict[str, Any] = {}
-    for path in sorted(root.glob("*.json")):
+    for path in sorted(root.glob("*.json")) + sorted(root.glob("*.jsonl")):
         combined[path.name] = normalize_batch_config(load_batch_config(path))
     return combined
 
@@ -122,6 +126,16 @@ def _normalize_server_router_kwargs(value: Any) -> str:
         "server_router_kwargs must be a JSON string or object, "
         f"got {type(value).__name__}."
     )
+
+
+def _normalize_shell_args(value: Any, *, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return shlex.split(value)
+    if isinstance(value, list):
+        return [_format_scalar(item) for item in value]
+    return [_format_scalar(value)]
 
 
 def _field_names(canonical: str, aliases: tuple[str, ...]) -> tuple[str, ...]:
@@ -197,10 +211,22 @@ def _normalize_trace_spec(spec: Any, base: dict[str, Any] | None = None) -> dict
 def normalize_batch_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = {key: value for key, value in config.items()}
 
+    for field_name, aliases in TOP_LEVEL_SCALAR_ALIASES.items():
+        value = _pick_field_value(normalized, field_name, aliases)
+        if value is not None:
+            normalized[field_name] = _format_scalar(value)
+            for alias in aliases:
+                normalized.pop(alias, None)
+
     server_router_kwargs = normalized.get("server_router_kwargs")
     if server_router_kwargs is not None:
         normalized["server_router_kwargs"] = _normalize_server_router_kwargs(
             server_router_kwargs
+        )
+    if "extra_server_args" in normalized:
+        normalized["extra_server_args"] = _normalize_shell_args(
+            normalized["extra_server_args"],
+            field_name="extra_server_args",
         )
 
     default_trace_source: dict[str, Any] = {}
@@ -302,6 +328,11 @@ def render_bash_assignments(config: dict[str, Any]) -> str:
         lines.append(
             "SERVER_ROUTER_KWARGS="
             f"{_quote_shell(normalized['server_router_kwargs'])}"
+        )
+    if "extra_server_args" in normalized:
+        lines.append(
+            "SERVER_EXTRA_ARGS_SHELL="
+            f"{_quote_shell(' '.join(_quote_shell(arg) for arg in normalized['extra_server_args']))}"
         )
 
     lines.extend(_render_shell_list("TRACES", normalized["traces"]))

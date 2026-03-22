@@ -806,7 +806,7 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
     async with aiohttp.ClientSession() as session:
         if clients is not None:
             # Set a very long timeout for this request
-            timeout = aiohttp.ClientTimeout(total=600.0)  # 10 minutes
+            timeout = aiohttp.ClientTimeout(total=3000.0)  # 50 minutes
             async with session.post(endpoint + "/update_clients", json={'clients': clients}, timeout=timeout) as response:
                 response.raise_for_status()
         # await session.post(endpoint + "/warmup", json={'model': problem.model_name})
@@ -818,7 +818,7 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
             async with session.post(
                 endpoint + "/start_energy_profile",
                 json={"store_prefix": problem.store_prefix},
-                timeout=aiohttp.ClientTimeout(total=600.0),
+                timeout=aiohttp.ClientTimeout(total=3000.0),
             ) as response:
                 if response.status != 404:
                     response.raise_for_status()
@@ -1011,10 +1011,10 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
             json={
                 "filename": filename,
                 "admission_filename": admission_filename,
-                "timeout": 300.0,
+                "timeout": 3000.0,
                 "include_energy_csv": False,
             },
-            timeout=300.0
+            timeout=3000.0
         )
         response.raise_for_status()
         dump_profile_response = response.json()

@@ -15,57 +15,18 @@
   ],
   "traces": [
     "azure_code_23:azure_code_23",
-    "azure_chat_23:azure_chat_23",
-    "azure_chat:azure_chat",
-    "azure_code:azure_code",
-    "sharegpt_code:azure_code_23",
-    "sharegpt_chat:azure_chat_23"
+    "azure_chat_23:azure_chat_23"
   ],
   "configs": {
     "azure_code_23:azure_code_23": {
       "window": "t1200:1800",
       "load_scale": 1.0,
-      "n_devices": [2, 4, 8, 12, 16, 32]
+      "n_devices": [2, 4, 6, 8]
     },
     "azure_chat_23:azure_chat_23": {
       "window": "t1200:1800",
       "load_scale": 1.0,
       "n_devices": [2, 4, 6, 8]
-    },
-    "azure_code:azure_code": {
-      "window": "t1200:1800",
-      "load_scale": 1.0,
-      "n_devices": [2, 4, 8, 12, 16, 32]
-    },
-    "azure_chat:azure_chat": {
-      "window": "t1200:1800",
-      "load_scale": 1.0,
-      "n_devices": [2, 4, 8, 12, 16, 32]
-    },
-    "sharegpt_code:azure_code_23": {
-      "window": "t1200:1800",
-      "load_scale": 1.0,
-      "n_devices": [2, 4, 6, 8]
-    },
-    "sharegpt_chat:azure_chat_23": {
-      "window": "t1200:1800",
-      "load_scale": 1.0,
-      "n_devices": [2, 4, 6, 8]
-    },
-    "sharegpt_code:azure_code": {
-      "window": "t1200:1800",
-      "load_scale": 1.0,
-      "n_devices": [2, 4, 8, 12, 16, 32]
-    },
-    "sharegpt_chat:azure_chat": {
-      "window": "t1200:1800",
-      "load_scale": 1.0,
-      "n_devices": [2, 4, 8, 12, 16, 32]
-    },
-    "reasoning:azure_chat_23": {
-      "window": "t1200:1800",
-      "load_scale": 1.0,
-      "n_devices": [2, 4, 8, 12, 16, 32]
     }
   }
 }

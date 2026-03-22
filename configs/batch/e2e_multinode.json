@@ -1,0 +1,29 @@
+{
+  "experiment_name": "e2e",
+  "server_clients": "0-15",
+  "extends": [
+    "base.json"
+  ],
+  "policies": [
+    "round_robin:sarathi+",
+    "llumnix_load:sarathi+",
+    "round_robin:atfc",
+    "slosserve_planner:atfc"
+  ],
+  "traces": [
+    "azure_chat:azure_chat",
+    "azure_code:azure_code"
+  ],
+  "configs": {
+    "azure_code:azure_code": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [2, 4, 8, 12, 16]
+    },
+    "azure_chat:azure_chat": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [2, 4, 8, 12, 16]
+    }
+  }
+}

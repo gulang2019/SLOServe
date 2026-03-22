@@ -6,7 +6,7 @@
   "policies": [
     "slosserve_planner_ablation-no_local:atfc",
     "slosserve_planner_ablation-no_global:atfc",
-    "slosserve_planner_ablation:atfc"
+    "slosserve_planner:atfc"
   ],
   "traces": [
     "azure_code_23:azure_code_23",

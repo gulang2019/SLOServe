@@ -110,7 +110,7 @@ def build_config_report(config_path: str | Path) -> ConfigReport:
 def build_directory_report(config_dir: str | Path) -> dict[str, object]:
     root = Path(config_dir).expanduser().resolve()
     reports = []
-    for path in sorted(root.glob("*.json")):
+    for path in sorted(root.glob("*.json")) + sorted(root.glob("*.jsonl")):
         report = build_config_report(path)
         if report.experiments == 0:
             continue
@@ -145,7 +145,7 @@ def main() -> int:
         "--config-dir",
         type=str,
         default="configs/batch",
-        help="Directory containing batch config JSON files.",
+        help="Directory containing batch config JSON or JSONL files.",
     )
     parser.add_argument(
         "--json",

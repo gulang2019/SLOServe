@@ -1,0 +1,312 @@
+{
+  "configs": [
+    {
+      "available_clients": 8,
+      "config_name": "ablation_cluster.json",
+      "error": null,
+      "experiment_runs": 6,
+      "runnable_policy_invocations": 6,
+      "serial_wall_hours": 1.0,
+      "trace_count": 2,
+      "traces": [
+        {
+          "experiment_runs": 3,
+          "policy_count": 3,
+          "policy_device_runs": 3,
+          "requested_device_count": 1,
+          "runnable_policy_invocations": 3,
+          "serial_wall_hours": 0.5,
+          "sweep_count": 1,
+          "trace": "azure_code_23:azure_code_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        },
+        {
+          "experiment_runs": 3,
+          "policy_count": 3,
+          "policy_device_runs": 3,
+          "requested_device_count": 1,
+          "runnable_policy_invocations": 3,
+          "serial_wall_hours": 0.5,
+          "sweep_count": 1,
+          "trace": "azure_chat_23:azure_chat_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        }
+      ]
+    },
+    {
+      "available_clients": 8,
+      "config_name": "e2e.json",
+      "error": null,
+      "experiment_runs": 64,
+      "runnable_policy_invocations": 16,
+      "serial_wall_hours": 10.666666666666666,
+      "trace_count": 2,
+      "traces": [
+        {
+          "experiment_runs": 32,
+          "policy_count": 8,
+          "policy_device_runs": 32,
+          "requested_device_count": 4,
+          "runnable_policy_invocations": 8,
+          "serial_wall_hours": 5.333333333333333,
+          "sweep_count": 1,
+          "trace": "azure_code_23:azure_code_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        },
+        {
+          "experiment_runs": 32,
+          "policy_count": 8,
+          "policy_device_runs": 32,
+          "requested_device_count": 4,
+          "runnable_policy_invocations": 8,
+          "serial_wall_hours": 5.333333333333333,
+          "sweep_count": 1,
+          "trace": "azure_chat_23:azure_chat_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        }
+      ]
+    },
+    {
+      "available_clients": 16,
+      "config_name": "e2e_multinode.json",
+      "error": null,
+      "experiment_runs": 40,
+      "runnable_policy_invocations": 8,
+      "serial_wall_hours": 6.666666666666666,
+      "trace_count": 2,
+      "traces": [
+        {
+          "experiment_runs": 20,
+          "policy_count": 4,
+          "policy_device_runs": 20,
+          "requested_device_count": 5,
+          "runnable_policy_invocations": 4,
+          "serial_wall_hours": 3.333333333333333,
+          "sweep_count": 1,
+          "trace": "azure_chat:azure_chat",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        },
+        {
+          "experiment_runs": 20,
+          "policy_count": 4,
+          "policy_device_runs": 20,
+          "requested_device_count": 5,
+          "runnable_policy_invocations": 4,
+          "serial_wall_hours": 3.333333333333333,
+          "sweep_count": 1,
+          "trace": "azure_code:azure_code",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        }
+      ]
+    },
+    {
+      "available_clients": 8,
+      "config_name": "energy.json",
+      "error": null,
+      "experiment_runs": 12,
+      "runnable_policy_invocations": 2,
+      "serial_wall_hours": 2.0,
+      "trace_count": 1,
+      "traces": [
+        {
+          "experiment_runs": 12,
+          "policy_count": 2,
+          "policy_device_runs": 2,
+          "requested_device_count": 1,
+          "runnable_policy_invocations": 2,
+          "serial_wall_hours": 2.0,
+          "sweep_count": 6,
+          "trace": "azure_chat_23:azure_chat_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        }
+      ]
+    },
+    {
+      "available_clients": 8,
+      "config_name": "multiround_chat.json",
+      "error": null,
+      "experiment_runs": 5,
+      "runnable_policy_invocations": 5,
+      "serial_wall_hours": 0.8333333333333333,
+      "trace_count": 1,
+      "traces": [
+        {
+          "experiment_runs": 5,
+          "policy_count": 5,
+          "policy_device_runs": 5,
+          "requested_device_count": 1,
+          "runnable_policy_invocations": 5,
+          "serial_wall_hours": 0.8333333333333333,
+          "sweep_count": 1,
+          "trace": "sharegpt_chat:azure_chat_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        }
+      ]
+    },
+    {
+      "available_clients": 8,
+      "config_name": "reasoning.json",
+      "error": null,
+      "experiment_runs": 15,
+      "runnable_policy_invocations": 5,
+      "serial_wall_hours": 2.5,
+      "trace_count": 1,
+      "traces": [
+        {
+          "experiment_runs": 15,
+          "policy_count": 5,
+          "policy_device_runs": 15,
+          "requested_device_count": 3,
+          "runnable_policy_invocations": 5,
+          "serial_wall_hours": 2.5,
+          "sweep_count": 1,
+          "trace": "reasoning:azure_chat_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        }
+      ]
+    },
+    {
+      "available_clients": 8,
+      "config_name": "sensitivity_n_device.json",
+      "error": null,
+      "experiment_runs": 4,
+      "runnable_policy_invocations": 4,
+      "serial_wall_hours": 0.6666666666666666,
+      "trace_count": 1,
+      "traces": [
+        {
+          "experiment_runs": 4,
+          "policy_count": 4,
+          "policy_device_runs": 4,
+          "requested_device_count": 1,
+          "runnable_policy_invocations": 4,
+          "serial_wall_hours": 0.6666666666666666,
+          "sweep_count": 1,
+          "trace": "azure_code_23:azure_code_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        }
+      ]
+    },
+    {
+      "available_clients": 8,
+      "config_name": "sensitivity_perf_model.json",
+      "error": null,
+      "experiment_runs": 12,
+      "runnable_policy_invocations": 2,
+      "serial_wall_hours": 2.0,
+      "trace_count": 1,
+      "traces": [
+        {
+          "experiment_runs": 12,
+          "policy_count": 2,
+          "policy_device_runs": 2,
+          "requested_device_count": 1,
+          "runnable_policy_invocations": 2,
+          "serial_wall_hours": 2.0,
+          "sweep_count": 6,
+          "trace": "azure_code_23:azure_code_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        }
+      ]
+    },
+    {
+      "available_clients": 8,
+      "config_name": "sensitivity_slo.json",
+      "error": null,
+      "experiment_runs": 15,
+      "runnable_policy_invocations": 3,
+      "serial_wall_hours": 2.5,
+      "trace_count": 1,
+      "traces": [
+        {
+          "experiment_runs": 15,
+          "policy_count": 3,
+          "policy_device_runs": 3,
+          "requested_device_count": 1,
+          "runnable_policy_invocations": 3,
+          "serial_wall_hours": 2.5,
+          "sweep_count": 5,
+          "trace": "azure_code_23:azure_code_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        }
+      ]
+    },
+    {
+      "available_clients": 8,
+      "config_name": "sensitivity_slo_tpot.json",
+      "error": null,
+      "experiment_runs": 12,
+      "runnable_policy_invocations": 3,
+      "serial_wall_hours": 2.0,
+      "trace_count": 1,
+      "traces": [
+        {
+          "experiment_runs": 12,
+          "policy_count": 3,
+          "policy_device_runs": 3,
+          "requested_device_count": 1,
+          "runnable_policy_invocations": 3,
+          "serial_wall_hours": 2.0,
+          "sweep_count": 4,
+          "trace": "azure_code_23:azure_code_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        }
+      ]
+    },
+    {
+      "available_clients": 8,
+      "config_name": "e2e_30B.jsonl",
+      "error": null,
+      "experiment_runs": 32,
+      "runnable_policy_invocations": 8,
+      "serial_wall_hours": 5.333333333333333,
+      "trace_count": 2,
+      "traces": [
+        {
+          "experiment_runs": 16,
+          "policy_count": 4,
+          "policy_device_runs": 16,
+          "requested_device_count": 4,
+          "runnable_policy_invocations": 4,
+          "serial_wall_hours": 2.6666666666666665,
+          "sweep_count": 1,
+          "trace": "azure_code_23:azure_code_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        },
+        {
+          "experiment_runs": 16,
+          "policy_count": 4,
+          "policy_device_runs": 16,
+          "requested_device_count": 4,
+          "runnable_policy_invocations": 4,
+          "serial_wall_hours": 2.6666666666666665,
+          "sweep_count": 1,
+          "trace": "azure_chat_23:azure_chat_23",
+          "window": "t1200:1800",
+          "window_hours": 0.16666666666666666
+        }
+      ]
+    }
+  ],
+  "total": {
+    "config_count": 11,
+    "experiment_runs": 217,
+    "invalid_config_count": 0,
+    "runnable_policy_invocations": 62,
+    "serial_wall_hours": 36.166666666666664
+  }
+}
