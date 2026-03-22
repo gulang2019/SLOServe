@@ -20,7 +20,6 @@ import matplotlib.pyplot as plt
 from motivation.events_analysis import analyze_events, analyze_slo_violation
 from motivation.auto_scaling import eval_auto_scaling
 from Dataset.dataset import ArrivalTimes, Requests, Request
-from SLOsServe.fitting_utils import sanitize_filename, write_json
 
 
 logger = logging.getLogger(__name__)
@@ -28,11 +27,10 @@ logger.setLevel(logging.DEBUG)
 
 FRONTEND_DELAY=0.03
 
-from SLOsServe.perf_model import ASSETS_DIR, get_model_max_tokens, get_easy_name
-PERF_MODEL_REGRESSION_DIR = ASSETS_DIR / "perf_model_regressions"
+from SLOsServe.perf_model import get_model_max_tokens, get_easy_name
 
 
-def _extract_batch_regression_row(event: Dict[str, Any]) -> Dict[str, Any] | None:
+def _extract_batch_perf_error_row(event: Dict[str, Any]) -> Dict[str, Any] | None:
     if event.get("event_type") != "batch":
         return None
 
@@ -99,97 +97,124 @@ def _extract_batch_regression_row(event: Dict[str, Any]) -> Dict[str, Any] | Non
         "measured_time": max(0.0, elapsed - scheduling_overhead),
         "elapsed_time": max(0.0, elapsed),
         "scheduling_overhead": max(0.0, scheduling_overhead),
-        "batch": batch,
     }
 
 
-def _collect_batch_regression_rows(events: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], list[tuple[list[tuple[int, int]], float]]]:
-    regression_rows: List[Dict[str, Any]] = []
-    batch_times: list[tuple[list[tuple[int, int]], float]] = []
+def _collect_batch_perf_error_rows(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    error_rows: List[Dict[str, Any]] = []
 
     for event in events:
-        row = _extract_batch_regression_row(event)
+        row = _extract_batch_perf_error_row(event)
         if row is None:
             continue
-        regression_rows.append(row)
-        batch_times.append((
-            [(item["past_tokens"], item["scheduled_tokens"]) for item in row["batch"]],
-            row["measured_time"],
-        ))
+        error_s = float(row["estimated_time"] - row["measured_time"])
+        abs_error_s = float(abs(error_s))
+        measured_time = float(row["measured_time"])
+        relative_error = None
+        abs_relative_error = None
+        estimated_over_measured = None
+        if measured_time > 0.0:
+            relative_error = float(error_s / measured_time)
+            abs_relative_error = float(abs_error_s / measured_time)
+            estimated_over_measured = float(row["estimated_time"] / measured_time)
+        row.update({
+            "error_s": error_s,
+            "abs_error_s": abs_error_s,
+            "relative_error": relative_error,
+            "abs_relative_error": abs_relative_error,
+            "estimated_over_measured": estimated_over_measured,
+        })
+        error_rows.append(row)
 
-    return regression_rows, batch_times
+    return error_rows
 
 
-def _plot_batch_time_vs_batch_size(
-    regression_rows: List[Dict[str, Any]],
-    plot_path: str | Path,
-    title: str,
-) -> Path | None:
-    if not regression_rows:
-        return None
+def _summarize_distribution(values: List[float]) -> Dict[str, Any]:
+    if not values:
+        return {"count": 0}
 
-    output_path = Path(plot_path)
+    data = np.asarray(values, dtype=float)
+    percentiles = {
+        "p01": 1,
+        "p05": 5,
+        "p10": 10,
+        "p25": 25,
+        "p50": 50,
+        "p75": 75,
+        "p90": 90,
+        "p95": 95,
+        "p99": 99,
+    }
+    summary = {
+        "count": int(data.size),
+        "mean": float(np.mean(data)),
+        "std": float(np.std(data)),
+        "min": float(np.min(data)),
+        "max": float(np.max(data)),
+    }
+    for key, percentile in percentiles.items():
+        summary[key] = float(np.percentile(data, percentile))
+    return summary
+
+
+def _write_jsonl(path: str | Path, rows: List[Dict[str, Any]]) -> Path:
+    output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    df = pd.DataFrame(regression_rows)
-    grouped = (
-        df.groupby("batch_size", as_index=False)[["estimated_time", "measured_time", "predicted_time"]]
-        .mean()
-        .sort_values("batch_size")
-    )
-
-    fig, ax = plt.subplots(figsize=(8, 5), tight_layout=True)
-    for column, label in (
-        ("estimated_time", "Estimated"),
-        ("measured_time", "Measured"),
-        ("predicted_time", "Predicted"),
-    ):
-        ax.plot(grouped["batch_size"], grouped[column], marker="o", label=label)
-    ax.set_xlabel("Batch Size")
-    ax.set_ylabel("Time (s)")
-    ax.set_title(title)
-    ax.legend()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
+    with output_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
     return output_path
 
 
-def _regress_perf_model_from_batch_events(problem: "Problem", events: List[Dict[str, Any]]) -> Dict[str, str] | None:
-    regression_rows, batch_times = _collect_batch_regression_rows(events)
-    if not batch_times:
+def _log_perf_model_errors_from_batch_events(
+    problem: "Problem",
+    events: List[Dict[str, Any]],
+    output_path: str | Path,
+    *,
+    event_file: str,
+) -> Dict[str, Any] | None:
+    error_rows = _collect_batch_perf_error_rows(events)
+    if not error_rows:
         return None
 
-    from SLOsServe.perf_model import PerfModel
-
-    perf_model = PerfModel.get_perf_model(problem.model_name, problem.length_pattern)
-    fit_result = perf_model.fit(batch_times, tag=problem.length_pattern)
-
-    for row, predicted_time in zip(regression_rows, fit_result["predicted_times"]):
-        row["predicted_time"] = float(predicted_time)
-
-    run_name = sanitize_filename(
-        f"{problem.model_name}__{problem.length_pattern}__{Path(problem.store_prefix).name}"
-    )
-    regression_path = PERF_MODEL_REGRESSION_DIR / f"{run_name}.new_regressed.json"
-    write_json(regression_path, {
+    summary = {
         "model_name": problem.model_name,
-        "task": problem.length_pattern,
+        "length_pattern": problem.length_pattern,
         "store_prefix": problem.store_prefix,
-        "hardware_params": fit_result["hardware_params"],
-        "stats": fit_result["stats"],
-        "new_regressed": regression_rows,
-    })
+        "event_file": event_file,
+        "perf_model_err": float(problem.perf_model_err),
+        "relative_error_denominator": "measured_time",
+        "estimated_minus_measured_s": _summarize_distribution(
+            [float(row["error_s"]) for row in error_rows]
+        ),
+        "abs_estimated_minus_measured_s": _summarize_distribution(
+            [float(row["abs_error_s"]) for row in error_rows]
+        ),
+        "estimated_minus_measured_relative": _summarize_distribution([
+            float(row["relative_error"])
+            for row in error_rows
+            if row["relative_error"] is not None
+        ]),
+        "abs_estimated_minus_measured_relative": _summarize_distribution([
+            float(row["abs_relative_error"])
+            for row in error_rows
+            if row["abs_relative_error"] is not None
+        ]),
+    }
 
-    figure_path = Path(f"{problem.store_prefix}.batch_time_vs_batch_size.png")
-    _plot_batch_time_vs_batch_size(
-        regression_rows,
-        figure_path,
-        title=f"{get_easy_name(problem.model_name)} [{problem.length_pattern}]",
-    )
+    rows = [{
+        "record_type": "summary",
+        **summary,
+    }]
+    rows.extend({
+        "record_type": "batch_error",
+        **row,
+    } for row in error_rows)
+    output_path = _write_jsonl(output_path, list(rows))
 
     return {
-        "regression_path": str(regression_path),
-        "figure_path": str(figure_path),
+        "path": str(output_path),
+        "summary": summary,
     }
 
 
@@ -237,6 +262,7 @@ class Problem:
     # store_prefix
     store_prefix: str = 'problem'
     record_events: bool = False
+    log_perf_model_errors: bool = True
 
     def get_expected_profit(self, input_length: int):
         return float(self.profit_per_input_token * input_length + self.profit_per_output_token * average_output_length + self.profit_base)
@@ -884,10 +910,27 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
         json.dump(events, f, indent = 4)
     print(f'Saved {filename}')
 
-    regression_artifacts = _regress_perf_model_from_batch_events(problem, events)
-    if regression_artifacts is not None:
-        print(f"Saved perf-model regression data to {regression_artifacts['regression_path']}")
-        print(f"Saved batch-size timing figure to {regression_artifacts['figure_path']}")
+    perf_model_error_filename = f'{problem.store_prefix}.{i}.perf_model_errors.jsonl'
+    perf_model_error_artifacts = None
+    if problem.log_perf_model_errors:
+        perf_model_error_artifacts = _log_perf_model_errors_from_batch_events(
+            problem,
+            events,
+            perf_model_error_filename,
+            event_file=filename,
+        )
+        if perf_model_error_artifacts is not None:
+            print(
+                "Saved perf-model error log to "
+                f"{perf_model_error_artifacts['path']}"
+            )
+            error_summary = perf_model_error_artifacts["summary"]
+            print(
+                "Perf-model error summary:",
+                f"signed_mean={error_summary['estimated_minus_measured_s'].get('mean')}",
+                f"abs_mean={error_summary['abs_estimated_minus_measured_s'].get('mean')}",
+                f"relative_p50={error_summary['estimated_minus_measured_relative'].get('p50')}",
+            )
 
     # TODO(Yi): add oom fail rate analysis here.
     events, reqs = analyze_events(filename, verbose = True)
@@ -910,6 +953,9 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
     results['rr_sliced'] = rr_sliced
     results['rr_slice_kept_request_count'] = len(requests)
     results['rr_slice_total_request_count'] = original_request_count
+    if perf_model_error_artifacts is not None:
+        results['perf_model_error_summary'] = perf_model_error_artifacts["summary"]
+        results['perf_model_error_file'] = perf_model_error_artifacts["path"]
     if os.path.exists(admission_filename):
         with open(admission_filename, 'r') as f:
             admission_history = json.load(f)
@@ -1129,6 +1175,7 @@ def build_problems(
     kv_xfer_delay: float = 0.05,
     enable_session_replay: bool = False,
     session_pause_s: float = 0.0,
+    log_perf_model_errors: bool = True,
 ):
     session_replay_suffix = _session_replay_suffix(
         enable_session_replay,
@@ -1561,6 +1608,7 @@ def build_problems(
         routing_fallback_policy = routing_fallback_policy,
         enable_session_replay = enable_session_replay,
         session_pause_s = session_pause_s,
+        log_perf_model_errors = log_perf_model_errors,
     ) for (scheduling_kwargs, routing_kwargs) in product(
         scheduling_kwargss, routing_kwargss)]
 
@@ -1593,6 +1641,7 @@ def run(
     kv_xfer_delay: float,
     enable_session_replay: bool,
     session_pause_s: float,
+    log_perf_model_errors: bool,
 ):
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -1630,6 +1679,7 @@ def run(
     print(f'kv_xfer_delay: {kv_xfer_delay}')
     print(f'enable_session_replay: {enable_session_replay}')
     print(f'session_pause_s: {session_pause_s}')
+    print(f'log_perf_model_errors: {log_perf_model_errors}')
     print('--End of Problem Grid--')
     results = {}
     if os.path.exists(f'{experiment_dir}/results.jsonl'):
@@ -1708,6 +1758,7 @@ def run(
             kv_xfer_delay=kv_xfer_delay,
             enable_session_replay=enable_session_replay,
             session_pause_s=session_pause_s,
+            log_perf_model_errors=log_perf_model_errors,
         )
         if not len(problems):
             logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
@@ -1755,6 +1806,12 @@ def run(
             result.update(best_result.results['auto_scaling_analysis'])
         if 'extra_metrics' in best_result.results:
             result.update(best_result.results['extra_metrics'])
+        if 'perf_model_error_summary' in best_result.results:
+            result['perf_model_error_summary'] = best_result.results[
+                'perf_model_error_summary']
+        if 'perf_model_error_file' in best_result.results:
+            result['perf_model_error_file'] = (
+                f'{problems[0].store_prefix}.perf_model_errors.jsonl')
         print('--Result--')
         pprint.pprint(result)
         print('--End of Result--')
@@ -1763,8 +1820,17 @@ def run(
         with open(f'{experiment_dir}/results.jsonl', 'a') as f:
             f.write(json.dumps(result) + '\n')            
             
-        for surfix in ['events', 'reqs', 'execution_results', 'admission_history']:
-            os.system(f'cp {best_result.event_file}.{surfix}.jsonl {problems[0].store_prefix}.{surfix}.jsonl')
+        for surfix in [
+            'events',
+            'reqs',
+            'execution_results',
+            'admission_history',
+            'perf_model_errors',
+        ]:
+            src = f'{best_result.event_file}.{surfix}.jsonl'
+            dst = f'{problems[0].store_prefix}.{surfix}.jsonl'
+            if os.path.exists(src):
+                os.system(f'cp {src} {dst}')
     
         for r in run_results:
             os.system(f'rm {r.event_file}*')
@@ -1874,6 +1940,8 @@ if __name__ == '__main__':
                         help='serialize turns within each session and delay later turns until the previous one finishes')
     parser.add_argument('--session_pause_s', type=float, default=0.0,
                         help='fixed think-time delay between turns of the same session when replay is enabled')
+    parser.add_argument('--disable_perf_model_error_log', action='store_true',
+                        help='disable post-run batch-level estimated-vs-measured perf-model error logging')
     args = parser.parse_args()
     
     if not args.run_all:
@@ -1903,6 +1971,7 @@ if __name__ == '__main__':
                 kv_xfer_delay = args.kv_xfer_delay,
                 enable_session_replay = args.enable_session_replay,
                 session_pause_s = args.session_pause_s,
+                log_perf_model_errors = not args.disable_perf_model_error_log,
             )
         exit(0)
     
@@ -1963,6 +2032,7 @@ if __name__ == '__main__':
                 'kv_xfer_delay': args.kv_xfer_delay,
                 'enable_session_replay': args.enable_session_replay,
                 'session_pause_s': args.session_pause_s,
+                'log_perf_model_errors': not args.disable_perf_model_error_log,
             })
         p.start()
         running_jobs.append((p, clients_str, router))
