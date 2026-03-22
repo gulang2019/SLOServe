@@ -12,6 +12,7 @@ from itertools import product
 import logging
 import uuid
 import random
+from collections import deque
 import httpx
 import pandas as pd
 from pathlib import Path
@@ -540,6 +541,132 @@ def ensure_prompts_present(requests: List[Request], model_name: str) -> None:
         for i, req_idx in enumerate(indices):
             requests[req_idx].prompt = decoded_batch[i]
 
+
+def _generate_random_prompt_tokens(length: int, rng: random.Random) -> list[int]:
+    return [rng.randint(1000, 2000) for _ in range(max(0, int(length)))]
+
+
+def generate_session_replay_prompts(
+    requests: List[Request],
+    seed: int = 0,
+) -> None:
+    """Build synthetic prompts that preserve cached prefixes within a session."""
+    rng = random.Random(seed)
+    session_prompts: Dict[str, list[int]] = {}
+    warned_missing_session = False
+
+    for request in requests:
+        input_length = max(0, int(request.input_length))
+        cached_length = min(max(0, int(request.cached_length)), input_length)
+        session_id = request.session_id
+
+        if not session_id:
+            if cached_length > 0 and not warned_missing_session:
+                logger.warning(
+                    "enable_session_replay is on, but some requests have "
+                    "cached_length > 0 and no session_id; generating "
+                    "independent random prompts for those requests."
+                )
+                warned_missing_session = True
+            request.prompt = _generate_random_prompt_tokens(input_length, rng)
+            continue
+
+        prefix_tokens: list[int] = []
+        previous_prompt = session_prompts.get(session_id)
+        if previous_prompt is not None and cached_length > 0:
+            prefix_tokens = list(previous_prompt[:cached_length])
+        if len(prefix_tokens) < cached_length:
+            prefix_tokens.extend(
+                _generate_random_prompt_tokens(cached_length - len(prefix_tokens), rng)
+            )
+
+        prompt_tokens = prefix_tokens + _generate_random_prompt_tokens(
+            input_length - cached_length,
+            rng,
+        )
+        request.prompt = prompt_tokens
+        session_prompts[session_id] = prompt_tokens
+
+
+def prepare_request_prompts(
+    requests: List[Request],
+    model_name: str,
+    enable_session_replay: bool,
+) -> None:
+    if enable_session_replay:
+        generate_session_replay_prompts(requests)
+        return
+    ensure_prompts_present(requests, model_name)
+
+
+def build_session_replay_arrivals(
+    requests: List[Request],
+    arrival_times: List[float],
+    enable_session_replay: bool,
+) -> tuple[list[int], list[float], dict[str, deque[int]], dict[str, int]]:
+    if len(requests) != len(arrival_times):
+        raise ValueError(f"{len(requests)=} != {len(arrival_times)=}")
+    if not enable_session_replay:
+        return list(range(len(requests))), list(arrival_times), {}, {}
+
+    trace_request_indices: list[int] = []
+    trace_arrival_times: list[float] = []
+    session_turn_queues: dict[str, deque[int]] = {}
+    session_lengths: dict[str, int] = {}
+    seen_sessions: set[str] = set()
+
+    for idx, (request, arrival_time) in enumerate(zip(requests, arrival_times)):
+        session_id = request.session_id
+        if not session_id:
+            trace_request_indices.append(idx)
+            trace_arrival_times.append(arrival_time)
+            continue
+
+        session_lengths[session_id] = session_lengths.get(session_id, 0) + 1
+        if session_id not in seen_sessions:
+            seen_sessions.add(session_id)
+            session_turn_queues[session_id] = deque()
+            trace_request_indices.append(idx)
+            trace_arrival_times.append(arrival_time)
+            continue
+        session_turn_queues[session_id].append(idx)
+
+    return (
+        trace_request_indices,
+        trace_arrival_times,
+        session_turn_queues,
+        session_lengths,
+    )
+
+
+def release_ready_session_turns(
+    pending_indices: list[int],
+    requests: list[Request],
+    elapsed_time: float,
+    session_ready_at: dict[str, float],
+    session_turn_queues: dict[str, deque[int]],
+) -> list[int]:
+    if not session_turn_queues:
+        return []
+
+    pending_sessions = {
+        requests[idx].session_id
+        for idx in pending_indices
+        if requests[idx].session_id
+    }
+    released_indices: list[int] = []
+    for session_id, queue in session_turn_queues.items():
+        if not queue or session_id in pending_sessions:
+            continue
+        ready_at = session_ready_at.get(session_id)
+        if ready_at is None or ready_at == float("inf") or elapsed_time < ready_at:
+            continue
+        request_idx = queue.popleft()
+        pending_indices.append(request_idx)
+        pending_sessions.add(session_id)
+        released_indices.append(request_idx)
+    return released_indices
+
 async def _wait_for_server_ready(
     endpoint: str,
     timeout_s: float = 30.0,
@@ -612,15 +739,28 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
             f"kept_requests={len(requests)}",
             f"original_requests={original_request_count}",
         )
-    arrival_times = [t - arrival_base_time for t in arrival_times]
-    rps = len(arrival_times) / (arrival_times[-1] - arrival_times[0])
+    (
+        trace_request_indices,
+        trace_arrival_times,
+        session_turn_queues,
+        session_lengths,
+    ) = build_session_replay_arrivals(
+        requests,
+        arrival_times,
+        problem.enable_session_replay,
+    )
+    arrival_base_time = trace_arrival_times[0]
+    arrival_times = [t - arrival_base_time for t in trace_arrival_times]
+    rps = len(trace_request_indices) / (arrival_times[-1] - arrival_times[0])
     
     from SLOsServe.perf_model import PerfModel
     perf_model = PerfModel.get_perf_model(problem.model_name, problem.length_pattern)
     
-    # ensure_prompts_present(requests, problem.model_name)
-    for request in requests:
-        request.prompt = [random.randint(1000, 2000) for _ in range(request.input_length)]
+    prepare_request_prompts(
+        requests,
+        problem.model_name,
+        problem.enable_session_replay,
+    )
     
     # requests = requests.requests[window_start:window_end]
     # arrival_times = arrival_times.arrival_times[window_start:window_end]
@@ -632,6 +772,23 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
     print(f'#Requests: {len(requests)}')
     print(f'average_input_length: {average_input_length}')
     print(f'average_output_length: {average_output_length}')
+    if problem.enable_session_replay:
+        session_length_values = list(session_lengths.values())
+        if session_length_values:
+            session_request_count = sum(session_length_values)
+            print(
+                "Session replay:",
+                f"sessions={len(session_length_values)}",
+                f"session_requests={session_request_count}",
+                f"non_session_requests={len(requests) - session_request_count}",
+                f"session_head_arrivals={len(session_length_values)}",
+                f"mean_len={float(np.mean(session_length_values)):.2f}",
+                f"median_len={float(np.median(session_length_values)):.2f}",
+                f"p90_len={float(np.percentile(session_length_values, 90)):.2f}",
+                f"max_len={max(session_length_values)}",
+            )
+        else:
+            print("Session replay: no session_ids found in requests")
     
     
     arrival_idx = 0
@@ -669,8 +826,9 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
             if exc.status != 404:
                 raise
 
-    arrival_bar = tqdm.tqdm(total = len(requests), desc = 'Arrival')
-    finished_bar = tqdm.tqdm(total = len(requests), desc = 'Finished')
+    arrival_bar_desc = 'Session Arrival' if problem.enable_session_replay else 'Arrival'
+    arrival_bar = tqdm.tqdm(total = len(trace_request_indices), desc = arrival_bar_desc)
+    finished_bar = tqdm.tqdm(total = len(requests), desc = 'Finished Requests')
     
     global_start_time = time.time()
     print(f'global_start_time: {global_start_time}')
@@ -694,11 +852,20 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
         while finished_bar.n < len(requests):
             elapsed_time = time.time() - global_start_time + time_offset
             
-            while arrival_idx < len(requests) and arrival_times[arrival_idx] <= elapsed_time:
-                pending_indices.append(arrival_idx)
+            while arrival_idx < len(trace_request_indices) and arrival_times[arrival_idx] <= elapsed_time:
+                pending_indices.append(trace_request_indices[arrival_idx])
                 arrival_bar.update(1)
                 arrival_bar.set_description(f'Arrival Time: {arrival_times[arrival_idx]:.2f}, Elapsed Time: {elapsed_time:.2f}')
                 arrival_idx += 1
+
+            if problem.enable_session_replay:
+                release_ready_session_turns(
+                    pending_indices,
+                    requests,
+                    elapsed_time,
+                    session_ready_at,
+                    session_turn_queues,
+                )
 
             ready_indices, pending_indices = _split_ready_request_indices(
                 pending_indices,
@@ -750,7 +917,7 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
                 
             real_time = time.time()
             elapsed_time = real_time - global_start_time + time_offset
-            if finished_bar.n == arrival_bar.n and arrival_idx < len(requests) and (arrival_times[arrival_idx] - elapsed_time > 10):
+            if finished_bar.n == arrival_bar.n and arrival_idx < len(trace_request_indices) and (arrival_times[arrival_idx] - elapsed_time > 10):
                 time_offset += arrival_times[arrival_idx] - elapsed_time -1
                 time_offsets.append((real_time, time_offset))
                 continue

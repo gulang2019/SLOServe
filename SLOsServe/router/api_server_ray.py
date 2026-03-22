@@ -297,6 +297,27 @@ def _parse_clients_arg(raw_clients: str | None) -> list[str]:
         return []
     return [client.strip() for client in raw_clients.split(",") if client.strip()]
 
+
+def _parse_worker_env_args(raw_envs: list[str] | None) -> dict[str, str]:
+    env_vars: dict[str, str] = {}
+    if not raw_envs:
+        return env_vars
+    for raw_env in raw_envs:
+        for item in raw_env.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise ValueError(
+                    f"Invalid --worker_env value {item!r}; expected KEY=VALUE")
+            key, value = item.split("=", 1)
+            key = key.strip()
+            if not key:
+                raise ValueError(
+                    f"Invalid --worker_env value {item!r}; empty KEY")
+            env_vars[key] = value
+    return env_vars
+
 def _task_done(task: asyncio.Task):
     try:
         task.result()  # re-raises exception if task failed
@@ -317,9 +338,15 @@ class EngineWorker:
                  mock_engine: bool = False,
                  device_id: int = -1,
                  tensor_parallel_size: int = 1,
+                 worker_env: dict[str, str] | None = None,
                  vllm_port: int | None = None,
                  execplan_bus=None):
         setup_logger("SLOsServe.router.api_server", os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"))
+        if worker_env:
+            for key, value in worker_env.items():
+                os.environ[str(key)] = str(value)
+            logger.info("Replica %s applied worker env: %s", device_id,
+                        sorted(worker_env.items()))
         self.tensor_parallel_size = tensor_parallel_size
         if vllm_port is not None:
             os.environ["VLLM_PORT"] = str(vllm_port)
@@ -3695,6 +3722,12 @@ def parse_args():
     )
     parser.add_argument("--mock_connector", action="store_true", default=False, help="use mock connector to simulate the network latency")
     parser.add_argument("--ray_address", type=str, default=None)  # NEW: allow Ray cluster connect
+    parser.add_argument(
+        "--worker_env",
+        action="append",
+        default=[],
+        help="Environment variables propagated to EngineWorker actors, e.g. --worker_env NCCL_IB_DISABLE=1",
+    )
     parser.add_argument("--stat_window", type=float, default=0.5, help="stat window for collecting load statistics from backend engine (used for load prediction)")
     parser.add_argument("--mock_engine", action="store_true", default=False, help="use mock engine to simulate the model inference")
     parser.add_argument("--log_level", type=str, default=os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"), help="logging level (e.g., DEBUG, INFO, WARNING)")
@@ -3710,8 +3743,10 @@ def start_engine(clients: list):
             ray.init(log_to_driver=True, logging_level=ray_log_level)
 
     n_devices = len(clients)
+    worker_env = _parse_worker_env_args(args.worker_env)
     print('clients: ', clients, 'n_devices: ', n_devices,
-          'tensor_parallel_size: ', args.tensor_parallel_size)
+          'tensor_parallel_size: ', args.tensor_parallel_size,
+          'worker_env: ', worker_env)
 
     # Create one EngineWorker per logical replica. Each actor may use
     # multiple GPUs via tensor parallelism.
@@ -3735,17 +3770,23 @@ def start_engine(clients: list):
                 mock_engine=True,
                 device_id=device_id,
                 tensor_parallel_size=args.tensor_parallel_size,
+                worker_env=worker_env,
                 vllm_port=vllm_port,
                 execplan_bus=execplan_bus_actor,
                 output_queue = output_queue
             )
         else:
-            actor = EngineWorker.options(
-                num_gpus=args.tensor_parallel_size).remote(
+            actor_options: dict[str, Any] = {
+                "num_gpus": args.tensor_parallel_size,
+            }
+            if worker_env:
+                actor_options["runtime_env"] = {"env_vars": worker_env}
+            actor = EngineWorker.options(**actor_options).remote(
                 args.model_name,
                 args.mock_connector,
                 device_id=device_id,
                 tensor_parallel_size=args.tensor_parallel_size,
+                worker_env=worker_env,
                 vllm_port=vllm_port,
                 execplan_bus=execplan_bus_actor,
                 output_queue = output_queue 
