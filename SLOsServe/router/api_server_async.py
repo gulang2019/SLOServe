@@ -27,6 +27,7 @@ from vllm.inputs import TokensPrompt
 
 from motivation.bench_api_server import Problem
 from SLOsServe.perf_model import PerfModel
+from SLOsServe.router.engine_shutdown import shutdown_engine_instance
 
 import logging
 
@@ -869,7 +870,7 @@ async def lifespan(app: FastAPI):
 
     task = asyncio.create_task(routing_loop_with_error_monitoring())
     yield
-    engine.shutdown()
+    await shutdown_engine_instance(engine)
     task.cancel()
 app = FastAPI(lifespan=lifespan)
 
@@ -941,7 +942,7 @@ async def update_clients(request: Request):
     global engine 
     if engine is None or set(clients) != set(request_pool.clients):
         if engine is not None: 
-            engine.shutdown()
+            await shutdown_engine_instance(engine)
         start_engine(clients)
     request_pool.clients = clients
     logger.info(f"Updated clients: {clients}")

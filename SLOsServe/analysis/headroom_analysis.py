@@ -95,7 +95,8 @@ class Instance:
                  block_size = 16,
                  kv_cache_mem = 20e9,
                  max_decode_length = None,
-                 is_oracle: bool = False):
+                 is_oracle: bool = False,
+                 enforce_batch_memory_budget: bool = False):
         self.device_id = device_id
         self.event_queue = event_queue
         self.perf_model = PerfModel.get_perf_model(model_name)
@@ -107,9 +108,14 @@ class Instance:
         )
         if not Instance._printed_kv_cache_info:
             kv_mem_per_token = self.perf_model.get_kv_mem_per_token()
+            usable_kv_mem = self.mem_manager.total_free_blocks * block_size * kv_mem_per_token
             print(
-                f"[Instance {self.device_id}] kv_mem_per_token={kv_mem_per_token} "
-                f"num_free_blocks={self.mem_manager.total_free_blocks}"
+                f"[Instance {self.device_id}] configured_kv_cache_mem={int(kv_cache_mem)} "
+                f"usable_kv_cache_mem={usable_kv_mem} "
+                f"kv_mem_per_token={kv_mem_per_token} "
+                f"block_size={block_size} "
+                f"num_free_blocks={self.mem_manager.total_free_blocks} "
+                f"token_capacity={self.mem_manager.total_free_blocks * block_size}"
             )
             Instance._printed_kv_cache_info = True
         self.batch_planner = BatchPlanner(
@@ -117,6 +123,7 @@ class Instance:
             _block_size = block_size,
             _max_decode_length = self.perf_model.get_max_decode_length() if max_decode_length is None else max_decode_length,
             _is_oracle = is_oracle,
+            _enforce_batch_memory_budget = enforce_batch_memory_budget,
             _num_free_blocks = self.mem_manager.total_free_blocks,
         )
         
@@ -240,6 +247,7 @@ def calc_avg_num_servers(
     requests_list: list[Request] | None = None,
     is_pd_disagg: bool = False,
     verbose: bool = True,
+    enforce_batch_memory_budget: bool = False,
 ):
     if arrival_times_list is not None and requests_list is not None:
         arrival_times = ArrivalTimes(arrival_pattern, arrival_times_list)
@@ -264,6 +272,7 @@ def calc_avg_num_servers(
                           slo_ttft_scale=slo_ttft_scale,
                           slo_tpot = slo_tpot,
                           is_oracle = is_oracle,
+                          enforce_batch_memory_budget = enforce_batch_memory_budget,
                           max_decode_length = int(np.percentile([r.output_length for r in lengths.requests], 80))) for device_id in range(n_server)]
     for i, (t, req) in enumerate(zip(arrival_times.arrival_times, lengths.requests)):
         event_queue.push(t = t, event_type = "arrival", device_id = -1, obj = RequestInstance(req, f'req-{i}',mode = 'prefill_only' if is_pd_disagg else 'normal'))
@@ -276,6 +285,19 @@ def calc_avg_num_servers(
         p_arrival = None
         p_finish = None
     reject_reasons: dict[str, int] = {}
+    reject_counts = {
+        "comp": 0,
+        "mem": 0,
+        "unknown": 0,
+    }
+
+    def _categorize_reject_reason(reason: str) -> str:
+        if 'MEM' in reason:
+            return 'mem'
+        if reason == "UNKNOWN":
+            return 'unknown'
+        return 'comp'
+
     while len(event_queue):
         now, event_type, device_id, obj = event_queue.pop()
         if event_type == 'arrival':
@@ -290,6 +312,7 @@ def calc_avg_num_servers(
             if not acc:
                 reason = instance.batch_planner._last_infeasible_reason or "UNKNOWN"
                 reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
+                reject_counts[_categorize_reject_reason(reason)] += 1
         elif event_type == 'arrival_decode':
             assert isinstance(obj, RequestInstance)
             assert obj.mode == 'decode_only'
@@ -302,6 +325,7 @@ def calc_avg_num_servers(
             if not acc:
                 reason = instance.batch_planner._last_infeasible_reason or "UNKNOWN"
                 reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
+                reject_counts[_categorize_reject_reason(reason)] += 1
         elif event_type == 'batch_finish':
             instance = instances[device_id]
             instance.on_batch_finish(now, obj)
@@ -316,6 +340,12 @@ def calc_avg_num_servers(
         print("Rejected requests by reason:")
         for reason, count in sorted(reject_reasons.items(), key=lambda x: -x[1]):
             print(f"  {count}: {reason}")
+    rejection_summary = {
+        "comp": reject_counts["comp"],
+        "mem": reject_counts["mem"],
+        "unknown": reject_counts["unknown"],
+        "total": reject_counts["comp"] + reject_counts["mem"] + reject_counts["unknown"],
+    }
     
     all_idle_time = 0.0
     idle_time_ratio = 0
@@ -418,6 +448,7 @@ def calc_avg_num_servers(
         idle_time_ratio,
         aggregated_failures,
         per_instance_failures,
+        rejection_summary,
     )
 
 
@@ -474,6 +505,7 @@ def _compute_dataset_windows(
     n_server: int,
     is_oracle: bool = False,
     is_pd_disagg: bool = False,
+    enforce_batch_memory_budget: bool = False,
     parallel: bool = False,
     max_workers: int | None = None,
 ):
@@ -514,6 +546,7 @@ def _compute_dataset_windows(
                     n_server,
                     is_oracle,
                     is_pd_disagg,
+                    enforce_batch_memory_budget,
                     window_times,
                     window_requests,
                 ))
@@ -559,6 +592,7 @@ def _compute_window_from_lists(
     n_server: int,
     is_oracle: bool,
     is_pd_disagg: bool,
+    enforce_batch_memory_budget: bool,
     window_times: list[float],
     window_requests: list[Request],
 ):
@@ -574,7 +608,7 @@ def _compute_window_from_lists(
     ol_max = float(out_lens.max())
     ol_p95 = float(np.percentile(out_lens, 95))
     ol_median = float(np.percentile(out_lens, 50))
-    avg2peak, peak2min, n_active, n_total, idle_ratio, aggregated_failures, _ = calc_avg_num_servers(
+    avg2peak, peak2min, n_active, n_total, idle_ratio, aggregated_failures, _, _ = calc_avg_num_servers(
         arrival_pattern = arrival_pattern,
         length_pattern = length_pattern,
         model_name = model_name,
@@ -586,6 +620,7 @@ def _compute_window_from_lists(
         arrival_times_list = window_times,
         requests_list = window_requests,
         verbose = True,
+        enforce_batch_memory_budget = enforce_batch_memory_budget,
     )
     row = [
         dataset_label,
@@ -634,6 +669,7 @@ def _compute_window(
     n_server: int,
     is_oracle: bool = False,
     is_pd_disagg: bool = False,
+    enforce_batch_memory_budget: bool = False,
 ):
     times, requests = _get_dataset_data(arrival_pattern, length_pattern)
     if not times:
@@ -654,7 +690,7 @@ def _compute_window(
     ol_max = float(out_lens.max())
     ol_p95 = float(np.percentile(out_lens, 95))
     ol_median = float(np.percentile(out_lens, 50))
-    avg2peak, peak2min, n_active, n_total, idle_ratio, aggregated_failures, _ = calc_avg_num_servers(
+    avg2peak, peak2min, n_active, n_total, idle_ratio, aggregated_failures, _, _ = calc_avg_num_servers(
         arrival_pattern = arrival_pattern,
         length_pattern = length_pattern,
         model_name = model_name,
@@ -666,6 +702,7 @@ def _compute_window(
         arrival_times_list = window_times,
         requests_list = window_requests,
         verbose = False,
+        enforce_batch_memory_budget = enforce_batch_memory_budget,
     )
     row = [
         dataset_label,
@@ -709,6 +746,7 @@ if __name__ == '__main__':
     parser.add_argument("--dataset-label", default=None)
     parser.add_argument("--is-oracle", action="store_true")
     parser.add_argument("--is-pd-disagg", action="store_true")
+    parser.add_argument("--enforce-batch-memory-budget", action="store_true")
     parser.add_argument("--window-minutes", type=int, nargs="+", default=[5, 10, 30])
     parser.add_argument("--no-confirm", action="store_true")
     parser.add_argument("--output_name", default = 'headroom')
@@ -721,6 +759,7 @@ if __name__ == '__main__':
     window_minutes = args.window_minutes
     is_oracle = args.is_oracle
     is_pd_disagg = args.is_pd_disagg
+    enforce_batch_memory_budget = args.enforce_batch_memory_budget
     out_dir = "headroom_outputs"
     os.makedirs(out_dir, exist_ok=True)
     fig_dir = os.path.join(out_dir, "figs")
@@ -822,6 +861,7 @@ if __name__ == '__main__':
                         100,
                         is_oracle,
                         is_pd_disagg,
+                        enforce_batch_memory_budget,
                     ): (job_arrival_pattern, job_length_pattern, dataset, minutes, window_start, window_end)
                     for job_arrival_pattern, job_length_pattern, dataset, minutes, window_start, window_end in jobs
                 }

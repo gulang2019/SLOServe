@@ -13,6 +13,7 @@ import logging
 import uuid
 import random
 from collections import deque
+import aiohttp
 import httpx
 import pandas as pd
 from pathlib import Path
@@ -22,7 +23,7 @@ from motivation.events_analysis import analyze_events, analyze_slo_violation
 from motivation.auto_scaling import eval_auto_scaling
 from Dataset.dataset import ArrivalTimes, Requests, Request
 
-
+from SLOsServe.client_spec import count_client_spec, normalize_client_spec
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -688,7 +689,36 @@ async def _wait_for_server_ready(
         f"Server at {endpoint} did not become ready within {timeout_s}s"
     )
 
-async def main(problem: Problem, endpoint: str, clients: str | None):
+async def _configure_router_endpoint(
+    problem: Problem,
+    endpoint: str,
+    clients: str | None,
+    *,
+    update_clients: bool,
+) -> None:
+    print(f"Posting problem to endpoint: {endpoint}")
+    print(f"Problem: {problem}")
+
+    async with aiohttp.ClientSession() as session:
+        if clients is not None and update_clients:
+            timeout = aiohttp.ClientTimeout(total=3000.0)
+            response = await session.post(
+                endpoint + "/update_clients",
+                json={"clients": clients},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+        response = await session.post(endpoint + "/update_config", json=asdict(problem))
+        response.raise_for_status()
+
+
+async def main(
+    problem: Problem,
+    endpoint: str,
+    clients: str | None,
+    *,
+    update_clients: bool = True,
+):
     window_start, window_end = problem.window.split(':')
     arrival_times = ArrivalTimes.load(problem.arrival_pattern, 
                                       problem.load_scale, 
@@ -793,22 +823,12 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
     
     execution_results: List[ExecutionResult] = []
     
-    # Post the endpoint with the problem before starting the main loop
-    import aiohttp
-
-    # Optionally, you can log or print the endpoint and problem for debugging
-    print(f"Posting problem to endpoint: {endpoint}")
-    print(f"Problem: {problem}")
-
-    async with aiohttp.ClientSession() as session:
-        if clients is not None:
-            # Set a very long timeout for this request
-            timeout = aiohttp.ClientTimeout(total=3000.0)  # 50 minutes
-            async with session.post(endpoint + "/update_clients", json={'clients': clients}, timeout=timeout) as response:
-                response.raise_for_status()
-        # await session.post(endpoint + "/warmup", json={'model': problem.model_name})
-        response = await session.post(endpoint + "/update_config", json=asdict(problem))
-        response.raise_for_status()
+    await _configure_router_endpoint(
+        problem,
+        endpoint,
+        clients,
+        update_clients=update_clients,
+    )
     await _wait_for_server_ready(endpoint)
     async with aiohttp.ClientSession() as session:
         try:
@@ -1170,47 +1190,11 @@ async def main(problem: Problem, endpoint: str, clients: str | None):
 
 
 def _normalize_router_clients_arg(clients_arg: str | None) -> str | None:
-    if clients_arg is None:
-        return None
-    clients_arg = clients_arg.strip()
-    if not clients_arg:
-        return None
-
-    if "://" in clients_arg:
-        return clients_arg
-
-    if "-" in clients_arg and ":" not in clients_arg and "," not in clients_arg:
-        left, right = clients_arg.split("-", 1)
-        if left.isdigit() and right.isdigit():
-            start = int(left)
-            end = int(right)
-            return ",".join(f"r{i}" for i in range(start, end + 1))
-
-    if ":" in clients_arg and "," not in clients_arg:
-        left, right = clients_arg.split(":", 1)
-        if left.isdigit() and right.isdigit():
-            start = int(left)
-            count = int(right)
-            if start < 10:
-                return ",".join(f"r{i}" for i in range(start, start + count))
-            return ",".join(
-                f"http://localhost:{start + i}" for i in range(count))
-
-    tokens = [token.strip() for token in clients_arg.split(",") if token.strip()]
-    if not tokens:
-        return None
-    if all(token.isdigit() for token in tokens) and int(tokens[0]) < 10:
-        return ",".join(f"r{int(token)}" for token in tokens)
-    return ",".join(tokens)
+    return normalize_client_spec(clients_arg)
 
 
 def _count_router_clients_arg(clients_arg: str | None) -> int | None:
-    if clients_arg is None:
-        return None
-    tokens = [token.strip() for token in clients_arg.split(",") if token.strip()]
-    if not tokens:
-        return None
-    return len(tokens)
+    return count_client_spec(clients_arg)
 
 
 def _routing_kwargs_to_dict(
@@ -1806,6 +1790,7 @@ def run(
     enable_session_replay: bool,
     session_pause_s: float,
     log_perf_model_errors: bool,
+    update_clients: bool = True,
 ):
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -1931,7 +1916,14 @@ def run(
         for problem in problems:
             # print(f"Running problem: {problem}")
             problem.scheduling_kwargs['scheduling_overhead'] = scheduling_overhead
-            exec_result = asyncio.run(main(problem, endpoint, clients))
+            exec_result = asyncio.run(
+                main(
+                    problem,
+                    endpoint,
+                    clients,
+                    update_clients=update_clients,
+                )
+            )
             run_results.append(exec_result)
         best_result = max(run_results, key = lambda x: x.profit)
         requested_n_device = best_result.results.get('requested_n_device', n_device)
@@ -2087,6 +2079,8 @@ if __name__ == '__main__':
     parser.add_argument('--load_scales', type=float, default=[0.5,1.0,2.0,3.0,4.0], nargs='+', help = 'list of load scales (we rescale the arrival rate by load scale, higher load scale means higher query per second)')
     parser.add_argument('--router_ports', type=str, default='8001:4', help = 'port of router to run (inclusive)')
     parser.add_argument('--clients', type=str, default=None, help = 'logical replica labels (e.g. r0,r1,r2,r3) or legacy URL pool spec')
+    parser.add_argument('--skip_update_clients', action='store_true', default=False,
+                        help='assume the router already started with the desired clients and skip POST /update_clients')
     parser.add_argument('--run_all', action = 'store_true')
     # parser.add_argument('--scheduling_policies', type=str, default=SCHEDULING_POLICIES, nargs='+')
     # parser.add_argument('--routing_policies', type=str, default=ROUTING_POLICIES, nargs='+')
@@ -2136,6 +2130,7 @@ if __name__ == '__main__':
                 enable_session_replay = args.enable_session_replay,
                 session_pause_s = args.session_pause_s,
                 log_perf_model_errors = not args.disable_perf_model_error_log,
+                update_clients = not args.skip_update_clients,
             )
         exit(0)
     

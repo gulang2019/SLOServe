@@ -34,10 +34,12 @@ from vllm.inputs import TokensPrompt
 
 
 import logging
+from SLOsServe.client_spec import parse_client_spec
 from SLOsServe.perf_model import PerfModel
 from SLOsServe.router.execplan_bus import (ExecPlanBus, ExecPlan,
                                            extract_load_statistics)
 from SLOsServe.router.adm_ctrl import Request as BatchPlannerRequest
+from SLOsServe.router.engine_shutdown import shutdown_engine_instance
 from SLOsServe.router.macro import PERF_MODEL_HEADROOM, DUMP_SCHS, DUMP_ADM
 from SLOsServe.router.sem_util import MaxCapSemaphore
 from motivation.energy_measure import EnergyMeter, EnergyHistoryRecorder
@@ -293,9 +295,7 @@ routing_loop_task: asyncio.Task | None = None
 
 
 def _parse_clients_arg(raw_clients: str | None) -> list[str]:
-    if raw_clients is None:
-        return []
-    return [client.strip() for client in raw_clients.split(",") if client.strip()]
+    return parse_client_spec(raw_clients)
 
 
 def _parse_worker_env_args(raw_envs: list[str] | None) -> dict[str, str]:
@@ -470,7 +470,7 @@ class EngineWorker:
     async def shutdown(self):
         if self._energy_profiler is not None:
             self._energy_profiler.stop()
-        self.engine.shutdown()
+        await shutdown_engine_instance(self.engine)
         self._mux_task.cancel()
         try:
             await self._mux_task

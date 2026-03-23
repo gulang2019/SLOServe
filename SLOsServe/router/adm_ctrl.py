@@ -78,6 +78,7 @@ class BatchPlanner:
     _max_batch_size: int | None = None
     _profile_events: list = field(default_factory=list)
     _is_oracle: bool = False
+    _enforce_batch_memory_budget: bool = False
     _now = time.time
     
     _num_free_blocks: int # the number of free blocks
@@ -99,6 +100,7 @@ class BatchPlanner:
         # Initialize C++ admission controller; TPOT is set lazily per request mix.
         self._adm_ctrler = SLOsServe_C.AdmCtrlScheduler("edf_sim", self._block_size, False, False)
         self._adm_ctrler_tpot = None
+        self.batch_id = 0
 
     def _cap_batch_size(self, batch_size: int) -> int:
         batch_size = max(0, int(batch_size))
@@ -108,6 +110,62 @@ class BatchPlanner:
 
     def _get_batch_time(self, batch: Batch):
         return self._perf_model.get_batch_time([(self._requests[req_id].num_computed_tokens, v) for req_id, v in batch.n_scheduled_tokens.items()])
+
+    def _get_num_blocks(self, n_tokens: int) -> int:
+        if n_tokens <= 0:
+            return 0
+        return math.ceil(n_tokens / self._block_size)
+
+    def _get_block_growth(self, req: Request, n_scheduled_tokens: int) -> int:
+        if n_scheduled_tokens <= 0:
+            return 0
+        before = self._get_num_blocks(req.num_computed_tokens)
+        after = self._get_num_blocks(req.num_computed_tokens + n_scheduled_tokens)
+        return after - before
+
+    def _cap_tokens_to_memory_budget(
+        self,
+        req: Request,
+        n_scheduled_tokens: int,
+        remaining_blocks: int,
+    ) -> int:
+        if n_scheduled_tokens <= 0 or remaining_blocks < 0:
+            return 0
+        if self._get_block_growth(req, n_scheduled_tokens) <= remaining_blocks:
+            return n_scheduled_tokens
+        current_blocks = self._get_num_blocks(req.num_computed_tokens)
+        max_tokens = max(
+            0,
+            (current_blocks + remaining_blocks) * self._block_size - req.num_computed_tokens,
+        )
+        return min(n_scheduled_tokens, max_tokens)
+
+    def _fit_batch_to_memory_budget(self, batch: Batch) -> tuple[Batch, bool]:
+        remaining_blocks = self._num_free_blocks
+        trimmed_schedule: dict[str, int] = {}
+        memory_limited = False
+        reclaimed_tokens = 0
+        for req_id, n_scheduled_tokens in batch.n_scheduled_tokens.items():
+            req = self._requests.get(req_id)
+            if req is None:
+                memory_limited = True
+                reclaimed_tokens += n_scheduled_tokens
+                continue
+            capped_tokens = self._cap_tokens_to_memory_budget(
+                req,
+                n_scheduled_tokens,
+                remaining_blocks,
+            )
+            if capped_tokens < n_scheduled_tokens:
+                memory_limited = True
+                reclaimed_tokens += n_scheduled_tokens - capped_tokens
+            if capped_tokens <= 0:
+                continue
+            remaining_blocks -= self._get_block_growth(req, capped_tokens)
+            trimmed_schedule[req_id] = capped_tokens
+        batch.n_scheduled_tokens = trimmed_schedule
+        batch.unscheduled_tokens += reclaimed_tokens
+        return batch, memory_limited
 
     def _ensure_cpp_planner(self, tpot: float):
         if self._adm_ctrler_tpot is not None and abs(self._adm_ctrler_tpot - tpot) < 1e-9:
@@ -300,6 +358,17 @@ class BatchPlanner:
         admitted_requests = set(self._admitted_requests)
         self._admitted_requests.clear()
         next_batch = self._batch_plan[0]
+        if self._enforce_batch_memory_budget:
+            next_batch, memory_limited = self._fit_batch_to_memory_budget(next_batch)
+            if memory_limited:
+                logger.debug(
+                    "[BatchPlanner] Trimmed next batch to fit memory budget: num_free_blocks=%s, scheduled=%s",
+                    self._num_free_blocks,
+                    next_batch.n_scheduled_tokens,
+                )
+            if not next_batch.n_scheduled_tokens:
+                self._next_batch_time = None
+                return {}, admitted_requests, ExecPlan()
         self._next_batch_time = self._now() + self._get_batch_time(next_batch)
         
         refresh_time = time.time() - start 
