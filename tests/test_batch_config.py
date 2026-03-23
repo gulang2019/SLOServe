@@ -120,6 +120,8 @@ def test_render_bash_assignments_emits_trace_arrays():
     assert "SERVER_CLIENTS=0-3" in rendered
     assert "SERVER_ROUTER_KWARGS=" in rendered
     assert "TRACES=(" in rendered
+    assert "declare -gA TRACE_SERVER_ARGS_SHELL=(" in rendered
+    assert "declare -gA TRACE_SERVER_ROUTER_KWARGS=(" in rendered
     assert "declare -gA TRACE_POLICIES=(" in rendered
     assert "declare -gA TRACE_EXTRA_ARGS_SHELL=(" in rendered
     assert "declare -gA TRACE_LOAD_SCALES=(" in rendered
@@ -150,6 +152,71 @@ def test_normalize_batch_config_supports_extra_args_string_alias():
         "--session_pause_s",
         "5.0",
     ]
+
+
+def test_normalize_batch_config_extracts_server_launch_overrides():
+    normalized = normalize_batch_config(
+        {
+            "server_router_kwargs": {
+                "device_mem": 1024,
+                "block_size": 16,
+                "model_name": "stale/model",
+            },
+            "extra_server_args": (
+                "--tensor_parallel_size 2 "
+                "--worker_env NCCL_IB_DISABLE=1"
+            ),
+            "extra_args": "--model_name Qwen/Test-30B",
+            "policies": ["round_robin:atfc"],
+            "configs": {
+                "azure_chat:azure_chat": {
+                    "window": "t10:20",
+                    "n_devices": [2],
+                }
+            },
+        }
+    )
+
+    spec = normalized["trace_specs"]["azure_chat:azure_chat"]
+    assert spec["model_name"] == "Qwen/Test-30B"
+    assert spec["tensor_parallel_size"] == "2"
+    assert "extra_args" not in spec
+    assert normalized["extra_server_args"] == [
+        "--worker_env",
+        "NCCL_IB_DISABLE=1",
+    ]
+    assert normalized["trace_server_args"]["azure_chat:azure_chat"] == [
+        "--worker_env",
+        "NCCL_IB_DISABLE=1",
+        "--model_name",
+        "Qwen/Test-30B",
+        "--tensor_parallel_size",
+        "2",
+    ]
+    assert json.loads(
+        normalized["trace_server_router_kwargs"]["azure_chat:azure_chat"]
+    ) == {
+        "block_size": 16,
+        "device_mem": 1024,
+        "model_name": "Qwen/Test-30B",
+    }
+
+
+def test_normalize_batch_config_rejects_conflicting_reserved_server_args():
+    with pytest.raises(ValueError):
+        normalize_batch_config(
+            {
+                "tensor_parallel_size": 1,
+                "extra_server_args": "--tensor_parallel_size 2",
+                "policies": ["round_robin:atfc"],
+                "configs": {
+                    "azure_chat:azure_chat": {
+                        "window": "t10:20",
+                        "n_devices": [2],
+                    }
+                },
+            }
+        )
 
 
 def test_normalize_batch_config_rejects_missing_required_fields():

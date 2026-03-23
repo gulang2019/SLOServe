@@ -23,6 +23,7 @@ SUCCEEDED_LOG="${SUCCEEDED_LOG:-$SCRIPT_DIR/succeeded_runs.log}"
 FAILED_LOG="${FAILED_LOG:-$SCRIPT_DIR/failed_runs.log}"
 RUN_LOG="${RUN_LOG:-$SCRIPT_DIR/all_runs.log}"
 SERVER_ROUTER_KWARGS='{"device_mem":1248576, "block_size":16, "model_name":"Qwen/Qwen2.5-7B-Instruct", "tpot":0.05, "scheduling_overhead":0.005, "max_decode_length":500, "is_pd_disagg":0, "n_prefill_per_group":1, "max_decode_bs":16, "enable_rerouting":0}'
+SERVER_EXTRA_ARGS_SHELL="${SERVER_EXTRA_ARGS_SHELL:-}"
 SERVER_CLIENTS="${SERVER_CLIENTS:-0-7}"
 
 touch "$SUCCEEDED_LOG" "$FAILED_LOG" "$RUN_LOG"
@@ -48,6 +49,8 @@ load_config() {
   local key="${length_trace}:${arrival_trace}"
   local cfg
   local -a cfg_parts=()
+
+  server_router_kwargs="$SERVER_ROUTER_KWARGS"
 
   if [[ "$BATCH_CONFIG_LOADED" == "1" ]]; then
     if [[ -z "${TRACE_WINDOW[$key]:-}" ]]; then
@@ -76,6 +79,16 @@ load_config() {
     routing_fallback_policy="${TRACE_ROUTING_FALLBACK_POLICY[$key]}"
     tensor_parallel_size="${TRACE_TENSOR_PARALLEL_SIZE[$key]}"
     output_dir="${TRACE_OUTPUT_DIR[$key]:-experiments_${EXPERIMENT_NAME}}"
+    server_router_kwargs="${TRACE_SERVER_ROUTER_KWARGS[$key]:-$SERVER_ROUTER_KWARGS}"
+    server_extra_args=()
+    if [[ -n "${TRACE_SERVER_ARGS_SHELL[$key]:-}" ]]; then
+      eval "server_extra_args=(${TRACE_SERVER_ARGS_SHELL[$key]})"
+    else
+      if [[ -n "${SERVER_EXTRA_ARGS_SHELL:-}" ]]; then
+        eval "server_extra_args=(${SERVER_EXTRA_ARGS_SHELL})"
+      fi
+      server_extra_args+=(--model_name "$model_name" --tensor_parallel_size "$tensor_parallel_size")
+    fi
     return
   fi
 
@@ -109,6 +122,11 @@ load_config() {
   routing_fallback_policy="$DEFAULT_ROUTING_FALLBACK_POLICY"
   tensor_parallel_size="$DEFAULT_TENSOR_PARALLEL_SIZE"
   output_dir="experiments_${EXPERIMENT_NAME}"
+  server_extra_args=()
+  if [[ -n "${SERVER_EXTRA_ARGS_SHELL:-}" ]]; then
+    eval "server_extra_args=(${SERVER_EXTRA_ARGS_SHELL})"
+  fi
+  server_extra_args+=(--model_name "$model_name" --tensor_parallel_size "$tensor_parallel_size")
 }
 
 make_run_key() {
@@ -149,7 +167,10 @@ log_run_cmd() {
 }
 
 cleanup_server() {
-  local server_pid="$1"
+  local server_pid="${1:-}"
+  if [[ -z "$server_pid" ]]; then
+    return 0
+  fi
   kill "$server_pid" 2>/dev/null || true
   wait "$server_pid" 2>/dev/null || true
 }
@@ -210,23 +231,19 @@ filter_compatible_devices() {
   done
 }
 
-run_suite() {
-  local trace
-  local length_trace
-  local arrival_trace
-  local policy
-  local run_key
-  local server_pid
-  local bench_status
-  local cmd_str
-  local available_clients
-  local -a server_cmd=()
-  local -a cmd=()
-  local -a run_devices=()
-  local -a trace_policies=()
-  local -a extra_bench_args=()
+compute_server_signature() {
+  local server_args_key
+  printf -v server_args_key '%q ' "${server_extra_args[@]}"
+  printf '%s|%s|%s|%s\n' \
+    "$RUN_BATCH_PORT" \
+    "$SERVER_CLIENTS" \
+    "$server_router_kwargs" \
+    "$server_args_key"
+}
 
-  available_clients="$(count_clients_spec "$SERVER_CLIENTS")"
+start_server() {
+  local -a server_cmd=()
+  local server_cmd_str
 
   server_cmd=(
     python -m SLOsServe.router.api_server_ray
@@ -235,22 +252,58 @@ run_suite() {
     --port "$RUN_BATCH_PORT"
     --window_size 0.005
     --router slosserve
-    --router_kwargs "$SERVER_ROUTER_KWARGS"
+    --router_kwargs "$server_router_kwargs"
     --clients "$SERVER_CLIENTS"
     --admission_mode anytime
     --mock_connector
+    "${server_extra_args[@]}"
   )
+
+  printf -v server_cmd_str '%q ' "${server_cmd[@]}"
+  echo "STARTING SERVER: $server_cmd_str"
+  log_run_cmd "SERVER_START" "$current_server_signature" "$server_cmd_str"
 
   "${server_cmd[@]}" &
   server_pid=$!
-  trap 'cleanup_server "$server_pid"' EXIT
   wait_for_server
+}
+
+run_suite() {
+  local trace
+  local length_trace
+  local arrival_trace
+  local policy
+  local run_key
+  local server_pid=""
+  local current_server_signature=""
+  local next_server_signature
+  local bench_status
+  local cmd_str
+  local available_clients
+  local -a cmd=()
+  local -a run_devices=()
+  local -a trace_policies=()
+  local -a extra_bench_args=()
+  local -a server_extra_args=()
+
+  available_clients="$(count_clients_spec "$SERVER_CLIENTS")"
+  trap 'cleanup_server "$server_pid"' EXIT
 
   for trace in "${TRACES[@]}"; do
     length_trace="${trace%%:*}"
     arrival_trace="${trace##*:}"
 
     load_config "$length_trace" "$arrival_trace"
+    next_server_signature="$(compute_server_signature)"
+    if [[ -z "$server_pid" || "$next_server_signature" != "$current_server_signature" ]]; then
+      if [[ -n "$server_pid" ]]; then
+        echo "RESTARTING SERVER for ${length_trace}:${arrival_trace}"
+        cleanup_server "$server_pid"
+        server_pid=""
+      fi
+      current_server_signature="$next_server_signature"
+      start_server
+    fi
 
     for policy in "${trace_policies[@]}"; do
       run_devices=("${n_devices[@]}")

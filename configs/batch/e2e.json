@@ -22,12 +22,12 @@
     "azure_code_23:azure_code_23": {
       "window": "t1200:1800",
       "load_scale": 1.0,
-      "n_devices": [2, 4, 6, 8]
+      "n_devices": [8,6,4,2]
     },
     "azure_chat_23:azure_chat_23": {
       "window": "t1200:1800",
       "load_scale": 1.0,
-      "n_devices": [2, 4, 6, 8]
+      "n_devices": [8,6,4,2]
     }
   }
 }

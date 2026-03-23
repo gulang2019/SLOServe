@@ -47,11 +47,15 @@ DEFAULT_TRACE_SPEC: dict[str, Any] = {
     "ttft_slo_scales": ["5.0"],
     "slo_tpots": ["0.05"],
     "perf_model_errs": ["1.0"],
-    "extra_args": [],
 }
 
 TOP_LEVEL_SCALAR_ALIASES: dict[str, tuple[str, ...]] = {
     "server_clients": ("clients",),
+}
+
+RESERVED_BATCH_CLI_FLAGS: dict[str, str] = {
+    "--model_name": "model_name",
+    "--tensor_parallel_size": "tensor_parallel_size",
 }
 
 
@@ -118,10 +122,18 @@ def _format_scalar(value: Any) -> str:
 
 
 def _normalize_server_router_kwargs(value: Any) -> str:
+    return json.dumps(
+        _normalize_server_router_kwargs_dict(value),
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _normalize_server_router_kwargs_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
-        return value
+        value = json.loads(value)
     if isinstance(value, dict):
-        return json.dumps(value, separators=(",", ":"), sort_keys=True)
+        return dict(value)
     raise TypeError(
         "server_router_kwargs must be a JSON string or object, "
         f"got {type(value).__name__}."
@@ -179,6 +191,85 @@ def _parse_legacy_trace_config(value: str) -> dict[str, Any]:
     }
 
 
+def _consume_reserved_cli_overrides(
+    args: list[str],
+    *,
+    field_name: str,
+    target_spec: dict[str, Any],
+    locked_fields: set[str] | None = None,
+) -> list[str]:
+    remaining: list[str] = []
+    seen: dict[str, str] = {}
+    locked_fields = locked_fields or set()
+    idx = 0
+
+    while idx < len(args):
+        arg = args[idx]
+        canonical: str | None = None
+        value: str | None = None
+        consume_count = 1
+
+        if arg in RESERVED_BATCH_CLI_FLAGS:
+            canonical = RESERVED_BATCH_CLI_FLAGS[arg]
+            if idx + 1 >= len(args):
+                raise ValueError(f"{field_name} is missing a value for {arg}.")
+            value = _format_scalar(args[idx + 1])
+            consume_count = 2
+        else:
+            for flag, field in RESERVED_BATCH_CLI_FLAGS.items():
+                prefix = f"{flag}="
+                if arg.startswith(prefix):
+                    canonical = field
+                    value = _format_scalar(arg[len(prefix):])
+                    break
+
+        if canonical is None:
+            remaining.append(arg)
+            idx += 1
+            continue
+
+        existing = target_spec.get(canonical)
+        if existing is not None and _format_scalar(existing) != value:
+            if canonical in locked_fields:
+                raise ValueError(
+                    f"Conflicting {canonical} values between {field_name} and "
+                    f"canonical config fields: {_format_scalar(existing)!r} vs {value!r}"
+                )
+        if canonical in seen and seen[canonical] != value:
+            raise ValueError(
+                f"Conflicting {canonical} values inside {field_name}: "
+                f"{seen[canonical]!r} vs {value!r}"
+            )
+
+        seen[canonical] = value
+        target_spec[canonical] = value
+        idx += consume_count
+
+    return remaining
+
+
+def _build_trace_server_router_kwargs(
+    server_router_kwargs: dict[str, Any],
+    trace_spec: dict[str, Any],
+) -> str:
+    merged = dict(server_router_kwargs)
+    merged["model_name"] = trace_spec["model_name"]
+    return json.dumps(merged, separators=(",", ":"), sort_keys=True)
+
+
+def _build_trace_server_args(
+    trace_spec: dict[str, Any],
+    extra_server_args: list[str],
+) -> list[str]:
+    return [
+        *extra_server_args,
+        "--model_name",
+        trace_spec["model_name"],
+        "--tensor_parallel_size",
+        trace_spec["tensor_parallel_size"],
+    ]
+
+
 def _normalize_trace_spec(spec: Any, base: dict[str, Any] | None = None) -> dict[str, Any]:
     if isinstance(spec, str):
         raw_spec = _parse_legacy_trace_config(spec)
@@ -191,8 +282,15 @@ def _normalize_trace_spec(spec: Any, base: dict[str, Any] | None = None) -> dict
         )
 
     normalized = dict(base or {})
+    explicit_scalar_fields = {
+        field_name
+        for field_name, aliases in SCALAR_FIELD_ALIASES.items()
+        if _pick_field_value(raw_spec, field_name, aliases) is not None
+    }
 
     for field_name, aliases in LIST_FIELD_ALIASES.items():
+        if field_name == "extra_args":
+            continue
         value = _pick_field_value(raw_spec, field_name, aliases)
         if value is not None:
             normalized[field_name] = _normalize_list_value(
@@ -204,6 +302,17 @@ def _normalize_trace_spec(spec: Any, base: dict[str, Any] | None = None) -> dict
         value = _pick_field_value(raw_spec, field_name, aliases)
         if value is not None:
             normalized[field_name] = _format_scalar(value)
+
+    extra_args = _pick_field_value(raw_spec, "extra_args", LIST_FIELD_ALIASES["extra_args"])
+    if extra_args is not None:
+        cleaned_extra_args = _consume_reserved_cli_overrides(
+            _normalize_list_value(extra_args, field_name="extra_args"),
+            field_name="extra_args",
+            target_spec=normalized,
+            locked_fields=explicit_scalar_fields,
+        )
+        if cleaned_extra_args:
+            normalized["extra_args"] = cleaned_extra_args
 
     return normalized
 
@@ -219,7 +328,11 @@ def normalize_batch_config(config: dict[str, Any]) -> dict[str, Any]:
                 normalized.pop(alias, None)
 
     server_router_kwargs = normalized.get("server_router_kwargs")
+    server_router_kwargs_dict: dict[str, Any] = {}
     if server_router_kwargs is not None:
+        server_router_kwargs_dict = _normalize_server_router_kwargs_dict(
+            server_router_kwargs
+        )
         normalized["server_router_kwargs"] = _normalize_server_router_kwargs(
             server_router_kwargs
         )
@@ -244,6 +357,17 @@ def normalize_batch_config(config: dict[str, Any]) -> dict[str, Any]:
         for name in _field_names(field_name, aliases):
             if name in normalized:
                 default_trace_source[name] = normalized[name]
+
+    if "extra_server_args" in normalized:
+        cleaned_extra_server_args = _consume_reserved_cli_overrides(
+            normalized["extra_server_args"],
+            field_name="extra_server_args",
+            target_spec=default_trace_source,
+        )
+        if cleaned_extra_server_args:
+            normalized["extra_server_args"] = cleaned_extra_server_args
+        else:
+            normalized.pop("extra_server_args", None)
 
     default_trace_spec = _normalize_trace_spec(
         default_trace_source,
@@ -284,8 +408,24 @@ def normalize_batch_config(config: dict[str, Any]) -> dict[str, Any]:
             )
         normalized_traces[trace] = trace_spec
 
+    trace_server_args = {
+        trace: _build_trace_server_args(
+            spec,
+            normalized.get("extra_server_args", []),
+        )
+        for trace, spec in normalized_traces.items()
+    }
+    trace_server_router_kwargs = {
+        trace: _build_trace_server_router_kwargs(server_router_kwargs_dict, spec)
+        for trace, spec in normalized_traces.items()
+        if server_router_kwargs_dict
+    }
+
     normalized["traces"] = trace_order
     normalized["trace_specs"] = normalized_traces
+    normalized["trace_server_args"] = trace_server_args
+    if trace_server_router_kwargs:
+        normalized["trace_server_router_kwargs"] = trace_server_router_kwargs
     return {
         key: value
         for key, value in normalized.items()
@@ -336,6 +476,18 @@ def render_bash_assignments(config: dict[str, Any]) -> str:
         )
 
     lines.extend(_render_shell_list("TRACES", normalized["traces"]))
+    lines.extend(_render_shell_assoc_array(
+        "TRACE_SERVER_ARGS_SHELL",
+        {
+            trace: " ".join(_quote_shell(arg) for arg in args)
+            for trace, args in normalized["trace_server_args"].items()
+        },
+    ))
+    if "trace_server_router_kwargs" in normalized:
+        lines.extend(_render_shell_assoc_array(
+            "TRACE_SERVER_ROUTER_KWARGS",
+            normalized["trace_server_router_kwargs"],
+        ))
 
     for field_name in LIST_FIELD_ALIASES:
         if field_name == "extra_args":
