@@ -624,6 +624,180 @@ def summarize_energy_events(events: List[Dict[str, Any]]) -> tuple[List[float], 
     ordered = [per_gpu.get(i, 0.0) for i in range(max(per_gpu) + 1)]
     return ordered, sum(ordered)
 
+
+def _event_value(event: Dict[str, Any] | Any, key: str, default: Any = None) -> Any:
+    if isinstance(event, dict):
+        return event.get(key, default)
+    return getattr(event, key, default)
+
+
+def _summarize_per_server_energy_metrics(
+    events: List[Dict[str, Any] | Any],
+    n_devices: int,
+) -> Dict[str, List[float]]:
+    per_server_energy = [0.0 for _ in range(max(0, int(n_devices)))]
+    per_server_elapsed = [0.0 for _ in range(len(per_server_energy))]
+    per_server_power_samples: List[List[float]] = [
+        [] for _ in range(len(per_server_energy))
+    ]
+
+    for event in events:
+        if _event_value(event, "event_type") != "energy":
+            continue
+        try:
+            device_id = int(_event_value(event, "device_id", -1))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= device_id < len(per_server_energy):
+            continue
+
+        try:
+            energy = float(_event_value(event, "energy", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            energy = 0.0
+        try:
+            power = float(_event_value(event, "power", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            power = 0.0
+
+        per_server_energy[device_id] += energy
+        if power > 0.0:
+            per_server_power_samples[device_id].append(power)
+            if energy > 0.0:
+                per_server_elapsed[device_id] += energy / power
+
+    per_server_power: List[float] = []
+    for energy, elapsed, power_samples in zip(
+        per_server_energy,
+        per_server_elapsed,
+        per_server_power_samples,
+    ):
+        if elapsed > 0.0:
+            per_server_power.append(float(energy / elapsed))
+        elif power_samples:
+            per_server_power.append(float(np.mean(power_samples)))
+        else:
+            per_server_power.append(0.0)
+
+    return {
+        "per_server_energy_consumption": per_server_energy,
+        "per_server_power": per_server_power,
+    }
+
+
+def _summarize_per_server_rps(
+    events: List[Dict[str, Any] | Any],
+    n_devices: int,
+    duration_s: float,
+) -> List[float]:
+    per_server_dispatches = [0 for _ in range(max(0, int(n_devices)))]
+
+    for event in events:
+        event_type = _event_value(event, "event_type")
+        if event_type == "dispatch-both":
+            device_key = "prefill_device_id"
+        elif event_type == "dispatch-prefill":
+            device_key = "prefill_device_id"
+        elif event_type == "dispatch-decode":
+            device_key = "decode_device_id"
+        else:
+            continue
+
+        try:
+            device_id = int(_event_value(event, device_key, -1))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= device_id < len(per_server_dispatches):
+            per_server_dispatches[device_id] += 1
+
+    if duration_s <= 0.0:
+        return [0.0 for _ in per_server_dispatches]
+    return [float(count / duration_s) for count in per_server_dispatches]
+
+
+def _get_rr_disagg_server_roles(
+    n_devices: int,
+    routing_policy: str,
+    routing_kwargs: Dict[str, Any] | str | None,
+) -> Dict[str, List[int]] | None:
+    if routing_policy != "round_robin":
+        return None
+
+    routing_kwargs_dict = _routing_kwargs_to_dict(routing_kwargs)
+    if not routing_kwargs_dict.get("is_pd_disagg", False):
+        return None
+
+    try:
+        group_size = int(routing_kwargs_dict.get("group_size", n_devices))
+        n_prefill_per_group = int(
+            routing_kwargs_dict.get("n_prefill_per_group", group_size)
+        )
+    except (TypeError, ValueError):
+        return None
+
+    if (
+        n_devices <= 0
+        or group_size <= 0
+        or group_size > n_devices
+        or n_devices % group_size != 0
+        or n_prefill_per_group <= 0
+        or n_prefill_per_group >= group_size
+    ):
+        return None
+
+    prefill_server_ids: List[int] = []
+    decode_server_ids: List[int] = []
+    for group_start in range(0, n_devices, group_size):
+        prefill_server_ids.extend(
+            range(group_start, group_start + n_prefill_per_group)
+        )
+        decode_server_ids.extend(
+            range(group_start + n_prefill_per_group, group_start + group_size)
+        )
+
+    return {
+        "prefill_server_ids": prefill_server_ids,
+        "decode_server_ids": decode_server_ids,
+    }
+
+
+def _summarize_rr_disagg_power_metrics(
+    *,
+    n_devices: int,
+    routing_policy: str,
+    routing_kwargs: Dict[str, Any] | str | None,
+    per_server_power: List[float],
+) -> Dict[str, Any]:
+    roles = _get_rr_disagg_server_roles(
+        n_devices=n_devices,
+        routing_policy=routing_policy,
+        routing_kwargs=routing_kwargs,
+    )
+    if roles is None:
+        return {}
+
+    prefill_power = [
+        float(per_server_power[device_id])
+        for device_id in roles["prefill_server_ids"]
+        if 0 <= device_id < len(per_server_power)
+    ]
+    decode_power = [
+        float(per_server_power[device_id])
+        for device_id in roles["decode_server_ids"]
+        if 0 <= device_id < len(per_server_power)
+    ]
+
+    return {
+        "per_prefill_power": (
+            float(np.mean(prefill_power)) if prefill_power else 0.0
+        ),
+        "per_decode_power": (
+            float(np.mean(decode_power)) if decode_power else 0.0
+        ),
+        "per_prefill_server_power": prefill_power,
+        "per_decode_server_power": decode_power,
+    }
+
 def ensure_prompts_present(requests: List[Request], model_name: str) -> None:
     """Ensure prompts exist for all requests.
 
@@ -1267,6 +1441,26 @@ async def main(
     results['rr_sliced'] = rr_sliced
     results['rr_slice_kept_request_count'] = len(requests)
     results['rr_slice_total_request_count'] = original_request_count
+    extra_metrics = results.setdefault('extra_metrics', {})
+    extra_metrics.update(_summarize_per_server_energy_metrics(
+        events,
+        problem.n_devices,
+    ))
+    arrival_duration_s = (
+        float(arrival_times[-1] - arrival_times[0])
+        if len(arrival_times) > 1 else 0.0
+    )
+    extra_metrics['per_server_rps'] = _summarize_per_server_rps(
+        events,
+        problem.n_devices,
+        arrival_duration_s,
+    )
+    extra_metrics.update(_summarize_rr_disagg_power_metrics(
+        n_devices=problem.n_devices,
+        routing_policy=problem.routing_policy,
+        routing_kwargs=problem.routing_kwargs,
+        per_server_power=extra_metrics.get('per_server_power', []),
+    ))
     if perf_model_error_artifacts is not None:
         results['perf_model_error_summary'] = perf_model_error_artifacts["summary"]
         results['perf_model_error_file'] = perf_model_error_artifacts["path"]
