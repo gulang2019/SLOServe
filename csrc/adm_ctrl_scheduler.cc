@@ -11,6 +11,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <list>
 #include <queue>
@@ -19,6 +20,7 @@
 #include <string>
 #include <list>
 #include <limits>
+#include <random>
 
 /**
     our performance model is the following: 
@@ -137,7 +139,367 @@ std::string dump_batch_impl_failure(
     return path;
 }
 
+struct MemoryReqState {
+    std::string id;
+    int input_length = 0;
+    int current_output_tokens = 0;
+    int output_length = 0;
+};
+
+struct MemoryCheckReport {
+    bool memory_check_called = false;
+    bool feasible = true;
+    int active_request = 0;
+    double oom_rate = -1.0;
+    long long current_memory_tokens = 0;
+    long long peak_memory_tokens = 0;
+};
+
+int resolve_memory_output_length(const Request& req) {
+    if (req.actual_output_length >= 0) {
+        return req.actual_output_length;
+    }
+    return std::max(req.max_tokens, 0);
+}
+
+std::vector<MemoryReqState> build_memory_req_states(
+    const std::vector<Request>& reqs
+) {
+    std::vector<MemoryReqState> memory_reqs;
+    memory_reqs.reserve(reqs.size());
+    for (const auto& req : reqs) {
+        if (req.prefill_only) {
+            continue;
+        }
+        const int output_length = resolve_memory_output_length(req);
+        if (output_length <= 0) {
+            continue;
+        }
+        const int current_output_tokens =
+            std::max(req.n_computed_tokens - req.input_length, 0);
+        if (current_output_tokens >= output_length) {
+            continue;
+        }
+        MemoryReqState mr;
+        mr.id = req.id;
+        mr.input_length = req.input_length;
+        mr.current_output_tokens = current_output_tokens;
+        mr.output_length = output_length;
+        memory_reqs.push_back(std::move(mr));
+    }
+    return memory_reqs;
+}
+
+MemoryCheckTrace to_memory_check_trace(
+    const std::string& request_id,
+    const std::string& policy,
+    const MemoryCheckReport& checked_report,
+    const MemoryCheckReport& post_report,
+    bool slo_feasible,
+    bool accepted,
+    long long memory_capacity_tokens
+) {
+    MemoryCheckTrace trace;
+    trace.request_id = request_id;
+    trace.policy = policy;
+    trace.memory_check_called = checked_report.memory_check_called;
+    trace.memory_feasible = checked_report.feasible;
+    trace.slo_feasible = slo_feasible;
+    trace.final_feasible = checked_report.feasible && slo_feasible;
+    trace.accepted = accepted;
+    trace.active_request = post_report.active_request;
+    trace.oom_rate = checked_report.oom_rate;
+    if (memory_capacity_tokens > 0) {
+        trace.checked_memory_occupy =
+            static_cast<double>(checked_report.current_memory_tokens) /
+            static_cast<double>(memory_capacity_tokens);
+        trace.memory_occupy =
+            static_cast<double>(post_report.current_memory_tokens) /
+            static_cast<double>(memory_capacity_tokens);
+        trace.peak_memory_occupy =
+            static_cast<double>(checked_report.peak_memory_tokens) /
+            static_cast<double>(memory_capacity_tokens);
+    }
+    return trace;
+}
+
+MemoryCheckReport run_memory_feasibility_check_greedy_report() {
+    MemoryCheckReport report;
+    report.memory_check_called = true;
+    report.feasible = true;
+    return report;
+}
+
+MemoryCheckReport run_memory_feasibility_check_conservative_report(
+    const std::vector<Request>& reqs,
+    int M,
+    int block_size
+) {
+    MemoryCheckReport report;
+    report.memory_check_called = true;
+    const auto memory_reqs = build_memory_req_states(reqs);
+    report.active_request = static_cast<int>(memory_reqs.size());
+    for (const auto& req : memory_reqs) {
+        report.current_memory_tokens += static_cast<long long>(req.input_length)
+                                     + static_cast<long long>(req.current_output_tokens);
+        report.peak_memory_tokens += static_cast<long long>(req.input_length)
+                                  + static_cast<long long>(req.output_length);
+    }
+    const long long memory_capacity_tokens =
+        static_cast<long long>(M) * static_cast<long long>(block_size);
+    report.feasible = report.peak_memory_tokens <= memory_capacity_tokens;
+    return report;
+}
+
+MemoryCheckReport run_memory_feasibility_check_oracle_report(
+    const std::vector<Request>& reqs,
+    int M,
+    int block_size
+) {
+    MemoryCheckReport report;
+    report.memory_check_called = true;
+    const auto memory_reqs = build_memory_req_states(reqs);
+    report.active_request = static_cast<int>(memory_reqs.size());
+    if (memory_reqs.empty()) {
+        report.feasible = true;
+        return report;
+    }
+    int max_remaining_tokens = 0;
+    for (const auto& req : memory_reqs) {
+        report.current_memory_tokens += static_cast<long long>(req.input_length)
+                                     + static_cast<long long>(req.current_output_tokens);
+        max_remaining_tokens = std::max(
+            max_remaining_tokens,
+            std::max(req.output_length - req.current_output_tokens, 0));
+    }
+
+    long long peak_tokens = 0;
+    for (int k = 0; k <= max_remaining_tokens; ++k) {
+        long long total_tokens = 0;
+        for (const auto& req : memory_reqs) {
+            if ((req.current_output_tokens + k) < req.output_length) {
+                total_tokens += static_cast<long long>(req.input_length)
+                              + static_cast<long long>(req.current_output_tokens)
+                              + static_cast<long long>(k);
+            }
+        }
+        peak_tokens = std::max(peak_tokens, total_tokens);
+    }
+    report.peak_memory_tokens = peak_tokens;
+    const long long memory_capacity_tokens =
+        static_cast<long long>(M) * static_cast<long long>(block_size);
+    report.feasible = report.peak_memory_tokens <= memory_capacity_tokens;
+    return report;
+}
+
+MemoryCheckReport run_memory_feasibility_check_mc_report(
+    const std::vector<Request>& reqs,
+    int M,
+    int block_size,
+    const std::vector<int>& memory_check_output_lengths,
+    const std::vector<int>& memory_check_sorted_output_lengths,
+    int memory_check_run_times,
+    double memory_check_threshold,
+    std::uint64_t memory_check_seed
+) {
+    MemoryCheckReport report;
+    report.memory_check_called = true;
+    if (memory_check_output_lengths.empty()) {
+        report.feasible = true;
+        return report;
+    }
+
+    const auto memory_reqs = build_memory_req_states(reqs);
+    report.active_request = static_cast<int>(memory_reqs.size());
+    if (memory_reqs.empty()) {
+        report.feasible = true;
+        return report;
+    }
+
+    for (const auto& req : memory_reqs) {
+        report.current_memory_tokens += static_cast<long long>(req.input_length)
+                                     + static_cast<long long>(req.current_output_tokens);
+    }
+
+    auto hash_combine = [](std::uint64_t& seed, std::uint64_t value) {
+        seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    };
+
+    std::uint64_t seed = memory_check_seed;
+    hash_combine(seed, static_cast<std::uint64_t>(memory_reqs.size()));
+    hash_combine(seed, static_cast<std::uint64_t>(M));
+    hash_combine(seed, static_cast<std::uint64_t>(block_size));
+    for (const auto& req : memory_reqs) {
+        hash_combine(seed, static_cast<std::uint64_t>(std::hash<std::string>{}(req.id)));
+        hash_combine(seed, static_cast<std::uint64_t>(req.input_length));
+        hash_combine(seed, static_cast<std::uint64_t>(req.current_output_tokens));
+    }
+
+    std::mt19937 rng(static_cast<std::mt19937::result_type>(seed ^ (seed >> 32)));
+    const long long memory_capacity_tokens =
+        static_cast<long long>(M) * static_cast<long long>(block_size);
+
+    auto sample_output_len = [&]() -> int {
+        std::uniform_int_distribution<size_t> dist(
+            0, memory_check_output_lengths.size() - 1);
+        return memory_check_output_lengths[dist(rng)];
+    };
+
+    auto sample_output_len_conditional = [&](int min_exclusive) -> int {
+        auto it = std::upper_bound(
+            memory_check_sorted_output_lengths.begin(),
+            memory_check_sorted_output_lengths.end(),
+            min_exclusive);
+        if (it == memory_check_sorted_output_lengths.end()) {
+            return min_exclusive + 1;
+        }
+        std::uniform_int_distribution<size_t> dist(
+            0, static_cast<size_t>(memory_check_sorted_output_lengths.end() - it - 1));
+        return *(it + dist(rng));
+    };
+
+    std::vector<int> sampled_output_lengths(memory_reqs.size(), 0);
+    std::vector<std::pair<int, size_t> > remaining_output_lengths;
+    remaining_output_lengths.reserve(memory_reqs.size());
+    int oom_cnt = 0;
+    long long peak_tokens_across_trials = 0;
+    for (int trial = 0; trial < memory_check_run_times; ++trial) {
+        remaining_output_lengths.clear();
+        long long base_tokens = 0;
+        for (size_t i = 0; i < memory_reqs.size(); ++i) {
+            const int current_output = memory_reqs[i].current_output_tokens;
+            const int sampled_output =
+                current_output > 0
+                    ? sample_output_len_conditional(current_output)
+                    : sample_output_len();
+            sampled_output_lengths[i] = sampled_output;
+            const int remaining_output =
+                std::max(sampled_output - current_output, 0);
+            if (remaining_output <= 0) {
+                continue;
+            }
+            remaining_output_lengths.emplace_back(remaining_output, i);
+            base_tokens += static_cast<long long>(memory_reqs[i].input_length)
+                        + static_cast<long long>(memory_reqs[i].current_output_tokens);
+        }
+
+        long long peak_tokens = 0;
+        if (!remaining_output_lengths.empty()) {
+            std::sort(
+                remaining_output_lengths.begin(),
+                remaining_output_lengths.end(),
+                [](const auto& a, const auto& b) {
+                    if (a.first != b.first) {
+                        return a.first < b.first;
+                    }
+                    return a.second < b.second;
+                });
+
+            long long active_req_count =
+                static_cast<long long>(remaining_output_lengths.size());
+            size_t idx = 0;
+            while (idx < remaining_output_lengths.size()) {
+                const int next_finish_remaining =
+                    remaining_output_lengths[idx].first;
+                const long long candidate_k =
+                    static_cast<long long>(next_finish_remaining) - 1;
+                peak_tokens = std::max(
+                    peak_tokens,
+                    base_tokens + active_req_count * candidate_k);
+
+                while (idx < remaining_output_lengths.size() &&
+                       remaining_output_lengths[idx].first == next_finish_remaining) {
+                    const size_t req_idx = remaining_output_lengths[idx].second;
+                    base_tokens -= static_cast<long long>(memory_reqs[req_idx].input_length)
+                                + static_cast<long long>(memory_reqs[req_idx].current_output_tokens);
+                    active_req_count -= 1;
+                    idx += 1;
+                }
+            }
+        }
+
+        peak_tokens_across_trials = std::max(peak_tokens_across_trials, peak_tokens);
+        if (peak_tokens > memory_capacity_tokens) {
+            oom_cnt += 1;
+            if ((static_cast<double>(oom_cnt) /
+                 static_cast<double>(memory_check_run_times)) >
+                memory_check_threshold) {
+                report.peak_memory_tokens = peak_tokens_across_trials;
+                report.oom_rate =
+                    static_cast<double>(oom_cnt) /
+                    static_cast<double>(std::max(memory_check_run_times, 1));
+                report.feasible = false;
+                return report;
+            }
+        }
+    }
+
+    report.peak_memory_tokens = peak_tokens_across_trials;
+    report.oom_rate =
+        static_cast<double>(oom_cnt) /
+        static_cast<double>(std::max(memory_check_run_times, 1));
+    report.feasible = report.oom_rate <= memory_check_threshold;
+    return report;
+}
+
 }  // namespace
+
+bool AdmCtrlScheduler::_memory_feasibility_check(
+    const std::vector<Request>& reqs,
+    int M
+) const {
+    if (!memory_check_enabled) {
+        return true;
+    }
+    if (memory_check_policy == "oracle") {
+        return _memory_feasibility_check_oracle(reqs, M);
+    }
+    if (memory_check_policy == "conservative") {
+        return _memory_feasibility_check_conservative(reqs, M);
+    }
+    if (memory_check_policy == "greedy") {
+        return _memory_feasibility_check_greedy(reqs, M);
+    }
+    return _memory_feasibility_check_mc(reqs, M);
+}
+
+bool AdmCtrlScheduler::_memory_feasibility_check_greedy(
+    const std::vector<Request>& reqs,
+    int M
+) const {
+    return run_memory_feasibility_check_greedy_report().feasible;
+}
+
+bool AdmCtrlScheduler::_memory_feasibility_check_conservative(
+    const std::vector<Request>& reqs,
+    int M
+) const {
+    return run_memory_feasibility_check_conservative_report(
+        reqs, M, block_size).feasible;
+}
+
+bool AdmCtrlScheduler::_memory_feasibility_check_oracle(
+    const std::vector<Request>& reqs,
+    int M
+) const {
+    return run_memory_feasibility_check_oracle_report(
+        reqs, M, block_size).feasible;
+}
+
+bool AdmCtrlScheduler::_memory_feasibility_check_mc(
+    const std::vector<Request>& reqs,
+    int M
+) const {
+    return run_memory_feasibility_check_mc_report(
+        reqs,
+        M,
+        block_size,
+        memory_check_output_lengths,
+        memory_check_sorted_output_lengths,
+        memory_check_run_times,
+        memory_check_threshold,
+        memory_check_seed).feasible;
+}
 
 std::tuple<bool, std::vector<Batch> > AdmCtrlScheduler::_construct_batch_prefix(
     const std::vector<Request>& active_reqs,
@@ -1235,6 +1597,7 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
     const int M,
     double current_time
 ) {
+    memory_check_traces.clear();
     int int_remained_mem = M * block_size;
     for (auto& req: reqs) {
         if (req.is_new_req) int_remained_mem -= req.n_computed_tokens;
@@ -1250,8 +1613,7 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
     auto get_next_ddl = [&](const Request& req) {
         return req.ddl + std::max(0, req.n_computed_tokens - req.input_length + 1) * planner->tpots[0];
     };
-    // TODO(Yi): implement the memory feasibility check with MontCaro;
-    auto feasibility_check = [&](const std::vector<Request>& reqs) -> bool {
+    auto slo_feasibility_check = [&](const std::vector<Request>& reqs) -> bool {
         std::vector<std::tuple<double, std::string, Request> > events;
         double tpot = planner->tpots[0];
         double decode_bs = planner->time_to_batch(tpot);
@@ -1346,6 +1708,32 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
         return true; 
     };
 
+    auto memory_check_report = [&](const std::vector<Request>& local_reqs) {
+        if (!memory_check_enabled) {
+            return MemoryCheckReport{};
+        }
+        if (memory_check_policy == "oracle") {
+            return run_memory_feasibility_check_oracle_report(
+                local_reqs, M, block_size);
+        }
+        if (memory_check_policy == "conservative") {
+            return run_memory_feasibility_check_conservative_report(
+                local_reqs, M, block_size);
+        }
+        if (memory_check_policy == "greedy") {
+            return run_memory_feasibility_check_greedy_report();
+        }
+        return run_memory_feasibility_check_mc_report(
+            local_reqs,
+            M,
+            block_size,
+            memory_check_output_lengths,
+            memory_check_sorted_output_lengths,
+            memory_check_run_times,
+            memory_check_threshold,
+            memory_check_seed);
+    };
+
     Timer timer;
     timer.start();
     
@@ -1360,10 +1748,14 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
         }
     }
 
-    bool feasible = feasibility_check(working_reqs);
+    const MemoryCheckReport baseline_memory_report =
+        memory_check_report(working_reqs);
+    bool feasible =
+        slo_feasibility_check(working_reqs) && baseline_memory_report.feasible;
     if (!feasible) {
         return {false, std::vector<bool>(reqs.size(), false)};
     }
+    MemoryCheckReport current_memory_report = baseline_memory_report;
 
     timer("feasibility_old_reqs");
 
@@ -1391,13 +1783,26 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
         auto candidate_reqs = working_reqs;
         candidate_reqs.push_back(req);
 
-        const bool candidate_feasible = feasibility_check(candidate_reqs);
+        const bool candidate_slo_feasible = slo_feasibility_check(candidate_reqs);
+        const MemoryCheckReport candidate_memory_report =
+            memory_check_report(candidate_reqs);
+        const bool candidate_feasible =
+            candidate_slo_feasible && candidate_memory_report.feasible;
         if (candidate_feasible) {
             working_reqs = std::move(candidate_reqs);
             is_accepted[cand.idx] = true;
+            current_memory_report = candidate_memory_report;
         } else {
             is_accepted[cand.idx] = false;
         }
+        memory_check_traces.push_back(to_memory_check_trace(
+            req.id,
+            memory_check_policy,
+            candidate_memory_report,
+            candidate_feasible ? candidate_memory_report : current_memory_report,
+            candidate_slo_feasible,
+            candidate_feasible,
+            static_cast<long long>(M) * static_cast<long long>(block_size)));
         timer("feasibility_new_reqs" + std::to_string(idx));
         idx++;
     }

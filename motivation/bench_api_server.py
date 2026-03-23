@@ -16,6 +16,7 @@ import pandas as pd
 
 from motivation.events_analysis import analyze_events, analyze_slo_violation
 from motivation.auto_scaling import eval_auto_scaling
+from motivation.memory_analysis import analyze_memory_run, analyze_memory_sweep
 from Dataset.dataset import ArrivalTimes, Requests, Request
 
 
@@ -316,7 +317,7 @@ async def main(problem: Problem, endpoint: str, clients: str):
     
     
     arrival_idx = 0
-    window_size = 0.05
+    window_size = 0.001
     
     execution_results: List[ExecutionResult] = []
     
@@ -483,11 +484,12 @@ async def main(problem: Problem, endpoint: str, clients: str):
     
     admission_filename = f'{problem.store_prefix}.{i}.admission_history.jsonl'
 
-    async with httpx.AsyncClient() as client:
+    dump_timeout_s = 1800.0
+    async with httpx.AsyncClient(timeout=httpx.Timeout(dump_timeout_s, connect=60.0)) as client:
         response = await client.post(
             f"{endpoint}/dump_profile_events",
-            json={"filename": filename, "admission_filename": admission_filename, "timeout": 300.0},
-            timeout=300.0
+            json={"filename": filename, "admission_filename": admission_filename, "timeout": dump_timeout_s},
+            timeout=dump_timeout_s
         )
         response.raise_for_status()
         
@@ -563,6 +565,7 @@ async def main(problem: Problem, endpoint: str, clients: str):
                                     n_device = problem.n_devices,
                                     draw = True)
     results['rps'] = rps
+    admission_history = []
     if os.path.exists(admission_filename):
         with open(admission_filename, 'r') as f:
             admission_history = json.load(f)
@@ -579,6 +582,16 @@ async def main(problem: Problem, endpoint: str, clients: str):
         else: 
             auto_scaling_analysis = {}
         results['auto_scaling_analysis'] = auto_scaling_analysis
+
+    memory_summary = analyze_memory_run(
+        store_prefix=problem.store_prefix,
+        policy_name=problem.routing_kwargs.get('memory_check_policy', 'none')
+            if isinstance(problem.routing_kwargs, dict) else 'none',
+        admission_history=admission_history,
+        reqs=reqs,
+        events=events,
+    )
+    results['memory_analysis'] = memory_summary
         
     execution_results = sorted(execution_results, key=lambda x: int(x.request_id))
     results =  ExecutionResults(problem, execution_results, results, f'{problem.store_prefix}.{i}')
@@ -611,8 +624,9 @@ def build_problems(
     scheduling_overhead: float = 0.0,
     routing_fallback_policy: str = "asap",
     kv_xfer_delay: float = 0.05,
+    memory_check_policy: str = "greedy",
 ):
-    store_prefix = f'{experiment_dir}/{scheduling_policy}_{routing_policy}_{load_scale}_{n_device}_{admission_mode}_{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
+    store_prefix = f'{experiment_dir}/{scheduling_policy}_{routing_policy}_{load_scale}_{n_device}_{admission_mode}_{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}_{memory_check_policy}'
     
     if ":" in trace: 
         requests_trace, arrival_times_trace = trace.split(":")
@@ -969,6 +983,7 @@ def build_problems(
             'model_name': model_name,
             'tpot': slo_tpot,
             'scheduling_overhead': scheduling_overhead,
+            'memory_check_policy': memory_check_policy,
             'group_size': group_size,
             'n_lb': n_lb,
             'use_planner': use_planner,
@@ -1033,6 +1048,7 @@ def run(
     routing_overhead: float,
     routing_fallback_policy: str,
     kv_xfer_delay: float,
+    memory_check_policy: str,
 ):
     import os
     os.makedirs(output_dir, exist_ok=True)
@@ -1067,6 +1083,7 @@ def run(
     print(f'performance model errors: {perf_model_errs}')
     print(f'routing fallback policy: {routing_fallback_policy}')
     print(f'kv_xfer_delay: {kv_xfer_delay}')
+    print(f'memory_check_policy: {memory_check_policy}')
     print('--End of Problem Grid--')
     import os
     results = {}
@@ -1074,7 +1091,17 @@ def run(
         print(f'Loading cached results from {experiment_dir}/results.jsonl')
         with open(f'{experiment_dir}/results.jsonl', 'r') as f:
             results = [json.loads(line) for line in f]
-            results = {(r['load_scale'], r['n_device'], r['scheduling_policy'], r['routing_policy'], r['ttft_slo_scale'], r['slo_tpot'], r['perf_model_err']): r for r in results}
+            results = {
+                (
+                    r['load_scale'],
+                    r['n_device'],
+                    r['scheduling_policy'],
+                    r['routing_policy'],
+                    r['ttft_slo_scale'],
+                    r['slo_tpot'],
+                    r['perf_model_err'],
+                    r.get('memory_check_policy', 'mc'),
+                ): r for r in results}
     else:
         results = {}
     
@@ -1088,7 +1115,16 @@ def run(
         if n_device == 1 and 'disaggregated' in routing_policy:
             print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot} because n_device is 1 and routing policy is disaggregated')
             continue
-        if not overwrite and (load_scale, n_device, scheduling_policy, routing_policy, ttft_slo_scale, slo_tpot, perf_model_err) in results:
+        if not overwrite and (
+            load_scale,
+            n_device,
+            scheduling_policy,
+            routing_policy,
+            ttft_slo_scale,
+            slo_tpot,
+            perf_model_err,
+            memory_check_policy,
+        ) in results:
             print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot}, {perf_model_err} because it already exists')
             continue
         problems = build_problems(
@@ -1110,6 +1146,7 @@ def run(
             scheduling_overhead = scheduling_overhead,
             routing_fallback_policy=routing_fallback_policy,
             kv_xfer_delay=kv_xfer_delay,
+            memory_check_policy=memory_check_policy,
         )
         if not len(problems):
             logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
@@ -1144,6 +1181,7 @@ def run(
             'slo_tpot': slo_tpot,
             'slo_violation_rate': 1 - best_result.results['slo_attainment_rate'],
             'perf_model_err': perf_model_err,
+            'memory_check_policy': memory_check_policy,
             
             'event_file': f'{problems[0].store_prefix}.events.jsonl',
             'energy_consumption': best_result.energy_consumption,
@@ -1155,11 +1193,32 @@ def run(
             result.update(best_result.results['auto_scaling_analysis'])
         if 'extra_metrics' in best_result.results:
             result.update(best_result.results['extra_metrics'])
+        if 'memory_analysis' in best_result.results:
+            result.update({
+                'total_requests': best_result.results['memory_analysis'].get('total_requests', 0),
+                'reject_rate': best_result.results['memory_analysis'].get('reject_rate', 0.0),
+                'accept_rate': best_result.results['memory_analysis'].get('accept_rate', 0.0),
+                'fail_rate': best_result.results['memory_analysis'].get('fail_rate', 0.0),
+                'success_rate': best_result.results['memory_analysis'].get('success_rate', 0.0),
+                'memory_connectivity_log': best_result.results['memory_analysis'].get('connectivity_log'),
+                'memory_debug_tsv': best_result.results['memory_analysis'].get('debug_tsv'),
+                'memory_debug_plot': best_result.results['memory_analysis'].get('debug_plot'),
+                'memory_summary_path': best_result.results['memory_analysis'].get('summary_path'),
+            })
         print('--Result--')
         pprint.pprint(result)
         print('--End of Result--')
         
-        results[(load_scale, n_device, scheduling_policy, routing_policy, ttft_slo_scale, slo_tpot, perf_model_err)] = result
+        results[(
+            load_scale,
+            n_device,
+            scheduling_policy,
+            routing_policy,
+            ttft_slo_scale,
+            slo_tpot,
+            perf_model_err,
+            memory_check_policy,
+        )] = result
         with open(f'{experiment_dir}/results.jsonl', 'a') as f:
             f.write(json.dumps(result) + '\n')            
             
@@ -1178,6 +1237,7 @@ def run(
     df = pd.DataFrame(results)
     df.to_csv(f'{experiment_dir}/profit_vs_n_device_and_load.csv', index=False)
     print(f"Saved source data to {experiment_dir}/profit_vs_n_device_and_load.csv")
+    analyze_memory_sweep(experiment_dir=experiment_dir, results=results)
 
     # 1. Plot: for each (scheduling_policy, routing_policy) pair, show profit vs n_device (for each load_scale)
     import math
@@ -1272,6 +1332,7 @@ if __name__ == '__main__':
     parser.add_argument('--routing_overhead', type = float, default = -1.0, help = "mocked overhead from at engine.")
     parser.add_argument('--routing_fallback_policy', type = str, default = 'asap', choices = ['asap', 'reject'])
     parser.add_argument('--kv_xfer_delay', type=float, default=0.05, help='KV transfer delay budget in seconds')
+    parser.add_argument('--memory-check-policy', type=str, default='greedy', choices=['mc', 'oracle', 'conservative', 'greedy'], help='memory admission policy used by slosserve routing')
     args = parser.parse_args()
     
     if not args.run_all:
@@ -1313,6 +1374,7 @@ if __name__ == '__main__':
                 routing_overhead = args.routing_overhead,
                 routing_fallback_policy = args.routing_fallback_policy,
                 kv_xfer_delay = args.kv_xfer_delay,
+                memory_check_policy = args.memory_check_policy,
             )
         exit(0)
     
@@ -1370,6 +1432,7 @@ if __name__ == '__main__':
                 'output_dir': args.output_dir,
                 'perf_model_errs': args.perf_model_err,
                 'kv_xfer_delay': args.kv_xfer_delay,
+                'memory_check_policy': args.memory_check_policy,
             })
         p.start()
         running_jobs.append((p, clients_str, router))

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <vector> 
 #include <iostream>
 #include <memory>
@@ -24,6 +25,7 @@ struct Request{
     int decode_device_id;
     bool prefill_only;
     double arrival_time;
+    int actual_output_length;
     
     Request() = default;
 
@@ -40,8 +42,8 @@ struct Request{
     int prefill_device_id = 0,
     int decode_device_id = 0,
     bool prefill_only = false,
-    double arrival_time = 0.0
-    ): 
+    double arrival_time = 0.0,
+    int actual_output_length = -1): 
         id(id),
         is_new_req(is_new_req), 
         ddl(ddl), 
@@ -55,7 +57,8 @@ struct Request{
         prefill_device_id(prefill_device_id),
         decode_device_id(decode_device_id),
         prefill_only(prefill_only),
-        arrival_time(arrival_time)
+        arrival_time(arrival_time),
+        actual_output_length(actual_output_length)
          {
             assert(max_tokens >= 1);
          }
@@ -93,6 +96,21 @@ struct Batch {
         }
         return max_decode_size;
     }
+};
+
+struct MemoryCheckTrace {
+    std::string request_id;
+    std::string policy;
+    bool memory_check_called = false;
+    bool memory_feasible = true;
+    bool slo_feasible = true;
+    bool final_feasible = true;
+    bool accepted = false;
+    int active_request = 0;
+    double oom_rate = -1.0;
+    double memory_occupy = 0.0;
+    double checked_memory_occupy = 0.0;
+    double peak_memory_occupy = 0.0;
 };
 
 // struct Batch {
@@ -217,8 +235,42 @@ protected:
     bool fifo_fair = false;
     bool continuous = false;
     bool _verbose;
+    bool memory_check_enabled = false;
+    std::vector<int> memory_check_output_lengths;
+    std::vector<int> memory_check_sorted_output_lengths;
+    double memory_check_threshold = 0.02;
+    int memory_check_run_times = 200;
+    std::uint64_t memory_check_seed = 1;
+    std::string memory_check_policy = "mc";
+    std::vector<MemoryCheckTrace> memory_check_traces;
 
     std::unique_ptr<BatchPlanner> planner;
+
+
+    bool _memory_feasibility_check(
+        const std::vector<Request>& reqs,
+        int M
+    ) const;
+
+    bool _memory_feasibility_check_mc(
+        const std::vector<Request>& reqs,
+        int M
+    ) const;
+
+    bool _memory_feasibility_check_oracle(
+        const std::vector<Request>& reqs,
+        int M
+    ) const;
+
+    bool _memory_feasibility_check_conservative(
+        const std::vector<Request>& reqs,
+        int M
+    ) const;
+
+    bool _memory_feasibility_check_greedy(
+        const std::vector<Request>& reqs,
+        int M
+    ) const;
 
     std::vector<Batch> _batch_impl(
         const std::vector<Request>& reqs,
@@ -315,6 +367,53 @@ public:
             alpha, max_sd_size, fixed_spec, continuous
         );
         return *this;
+    }
+
+    AdmCtrlScheduler& set_memory_check_policy(
+        std::vector<int> output_lengths,
+        double threshold,
+        int run_times = 200,
+        std::uint64_t seed = 1,
+        std::string policy = "mc"
+    ) {
+        memory_check_output_lengths.clear();
+        memory_check_output_lengths.reserve(output_lengths.size());
+        for (int len : output_lengths) {
+            if (len >= 0) {
+                memory_check_output_lengths.push_back(len);
+            }
+        }
+        memory_check_sorted_output_lengths = memory_check_output_lengths;
+        std::sort(
+            memory_check_sorted_output_lengths.begin(),
+            memory_check_sorted_output_lengths.end());
+        memory_check_threshold = std::clamp(threshold, 0.0, 1.0);
+        memory_check_run_times = std::max(run_times, 1);
+        memory_check_seed = seed;
+        if (policy != "mc" &&
+            policy != "oracle" &&
+            policy != "conservative" &&
+            policy != "greedy") {
+            policy = "mc";
+        }
+        memory_check_policy = policy;
+        memory_check_enabled =
+            (memory_check_policy != "mc") || !memory_check_output_lengths.empty();
+        return *this;
+    }
+
+    AdmCtrlScheduler& clear_memory_check_policy() {
+        memory_check_enabled = false;
+        memory_check_output_lengths.clear();
+        memory_check_sorted_output_lengths.clear();
+        memory_check_policy = "mc";
+        return *this;
+    }
+
+    std::vector<MemoryCheckTrace> consume_memory_check_traces() {
+        auto traces = std::move(memory_check_traces);
+        memory_check_traces.clear();
+        return traces;
     }
 
     /**

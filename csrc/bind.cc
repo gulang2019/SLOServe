@@ -11,10 +11,10 @@ PYBIND11_MODULE(SLOsServe_C, m) {
 
     // Bind the Request struct
     py::class_<Request>(m, "Request")
-        .def(py::init<std::string, bool, double, int, int, int, double, int, int, int, int, int, bool, double>(),
+        .def(py::init<std::string, bool, double, int, int, int, double, int, int, int, int, int, bool, double, int>(),
              py::arg("id"), py::arg("is_new_req"), py::arg("ddl"), py::arg("input_length"), py::arg("n_computed_tokens"), py::arg("max_tokens"),
              py::arg("profit"), py::arg("mem"), py::arg("tpot_idx"), py::arg("prefill_mem") = -1,
-             py::arg("prefill_device_id") = -1, py::arg("decode_device_id") = -1, py::arg("prefill_only") = false, py::arg("arrival_time") = 0.0)
+             py::arg("prefill_device_id") = -1, py::arg("decode_device_id") = -1, py::arg("prefill_only") = false, py::arg("arrival_time") = 0.0, py::arg("actual_output_length") = -1)
         .def_readwrite("id", &Request::id)
         .def_readwrite("is_new_req", &Request::is_new_req)
         .def_readwrite("ddl", &Request::ddl)
@@ -29,6 +29,7 @@ PYBIND11_MODULE(SLOsServe_C, m) {
         .def_readwrite("decode_device_id", &Request::decode_device_id)
         .def_readwrite("prefill_only", &Request::prefill_only)
         .def_readwrite("arrival_time", &Request::arrival_time)
+        .def_readwrite("actual_output_length", &Request::actual_output_length)
         .def("__repr__", [](const Request& req) {
             return "<Request id=" + req.id +
                    " is_new_req=" + std::to_string(req.is_new_req) +
@@ -42,7 +43,8 @@ PYBIND11_MODULE(SLOsServe_C, m) {
                    " prefill_mem=" + std::to_string(req.prefill_mem) +
                    " prefill_device_id=" + std::to_string(req.prefill_device_id) +
                    " decode_device_id=" + std::to_string(req.decode_device_id) +
-                   " prefill_only=" + std::to_string(req.prefill_only) + ">";
+                   " prefill_only=" + std::to_string(req.prefill_only) + 
+                   " actual_output_length=" + std::to_string(req.actual_output_length) + ">";
         });
 
     // Bind the ReqBatch struct
@@ -79,6 +81,20 @@ PYBIND11_MODULE(SLOsServe_C, m) {
             return oss.str();
         });
 
+    py::class_<MemoryCheckTrace>(m, "MemoryCheckTrace")
+        .def_readwrite("request_id", &MemoryCheckTrace::request_id)
+        .def_readwrite("policy", &MemoryCheckTrace::policy)
+        .def_readwrite("memory_check_called", &MemoryCheckTrace::memory_check_called)
+        .def_readwrite("memory_feasible", &MemoryCheckTrace::memory_feasible)
+        .def_readwrite("slo_feasible", &MemoryCheckTrace::slo_feasible)
+        .def_readwrite("final_feasible", &MemoryCheckTrace::final_feasible)
+        .def_readwrite("accepted", &MemoryCheckTrace::accepted)
+        .def_readwrite("active_request", &MemoryCheckTrace::active_request)
+        .def_readwrite("oom_rate", &MemoryCheckTrace::oom_rate)
+        .def_readwrite("memory_occupy", &MemoryCheckTrace::memory_occupy)
+        .def_readwrite("checked_memory_occupy", &MemoryCheckTrace::checked_memory_occupy)
+        .def_readwrite("peak_memory_occupy", &MemoryCheckTrace::peak_memory_occupy);
+
     // Bind the Batch struct
     // py::class_<Batch>(m, "Batch")
     //     .def(py::init<>())  // Default constructor
@@ -102,6 +118,12 @@ PYBIND11_MODULE(SLOsServe_C, m) {
         .def("set_sd_planner", &AdmCtrlScheduler::set_sd_planner,
             py::arg("tpots"), py::arg("hardware_params"), py::arg("fixed_bs"), 
             py::arg("alpha"), py::arg("max_sd_size"), py::arg("fixed_spec"), py::arg("max_bs") = 16384)
+        .def("set_memory_check_policy", &AdmCtrlScheduler::set_memory_check_policy,
+            py::arg("output_lengths"), py::arg("threshold"),
+            py::arg("run_times") = 200, py::arg("seed") = 1,
+            py::arg("policy") = "mc")
+        .def("clear_memory_check_policy", &AdmCtrlScheduler::clear_memory_check_policy)
+        .def("consume_memory_check_traces", &AdmCtrlScheduler::consume_memory_check_traces)
         .def("schedule", &AdmCtrlScheduler::schedule,
              py::arg("reqs"), py::arg("current_time"), py::arg("max_time") = 1,
              py::arg("verbose") = false)

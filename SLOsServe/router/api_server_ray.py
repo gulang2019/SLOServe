@@ -4,6 +4,7 @@ from xxlimited import Str
 import httpx
 import copy
 import random
+from functools import lru_cache
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Any, List, Tuple, Dict, AsyncGenerator, Optional
@@ -38,6 +39,7 @@ from SLOsServe.router.execplan_bus import (ExecPlanBus, ExecPlan,
                                            extract_load_statistics)
 from SLOsServe.router.adm_ctrl import Request as BatchPlannerRequest
 from SLOsServe.router.macro import PERF_MODEL_HEADROOM, DUMP_SCHS, DUMP_ADM
+from Dataset.dataset import Requests as TraceRequests
 
 DEBUG = False
 
@@ -60,6 +62,31 @@ def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
 
 
 logger = setup_logger("SLOsServe.router.api_server", os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"))
+
+@lru_cache(maxsize=None)
+def _load_memory_check_output_lengths(length_pattern: str) -> tuple[int, ...]:
+    """Load and cache the output-length population for a trace dataset."""
+    dataset = TraceRequests.load(
+        length_pattern,
+        max_tokens=None,
+        window_start=0,
+        window_end=None,
+    )
+    return tuple(
+        int(req.output_length)
+        for req in dataset.requests
+        if getattr(req, "output_length", None) is not None and int(req.output_length) >= 0
+    )
+
+
+def _summarize_router_kwargs(router_kwargs: Any) -> Any:
+    if not isinstance(router_kwargs, dict):
+        return router_kwargs
+    summary = dict(router_kwargs)
+    if "memory_check_output_lengths" in summary:
+        output_lengths = summary["memory_check_output_lengths"]
+        summary["memory_check_output_lengths"] = f"<len={len(output_lengths)}>"
+    return summary
 
 @dataclass 
 class EngineActor:
@@ -1331,7 +1358,7 @@ class SLOsServeRouter(Router):
         
         # self.routing_overhead = router_kwargs.get('routing_overhead', 0.0)
         self.pre_adm_ctrler = SLOsServe_C.AdmCtrlScheduler(
-            "edf", # policy
+            "edf_sim", # policy
             self.block_size,
             False, # fairness 
             False, # continuous
@@ -1354,6 +1381,29 @@ class SLOsServeRouter(Router):
             hardware_params = self.hardware_params,
             fixed_bs = False
         )
+        memory_check_policy = str(router_kwargs.get("memory_check_policy", "greedy")).lower()
+        memory_check_output_lengths = router_kwargs.get("memory_check_output_lengths", [])
+        if memory_check_policy in {"mc", "oracle", "conservative", "greedy"}:
+            self.pre_adm_ctrler.set_memory_check_policy(
+                output_lengths=[int(x) for x in memory_check_output_lengths],
+                threshold=float(router_kwargs.get("memory_check_threshold", 0.02)),
+                run_times=int(router_kwargs.get("memory_check_run_times", 200)),
+                seed=int(router_kwargs.get("memory_check_seed", 1)),
+                policy=memory_check_policy,
+            )
+            self.adm_planner.set_memory_check_policy(
+                output_lengths=[int(x) for x in memory_check_output_lengths],
+                threshold=float(router_kwargs.get("memory_check_threshold", 0.02)),
+                run_times=int(router_kwargs.get("memory_check_run_times", 200)),
+                seed=int(router_kwargs.get("memory_check_seed", 1)),
+                policy=memory_check_policy,
+            )
+            if (not hasattr(self.pre_adm_ctrler, "consume_memory_check_traces") or
+                not hasattr(self.adm_planner, "consume_memory_check_traces")):
+                raise RuntimeError(
+                    "SLOsServe_C extension is stale: memory-check trace APIs are missing. "
+                    "Please rebuild csrc/SLOsServe_C and restart api_server_ray."
+                )
         self.kv_xfer_delay = router_kwargs.get('kv_xfer_delay', 0.05)
         self.pre_adm_schedule_dump_threshold_s = router_kwargs.get("pre_adm_schedule_dump_threshold_s", 0.05)
         self.pre_adm_schedule_dump_dir = router_kwargs.get("pre_adm_schedule_dump_dir", "pre_adm_schedule_debug")
@@ -1368,6 +1418,50 @@ class SLOsServeRouter(Router):
             f'use_planner: {self.use_planner}, ablation: {self.ablation}' 
             f'hardware_params: {self.hardware_params}, scheduling_overhead: {router_kwargs["scheduling_overhead"]}'
         )
+
+    def _attach_memory_check_traces(
+        self,
+        did: int,
+        waiting_requests: List[RequestInstance],
+        traces: list[Any],
+    ) -> None:
+        if not traces:
+            return
+        req_map = {req.request_id: req for req in waiting_requests}
+        base_stat = {}
+        if 0 <= did < len(self.load_stat.stats):
+            base_stat = asdict(self.load_stat.get_stat()[did])
+        now = time.time()
+        for trace in traces:
+            request = req_map.get(trace.request_id)
+            if request is None:
+                continue
+            admission_stat = dict(base_stat)
+            admission_stat.update({
+                "memory_check_called": bool(trace.memory_check_called),
+                "memory_check_policy": str(trace.policy),
+                "memory_feasible": bool(trace.memory_feasible),
+                "slo_feasible": bool(trace.slo_feasible),
+                "final_feasible": bool(trace.final_feasible),
+                "accepted": bool(trace.accepted),
+                "active_request": int(trace.active_request),
+                "oom_rate": float(trace.oom_rate),
+                "memory_occupy": float(trace.memory_occupy),
+                "checked_memory_occupy": float(trace.checked_memory_occupy),
+                "peak_memory_occupy": float(trace.peak_memory_occupy),
+                "timestamp": now,
+                "device_id": did,
+            })
+            request.admission_stat = admission_stat
+            if hasattr(self, "_profile_events") and not request.get_state("memory_check_logged", False):
+                self._profile_events.append({
+                    "event_type": "memory_check",
+                    "timestamp": now,
+                    "device_id": did,
+                    "request_id": request.request_id,
+                    "extra_args": admission_stat,
+                })
+                request.update_state("memory_check_logged", True)
         
     def get_req_data(self, request: RequestInstance):
         extra_args = request.payload['vllm_xargs']
@@ -1448,6 +1542,7 @@ class SLOsServeRouter(Router):
                     decode_device_id=0,
                     prefill_only=(mode == 'prefill_only'),
                     arrival_time=req.arrival_time - now,
+                    actual_output_length=int(req.payload['vllm_xargs'].get('output_length', -1)),
                 )
             )
 
@@ -1477,12 +1572,17 @@ class SLOsServeRouter(Router):
                     decode_device_id=0,
                     prefill_only=prefill_only,
                     arrival_time=req.arrival_time - now,
+                    actual_output_length=int(req.payload['vllm_xargs'].get('output_length', -1)),
                 )
             )
             
 
         t_before_schedule = time.perf_counter()
         is_feasible, is_accepteds = self.adm_planner.adm_ctrl(c_reqs, engine_state.num_free_blocks, 0.0)
+        memory_check_traces = []
+        if hasattr(self.adm_planner, "consume_memory_check_traces"):
+            memory_check_traces = self.adm_planner.consume_memory_check_traces()
+        self._attach_memory_check_traces(did, waiting_requests, memory_check_traces)
         accepted_ids = set(c_req.id for c_req, is_accepted in zip(c_reqs, is_accepteds) if is_accepted)
         t_after_schedule = time.perf_counter()
         # logger.info(f'[SLOPacker] {did=} {is_feasible=}')
@@ -1803,6 +1903,9 @@ class SLOsServeRouter(Router):
                 ddl = prefill_ddl,
                 input_length = input_length,
                 n_computed_tokens = 0,
+                # - prefill_only: only a single token step is modeled by setting max_tokens=1
+                # - normal/decode: model up to max_decode_length
+                max_tokens = 1 if prefill_only else self.max_decode_length,
                 profit = profit,
                 mem = n_block_ub,
                 tpot_idx = 0,
@@ -1810,7 +1913,8 @@ class SLOsServeRouter(Router):
                 prefill_device_id = 0, 
                 decode_device_id = 0,
                 prefill_only = prefill_only,
-                arrival_time = req.arrival_time
+                arrival_time = req.arrival_time,
+                actual_output_length = int(req.payload['vllm_xargs'].get('output_length', -1)),
             )
             c_reqs.append(c_req)
             runned_waiting_reqs[req.request_id] = req
@@ -1827,12 +1931,14 @@ class SLOsServeRouter(Router):
                 ddl = prefill_ddl + self.tpot * num_output_tokens,
                 input_length = max(input_length - num_computed_token, 0),
                 n_computed_tokens = num_computed_token,
+                max_tokens = 1 if prefill_only else self.max_decode_length,
                 profit = profit,
                 mem = num_block_ub,
                 tpot_idx = 0,
                 prefill_mem = 0,
                 prefill_device_id = 0, 
                 decode_device_id = 0,
+                actual_output_length = int(req.payload['vllm_xargs'].get('output_length', -1)),
                 prefill_only = prefill_only,
                 arrival_time = req.arrival_time
             )
@@ -1843,6 +1949,10 @@ class SLOsServeRouter(Router):
         is_feasible, is_accepteds = self.pre_adm_ctrler.adm_ctrl(
             c_reqs, num_free_blocks, now
         )
+        pre_memory_check_traces = []
+        if hasattr(self.pre_adm_ctrler, "consume_memory_check_traces"):
+            pre_memory_check_traces = self.pre_adm_ctrler.consume_memory_check_traces()
+        self._attach_memory_check_traces(did, waiting_requests, pre_memory_check_traces)
         accpeted_ids = [req.id for req, accepted in zip(c_reqs, is_accepteds) if accepted]
         logger.info(f'slosserverouter, is_feasible: {is_feasible}, len(waiting): {len(waiting_requests)}, len(running): {len(running_requests)}')
         
@@ -2137,7 +2247,10 @@ class RenamingRouter(Router):
                 device.state = 'idle'
 
 def create_router(t: str, n_devices: int, router_kwargs: str) -> Router:
-    logger.info(f"Creating router of type {t} with {n_devices} devices and kwargs: {router_kwargs}")
+    logger.info(
+        f"Creating router of type {t} with {n_devices} devices and kwargs: "
+        f"{_summarize_router_kwargs(router_kwargs)}"
+    )
     if t == 'round_robin':
         return RoundRobinRouter(n_devices, router_kwargs)
     elif 'disaggregated-edf' in t:
@@ -2285,10 +2398,30 @@ class RequestPool:
         global engine_actors
         for actor in engine_actors:
             actor._profile_events = self._profile_events
+        
+        routing_kwargs = request_json['routing_kwargs']
+        if isinstance(routing_kwargs, dict):
+            routing_kwargs = dict(routing_kwargs)
+            # if request_json.get('routing_policy') == 'slosserve':
+            memory_check_policy = str(
+                routing_kwargs.get('memory_check_policy', 'greedy')
+            ).lower()
+            if (memory_check_policy == 'mc' and
+                'memory_check_output_lengths' not in routing_kwargs):
+                length_pattern = request_json.get('length_pattern')
+                if length_pattern:
+                    output_lengths = _load_memory_check_output_lengths(length_pattern)
+                    if output_lengths:
+                        routing_kwargs['memory_check_output_lengths'] = output_lengths
+                        logger.info(
+                            "Loaded %d output lengths from %s.requests.pkl for memory Monte Carlo check",
+                            len(output_lengths),
+                            length_pattern,
+                        )
 
         self.router = create_router(request_json['routing_policy'],
                                     request_json['n_devices'],
-                                    request_json['routing_kwargs'])
+                                    routing_kwargs)
         self.router.set_load_stat(self.load_stat)
         self.router.set_profile_events(self._profile_events)
         # self.admission_mode = request_json.get('admission_mode', 'arrival')
@@ -2297,18 +2430,18 @@ class RequestPool:
         assert self.fallback_policy in ['asap', 'reject'], \
             f"Unsupported routing_fallback_policy={self.fallback_policy}"
         # try:
-        if isinstance(request_json['routing_kwargs'], dict):
-            self.routing_overhead = request_json['routing_kwargs'].get('routing_overhead', self.routing_overhead)
-            self.enable_rerouting = request_json['routing_kwargs'].get('enable_rerouting', False)
-            self.enable_rescheduling = request_json['routing_kwargs'].get('enable_rescheduling', False)
-            self.stat_window = request_json['routing_kwargs'].get('stat_window', self.stat_window)
-            self.kv_xfer_delay = request_json['routing_kwargs'].get('kv_xfer_delay', 0.05)
+        if isinstance(routing_kwargs, dict):
+            self.routing_overhead = routing_kwargs.get('routing_overhead', self.routing_overhead)
+            self.enable_rerouting = routing_kwargs.get('enable_rerouting', False)
+            self.enable_rescheduling = routing_kwargs.get('enable_rescheduling', False)
+            self.stat_window = routing_kwargs.get('stat_window', self.stat_window)
+            self.kv_xfer_delay = routing_kwargs.get('kv_xfer_delay', 0.05)
         # except Exception:
         #     self.routing_overhead = 0
         if request_json['routing_policy'] == 'renaming':
             self.enable_rerouting = True
         
-        logger.info(f"RequestPool:[update_config]: {request_json['routing_kwargs']} {request_json['routing_policy']}, Enable Rerouting: {self.enable_rerouting}, Enable Rescheduling: {self.enable_rescheduling}, Route Ovd. {self.routing_overhead}, kv_xfer_delay: {self.kv_xfer_delay}.")
+        logger.info(f"RequestPool:[update_config]: {_summarize_router_kwargs(routing_kwargs)} {request_json['routing_policy']}, Enable Rerouting: {self.enable_rerouting}, Enable Rescheduling: {self.enable_rescheduling}, Route Ovd. {self.routing_overhead}, kv_xfer_delay: {self.kv_xfer_delay}.")
 
     def reset(self, n_devices):
         assert n_devices <= len(self.clients), f'{n_devices=} <= {len(self.clients)=}'
@@ -2328,6 +2461,56 @@ class RequestPool:
         self.routing_overhead = -1.0
         if execplan_bus_actor is not None:
             execplan_bus_actor.reset.remote()
+
+    def _record_admission_history(
+        self,
+        request: RequestInstance,
+        *,
+        is_rejected: bool,
+        decision_reason: str,
+    ) -> dict[str, Any]:
+        existing = request.get_state("admission_history_entry")
+        if existing is not None:
+            if request.admission_stat is not None:
+                existing.update(dict(request.admission_stat))
+            existing["is_rejected"] = bool(is_rejected)
+            existing["decision_reason"] = decision_reason
+            if not str(decision_reason).startswith("engine-reject"):
+                existing["timestamp"] = time.time()
+            return existing
+
+        base = {}
+        if request.admission_stat is not None:
+            base = dict(request.admission_stat)
+        elif 0 <= request.prefill_device_id < len(self.load_stat.stats):
+            base = asdict(self.load_stat.get_stat()[request.prefill_device_id])
+
+        entry = dict(base)
+        entry.update({
+            "timestamp": time.time(),
+            "request_id": request.request_id,
+            "input_length": request.payload['vllm_xargs'].get('input_length', 0),
+            "output_length": request.payload['vllm_xargs'].get('output_length', 0),
+            "prefill_ddl": entry.get(
+                'prefill_ddl',
+                request.payload['vllm_xargs'].get('prefill_ddl', time.time()) - time.time()),
+            "rejection_prob": request.rejection_prob,
+            "is_rejected": bool(is_rejected),
+            "decision_reason": decision_reason,
+            "memory_check_called": entry.get("memory_check_called", False),
+            "memory_check_policy": entry.get("memory_check_policy", "none"),
+            "memory_feasible": entry.get("memory_feasible", True),
+            "slo_feasible": entry.get("slo_feasible", True),
+            "final_feasible": entry.get("final_feasible", not is_rejected),
+            "active_request": entry.get("active_request", -1),
+            "oom_rate": entry.get("oom_rate", -1.0),
+            "memory_occupy": entry.get("memory_occupy", 0.0),
+            "checked_memory_occupy": entry.get("checked_memory_occupy", 0.0),
+            "peak_memory_occupy": entry.get("peak_memory_occupy", 0.0),
+        })
+        self.admission_history.append(entry)
+        request.update_state("admission_history_entry", entry)
+        return entry
 
     def add_request_json(self, request_json: dict) -> AsyncGenerator[bytes, Any]:
         # print('add_request_json', request_json)
@@ -2648,6 +2831,11 @@ class RequestPool:
                         continue
 
                     if self.fallback_policy == 'reject':
+                        self._record_admission_history(
+                            request,
+                            is_rejected=True,
+                            decision_reason="router_rejection",
+                        )
                         self._profile_events.append({
                             "event_type": "finish",
                             "timestamp": now,
@@ -2766,14 +2954,11 @@ class RequestPool:
             
             # print('dispatch', request.request_id, time.time(), 'router')
 
-            admission_history = request.admission_stat or asdict(self.load_stat.get_stat()[request.prefill_device_id])
-            admission_history.update({
-                'input_length': request.payload['vllm_xargs']['input_length'],
-                'output_length': request.payload['vllm_xargs']['output_length'],
-                'rejection_prob': request.rejection_prob,
-                'request_id': request.request_id
-            })
-            admission_history['prefill_ddl'] = admission_history.get('prefill_ddl', request.payload['vllm_xargs']['prefill_ddl'] - time.time())
+            admission_history = self._record_admission_history(
+                request,
+                is_rejected=False,
+                decision_reason="dispatch-both",
+            )
 
             admitted, generator = await stream_service_response_engine(request.prefill_device_id,
                                                             request.payload,
@@ -2790,6 +2975,7 @@ class RequestPool:
                 admission_history.update({
                     'is_rejected': True
                 })
+                admission_history["decision_reason"] = "engine-reject-both"
                 if self.enable_rescheduling:
                     self.waiting_pool.append(request)
                     self.running_pool.remove(request)
@@ -2824,6 +3010,11 @@ class RequestPool:
             return 
         
         if request.state < RequestState.PREFILL_FINISHED:
+            self._record_admission_history(
+                request,
+                is_rejected=False,
+                decision_reason="dispatch-prefill",
+            )
             # Disaggregated path: prefill → kv → decode
             self.load_stat.add_event({
                 'type': 'arrival',
@@ -2851,6 +3042,11 @@ class RequestPool:
 
             if not admitted:
                 logger.debug(f"Request {request.request_id} was rejected at prefill stage")
+                self._record_admission_history(
+                    request,
+                    is_rejected=True,
+                    decision_reason="engine-reject-prefill",
+                )
                 self.load_stat.add_event({
                     'type': 'reject',
                     'timestamp': time.time(),
@@ -2928,6 +3124,11 @@ class RequestPool:
                                                         request_id=request.request_id)
         if not admitted: 
             logger.debug(f"Request {request.request_id} was rejected at decode stage")
+            self._record_admission_history(
+                request,
+                is_rejected=True,
+                decision_reason="engine-reject-decode",
+            )
             is_rejected = True
             self.load_stat.add_event({
                 'type': 'reject',
@@ -3177,6 +3378,7 @@ def parse_args():
     parser.add_argument("--stat_window", type=float, default=0.5, help="stat window for collecting load statistics from backend engine (used for load prediction)")
     parser.add_argument("--mock_engine", action="store_true", default=False, help="use mock engine to simulate the model inference")
     parser.add_argument("--log_level", type=str, default=os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"), help="logging level (e.g., DEBUG, INFO, WARNING)")
+    parser.add_argument("--memory-check-policy", type=str, default="greedy", choices=["mc", "oracle", "conservative", "greedy"], help="default memory admission policy for slosserve router")
     return parser.parse_args()
 
 def start_engine(clients: list):
@@ -3235,7 +3437,16 @@ if __name__ == "__main__":
     if args.clients:
         start_engine(clients)
     logger.info(f"Engine started: {engine_actors}")
-    router = create_router(args.router, len(clients), args.router_kwargs)
+    initial_router_kwargs = args.router_kwargs
+    if args.router == "slosserve":
+        try:
+            parsed_router_kwargs = json.loads(args.router_kwargs)
+            if isinstance(parsed_router_kwargs, dict):
+                parsed_router_kwargs.setdefault("memory_check_policy", args.memory_check_policy)
+                initial_router_kwargs = parsed_router_kwargs
+        except Exception:
+            logger.warning("Failed to parse router_kwargs JSON when injecting memory_check_policy; using raw router_kwargs.")
+    router = create_router(args.router, len(clients), initial_router_kwargs)
     load_stat = LoadStat(max_window=args.stat_window, n_devices=len(clients))
     request_pool = RequestPool(args.window_size, router, clients, None,
                                args.enable_rerouting, args.enable_rescheduling, args.admission_mode, args.mock_connector, load_stat, args.stat_window)

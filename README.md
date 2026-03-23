@@ -1,9 +1,3 @@
-# TODOs
-For Yi
-- []  run through the router/benchmark detailed below; 
-- [] open a new branch, add memory feasibility check to the feasibility check in csrc/adm_ctrl_scheduler.cc; (csrc/adm_ctrl_scheduler.cc:1254)
-- [] do experiment on the S1K trace; wire the logic to add oom as another source of SLO violation (we do not do migration for now). (3rdparty/vllm/vllm/v1/core/sched/scheduler_adm_ctrl.py:1852, motivation/bench_api_server.py:550)
-
 # Setup
 
 ## Step 1: Setup
@@ -37,6 +31,10 @@ Launch a distributed api_server (router + engine).
 python -m SLOsServe.router.api_server_ray --help
 ```
 
+```sh
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
 Example: 
 ```sh
 export PYTHONPATH=$PWD
@@ -48,6 +46,17 @@ python -m SLOsServe.router.api_server_ray --stat_window 2 \
     --window_size 0.005 \
     --router slosserve \
     --router_kwargs "{\"device_mem\":1248576, \"block_size\": 16, \"model_name\": \"Qwen/Qwen2.5-7B-Instruct\", \"tpot\":0.05, \"scheduling_overhead\": 0.005, \"max_decode_length\": 500, \"is_pd_disagg\": 0, \"n_prefill_per_group\": 1, \"max_decode_bs\": 16, \"enable_rerouting\": 0}" \
+    --clients 0,1 --admission_mode anytime --mock_connector \
+    --mock_engine 2>&1 | tee out.txt
+```
+
+```sh
+python -m SLOsServe.router.api_server_ray --stat_window 2 \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --window_size 0.001 \
+    --router slosserve \
+    --router_kwargs "{\"device_mem\":1248576, \"block_size\": 16, \"model_name\": \"Qwen/Qwen2.5-7B-Instruct\", \"tpot\":0.08, \"scheduling_overhead\": 0.005, \"max_decode_length\": 500, \"is_pd_disagg\": 0, \"n_prefill_per_group\": 1, \"max_decode_bs\": 16, \"enable_rerouting\": 0}" \
     --clients 0,1 --admission_mode anytime --mock_connector \
     --mock_engine 2>&1 | tee out.txt
 ```
@@ -71,12 +80,115 @@ python motivation/bench_api_server.py --overwrite \
       --ttft_slo_scales 5.0 \
       --window "t800:1000" \
       --trace "azure_code_23:azure_code_23" \
-      --profit constant --admission_mode arrival \
-      --overwrite --slo_routing_overhead 0.05 --scheduling_overhead 0.005 \
+      --profit constant \
+      --admission_mode arrival \
+      --slo_routing_overhead 0.05 \
+      --scheduling_overhead 0.005 \
       --model_name Qwen/Qwen2.5-7B-Instruct \
-      --port 8000 --clients 0-15 \
-      --output_dir experiments_emulation_new --routing_overhead -1.0 --routing_fallback_policy reject --kv_xfer_delay 0.05
+      --port 8000 \
+      --clients 0-15 \
+      --output_dir exp_emulation_new \
+      --routing_overhead -1.0 \
+      --routing_fallback_policy reject \
+      --kv_xfer_delay 0.05\
+      > exp_emulation_new/out.txt $@
 ```
+
+```sh
+python motivation/bench_api_server.py --overwrite \
+      --n_devices 16 \
+      --policies slosserve_planner:atfc \
+      --load_scales 0.25 \
+      --slo_tpots 0.05 \
+      --ttft_slo_scales 5.0 \
+      --window "t800:1000" \
+      --trace "reasoning:azure_code_23" \
+      --profit constant \
+      --admission_mode arrival \
+      --slo_routing_overhead 0.05 \
+      --scheduling_overhead 0.005 \
+      --model_name Qwen/Qwen2.5-7B-Instruct \
+      --port 8000 \
+      --clients 0-15 \
+      --output_dir exp_memory_check_mc_reasoning \
+      --routing_overhead -1.0 \
+      --routing_fallback_policy reject \
+      --kv_xfer_delay 0.05 \
+      --memory-check-policy mc \
+      > exp_memory_check_mc_reasoning/out.txt $@
+```
+
+```sh
+python motivation/bench_api_server.py --overwrite \
+  --n_devices 16 \
+  --policies slosserve_planner:atfc \
+  --load_scales 0.25 0.5 0.75 1.0 1.25 1.5 \
+  --slo_tpots 0.05 \
+  --ttft_slo_scales 5.0 \
+  --window "0:1000" \
+  --trace "reasoning:reasoning" \
+  --profit constant \
+  --admission_mode arrival \
+  --slo_routing_overhead 0.05 \
+  --scheduling_overhead 0.005 \
+  --model_name Qwen/Qwen2.5-7B-Instruct \
+  --port 8000 \
+  --clients 0-15 \
+  --output_dir experiments_memory_check \
+  --routing_overhead -1.0 \
+  --routing_fallback_policy reject \
+  --kv_xfer_delay 0.05 \
+  --memory-check-policy oracle
+```
+
+```sh
+python motivation/bench_api_server.py --overwrite \
+  --n_devices 16 \
+  --policies slosserve_planner:atfc \
+  --load_scales 1.0 \
+  --slo_tpots 0.05 \
+  --ttft_slo_scales 5.0 \
+  --window "t800:1000" \
+  --trace "azure_code_23:azure_code_23" \
+  --profit constant \
+  --admission_mode arrival \
+  --slo_routing_overhead 0.05 \
+  --scheduling_overhead 0.005 \
+  --model_name Qwen/Qwen2.5-7B-Instruct \
+  --port 8000 \
+  --clients 0-15 \
+  --output_dir exp_memory_check_greedy \
+  --routing_overhead -1.0 \
+  --routing_fallback_policy reject \
+  --kv_xfer_delay 0.05 \
+  --memory-check-policy greedy \
+  > exp_memory_check_greedy/out.txt $@
+```
+
+```sh
+python motivation/bench_api_server.py --overwrite \
+  --n_devices 16 \
+  --policies slosserve_planner:atfc \
+  --load_scales 0.25 0.5 0.75 1.0 1.25 1.5 \
+  --slo_tpots 0.05 \
+  --ttft_slo_scales 5.0 \
+  --window "0:1000" \
+  --trace "reasoning:reasoning" \
+  --profit constant \
+  --admission_mode arrival \
+  --slo_routing_overhead 0.05 \
+  --scheduling_overhead 0.005 \
+  --model_name Qwen/Qwen2.5-7B-Instruct \
+  --port 8000 \
+  --clients 0-15 \
+  --output_dir experiments_memory_check \
+  --routing_overhead -1.0 \
+  --routing_fallback_policy reject \
+  --kv_xfer_delay 0.05 \
+  --memory-check-policy conservative
+```
+
+
 
 ## Step 4. end to end evaluation
 End-to-end scripts

@@ -27,7 +27,7 @@ class Request:
     slo_tpot: float
     prefill_only: bool
     kv_ready_time: float | None
-    output_length: int 
+    output_length: int | None
     
     num_computed_tokens: int = 0
     last_sch_bid: int = -1
@@ -187,6 +187,7 @@ class BatchPlanner:
         assert max_decode_length is not None
         mem = math.ceil((max_decode_length + req.num_prompt_tokens - req.num_computed_tokens) / self._block_size)
         prefill_mem = math.ceil(req.num_prompt_tokens / self._block_size)
+        actual_output_length = int(req.output_length) if req.output_length is not None else -1
         return SLOsServe_C.Request(
             id=req.request_id,
             is_new_req=is_new_req,
@@ -202,6 +203,7 @@ class BatchPlanner:
             decode_device_id=0,
             prefill_only=req.prefill_only,
             arrival_time=req.kv_ready_time - now if req.kv_ready_time is not None else 0,
+            actual_output_length=actual_output_length,
         )
 
     def _cpp_feasible_with_new(self, new_req: Request, now: float) -> bool:
