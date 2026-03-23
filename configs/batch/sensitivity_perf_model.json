@@ -1,4 +1,5 @@
 {
+  "experiment_name": "sensitivity_perf_model",
   "extends": [
     "base.json"
   ],

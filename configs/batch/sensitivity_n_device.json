@@ -1,5 +1,5 @@
 {
-  "experiment_name": "slo_tpot",
+  "experiment_name": "sensitivity_n_device",
   "extends": [
     "base.json"
   ],
@@ -7,13 +7,14 @@
     "slosserve_1_planner:atfc",
     "slosserve_2_planner:atfc",
     "slosserve_4_planner:atfc",
-    "slosserve_8_planner:atfc"
+    "slosserve_8_planner:atfc",
+    "round_robin_session:qlm"
   ],
   "traces": [
-    "azure_code_23:azure_code_23"
+    "sharegpt_chat:azure_chat_23"
   ],
   "configs": {
-    "azure_code_23:azure_code_23": {
+    "sharegpt_chat:azure_chat_23": {
       "window": "t1200:1800",
       "load_scale": 1.0,
       "n_devices": [8]

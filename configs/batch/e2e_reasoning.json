@@ -1,11 +1,11 @@
 {
-  "experiment_name": "e2e",
+  "experiment_name": "e2e_reasoning",
   "extends": [
     "base.json"
   ],
   "policies": [
-    "round_robin:sarathi+",
-    "llumnix_load:sarathi+",
+    "round_robin:qlm",
+    "llumnix_load:qlm",
     "round_robin:atfc",
     "slosserve_planner:atfc",
     "slosserve_planner_oracle_mem:atfc"
@@ -17,7 +17,7 @@
     "reasoning:azure_chat_23": {
       "window": "t1200:1800",
       "load_scale": 1.0,
-      "n_devices": [2, 4, 8]
+      "n_devices": [2, 4, 5, 8]
     }
   }
 }

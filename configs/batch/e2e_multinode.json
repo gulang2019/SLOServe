@@ -1,14 +1,15 @@
 {
-  "experiment_name": "e2e",
+  "experiment_name": "e2e_multinode",
   "server_clients": "0-15",
   "extends": [
     "base.json"
   ],
   "policies": [
-    "round_robin:sarathi+",
-    "llumnix_load:sarathi+",
+    "round_robin:qlm",
+    "llumnix_load:qlm",
     "round_robin:atfc",
-    "slosserve_planner:atfc"
+    "slosserve_planner:atfc",
+    "slosserve_planner_oracle_mem:atfc"
   ],
   "traces": [
     "azure_chat:azure_chat",

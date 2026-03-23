@@ -5,10 +5,11 @@
     "base.json"
   ],
   "policies": [
-    "round_robin:sarathi+",
-    "llumnix_load:sarathi+",
+    "round_robin:qlm",
+    "llumnix_load:qlm",
     "round_robin:atfc",
-    "slosserve_planner:atfc"
+    "slosserve_planner:atfc",
+    "slosserve_planner_oracle_mem:atfc"
   ],
   "traces": [
     "azure_code_23:azure_code_23",

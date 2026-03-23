@@ -4,7 +4,7 @@
     "base.json"
   ],
   "policies": [
-    "round_robin:sarathi+",
+    "round_robin:qlm",
     "round_robin:atfc",
     "slosserve_planner:atfc"
   ],

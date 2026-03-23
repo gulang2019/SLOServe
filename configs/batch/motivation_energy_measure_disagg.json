@@ -1,5 +1,5 @@
 {
-  "experiment_name": "energy",
+  "experiment_name": "motivation_energy_measure",
   "extends": [
     "base.json"
   ],
