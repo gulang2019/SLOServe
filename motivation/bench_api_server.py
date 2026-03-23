@@ -24,6 +24,7 @@ from motivation.auto_scaling import eval_auto_scaling
 from Dataset.dataset import ArrivalTimes, Requests, Request
 
 from SLOsServe.client_spec import count_client_spec, normalize_client_spec
+from SLOsServe.fitting_utils import fit_linear_perf_model
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -32,7 +33,9 @@ FRONTEND_DELAY=0.03
 from SLOsServe.perf_model import get_model_max_tokens, get_easy_name
 
 
-def _extract_batch_perf_error_row(event: Dict[str, Any]) -> Dict[str, Any] | None:
+def _extract_batch_perf_sample(
+    event: Dict[str, Any],
+) -> tuple[Dict[str, Any], list[tuple[int, int]]] | None:
     if event.get("event_type") != "batch":
         return None
 
@@ -99,7 +102,33 @@ def _extract_batch_perf_error_row(event: Dict[str, Any]) -> Dict[str, Any] | Non
         "measured_time": max(0.0, elapsed - scheduling_overhead),
         "elapsed_time": max(0.0, elapsed),
         "scheduling_overhead": max(0.0, scheduling_overhead),
-    }
+    }, [
+        (int(item["past_tokens"]), int(item["scheduled_tokens"]))
+        for item in batch
+    ]
+
+
+def _extract_batch_perf_error_row(event: Dict[str, Any]) -> Dict[str, Any] | None:
+    sample = _extract_batch_perf_sample(event)
+    if sample is None:
+        return None
+    row, _ = sample
+    return row
+
+
+def _collect_batch_fit_samples(
+    events: List[Dict[str, Any]],
+) -> list[tuple[list[tuple[int, int]], float]]:
+    batch_times: list[tuple[list[tuple[int, int]], float]] = []
+
+    for event in events:
+        sample = _extract_batch_perf_sample(event)
+        if sample is None:
+            continue
+        row, batch = sample
+        batch_times.append((batch, float(row["measured_time"])))
+
+    return batch_times
 
 
 def _collect_batch_perf_error_rows(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -168,16 +197,76 @@ def _write_jsonl(path: str | Path, rows: List[Dict[str, Any]]) -> Path:
     return output_path
 
 
+def _save_estimated_vs_measured_figure(
+    estimated_times: List[float],
+    measured_times: List[float],
+    path: str | Path,
+    *,
+    title: str,
+) -> Path | None:
+    if not estimated_times or not measured_times:
+        return None
+
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    estimated = np.asarray(estimated_times, dtype=float)
+    measured = np.asarray(measured_times, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(6, 6), tight_layout=True)
+    ax.scatter(measured, estimated, s=14, alpha=0.7)
+    lo = float(min(measured.min(), estimated.min()))
+    hi = float(max(measured.max(), estimated.max()))
+    if hi > lo:
+        ax.plot([lo, hi], [lo, hi], "--r", linewidth=1)
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+    ax.set_xlabel("Measured Time (s)")
+    ax.set_ylabel("Estimated Time (s)")
+    ax.set_title(title)
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    return output_path
+
+
 def _log_perf_model_errors_from_batch_events(
     problem: "Problem",
     events: List[Dict[str, Any]],
     output_path: str | Path,
     *,
     event_file: str,
+    include_time_lists: bool = False,
+    draw_figure: bool = True,
+    figure_path: str | Path | None = None,
 ) -> Dict[str, Any] | None:
     error_rows = _collect_batch_perf_error_rows(events)
     if not error_rows:
         return None
+    batch_times = _collect_batch_fit_samples(events)
+    if not batch_times:
+        return None
+
+    from SLOsServe.perf_model import PerfModel
+
+    old_hardware_params = list(
+        PerfModel.get_perf_model(
+            problem.model_name,
+            problem.length_pattern,
+        ).hardware_params
+    )
+    fit_result = fit_linear_perf_model(batch_times)
+    regressed_hardware_params = [
+        float(param) for param in fit_result["hardware_params"]
+    ]
+    regressed_hardware_params_delta = [
+        float(new_param - old_param)
+        for old_param, new_param in zip(
+            old_hardware_params,
+            regressed_hardware_params,
+        )
+    ]
+    estimated_times = [float(row["estimated_time"]) for row in error_rows]
+    measured_times = [float(row["measured_time"]) for row in error_rows]
 
     summary = {
         "model_name": problem.model_name,
@@ -185,6 +274,10 @@ def _log_perf_model_errors_from_batch_events(
         "store_prefix": problem.store_prefix,
         "event_file": event_file,
         "perf_model_err": float(problem.perf_model_err),
+        "old_hardware_params": [float(param) for param in old_hardware_params],
+        "regressed_hardware_params": regressed_hardware_params,
+        "regressed_hardware_params_delta": regressed_hardware_params_delta,
+        "regression_stats": fit_result["stats"],
         "relative_error_denominator": "measured_time",
         "estimated_minus_measured_s": _summarize_distribution(
             [float(row["error_s"]) for row in error_rows]
@@ -203,6 +296,20 @@ def _log_perf_model_errors_from_batch_events(
             if row["abs_relative_error"] is not None
         ]),
     }
+    if include_time_lists:
+        summary["estimated_time_list"] = estimated_times
+        summary["measured_time_list"] = measured_times
+
+    plotted_figure_path = None
+    if draw_figure:
+        plotted_figure_path = _save_estimated_vs_measured_figure(
+            estimated_times,
+            measured_times,
+            figure_path or Path(output_path).with_suffix(".png"),
+            title=f"{get_easy_name(problem.model_name)} [{problem.length_pattern}]",
+        )
+        if plotted_figure_path is not None:
+            summary["estimated_vs_measured_figure_path"] = str(plotted_figure_path)
 
     rows = [{
         "record_type": "summary",
@@ -217,6 +324,10 @@ def _log_perf_model_errors_from_batch_events(
     return {
         "path": str(output_path),
         "summary": summary,
+        "figure_path": (
+            str(plotted_figure_path)
+            if plotted_figure_path is not None else None
+        ),
     }
 
 
@@ -265,6 +376,8 @@ class Problem:
     store_prefix: str = 'problem'
     record_events: bool = False
     log_perf_model_errors: bool = True
+    include_perf_model_time_lists: bool = False
+    draw_perf_model_error_figure: bool = True
 
     def get_expected_profit(self, input_length: int):
         return float(self.profit_per_input_token * input_length + self.profit_per_output_token * average_output_length + self.profit_base)
@@ -1095,6 +1208,9 @@ async def main(
     print(f'Saved {filename}')
 
     perf_model_error_filename = f'{problem.store_prefix}.{i}.perf_model_errors.jsonl'
+    perf_model_error_figure_filename = (
+        f'{problem.store_prefix}.{i}.perf_model_estimated_vs_measured.png'
+    )
     perf_model_error_artifacts = None
     if problem.log_perf_model_errors:
         perf_model_error_artifacts = _log_perf_model_errors_from_batch_events(
@@ -1102,6 +1218,9 @@ async def main(
             events,
             perf_model_error_filename,
             event_file=filename,
+            include_time_lists=problem.include_perf_model_time_lists,
+            draw_figure=problem.draw_perf_model_error_figure,
+            figure_path=perf_model_error_figure_filename,
         )
         if perf_model_error_artifacts is not None:
             print(
@@ -1111,10 +1230,17 @@ async def main(
             error_summary = perf_model_error_artifacts["summary"]
             print(
                 "Perf-model error summary:",
+                f"old_params={error_summary['old_hardware_params']}",
+                f"regressed_params={error_summary['regressed_hardware_params']}",
                 f"signed_mean={error_summary['estimated_minus_measured_s'].get('mean')}",
                 f"abs_mean={error_summary['abs_estimated_minus_measured_s'].get('mean')}",
                 f"relative_p50={error_summary['estimated_minus_measured_relative'].get('p50')}",
             )
+            if perf_model_error_artifacts.get("figure_path"):
+                print(
+                    "Saved perf-model estimated-vs-measured figure to "
+                    f"{perf_model_error_artifacts['figure_path']}"
+                )
 
     # TODO(Yi): add oom fail rate analysis here.
     events, reqs = analyze_events(filename, verbose = True)
@@ -1140,6 +1266,24 @@ async def main(
     if perf_model_error_artifacts is not None:
         results['perf_model_error_summary'] = perf_model_error_artifacts["summary"]
         results['perf_model_error_file'] = perf_model_error_artifacts["path"]
+        if perf_model_error_artifacts.get("figure_path") is not None:
+            results['perf_model_error_figure'] = perf_model_error_artifacts[
+                "figure_path"]
+        results['perf_model_old_hardware_params'] = perf_model_error_artifacts[
+            "summary"]["old_hardware_params"]
+        results['perf_model_regressed_hardware_params'] = (
+            perf_model_error_artifacts["summary"]["regressed_hardware_params"])
+        results['perf_model_regressed_hardware_params_delta'] = (
+            perf_model_error_artifacts["summary"][
+                "regressed_hardware_params_delta"])
+        results['perf_model_regression_stats'] = (
+            perf_model_error_artifacts["summary"]["regression_stats"])
+        if "estimated_time_list" in perf_model_error_artifacts["summary"]:
+            results["perf_model_estimated_time_list"] = (
+                perf_model_error_artifacts["summary"]["estimated_time_list"])
+        if "measured_time_list" in perf_model_error_artifacts["summary"]:
+            results["perf_model_measured_time_list"] = (
+                perf_model_error_artifacts["summary"]["measured_time_list"])
     if os.path.exists(admission_filename):
         with open(admission_filename, 'r') as f:
             admission_history = json.load(f)
@@ -1324,6 +1468,8 @@ def build_problems(
     enable_session_replay: bool = False,
     session_pause_s: float = 0.0,
     log_perf_model_errors: bool = True,
+    include_perf_model_time_lists: bool = False,
+    draw_perf_model_error_figure: bool = True,
 ):
     session_replay_suffix = _session_replay_suffix(
         enable_session_replay,
@@ -1757,6 +1903,8 @@ def build_problems(
         enable_session_replay = enable_session_replay,
         session_pause_s = session_pause_s,
         log_perf_model_errors = log_perf_model_errors,
+        include_perf_model_time_lists = include_perf_model_time_lists,
+        draw_perf_model_error_figure = draw_perf_model_error_figure,
     ) for (scheduling_kwargs, routing_kwargs) in product(
         scheduling_kwargss, routing_kwargss)]
 
@@ -1790,6 +1938,8 @@ def run(
     enable_session_replay: bool,
     session_pause_s: float,
     log_perf_model_errors: bool,
+    include_perf_model_time_lists: bool,
+    draw_perf_model_error_figure: bool,
     update_clients: bool = True,
 ):
     output_dir = os.path.abspath(output_dir)
@@ -1829,6 +1979,8 @@ def run(
     print(f'enable_session_replay: {enable_session_replay}')
     print(f'session_pause_s: {session_pause_s}')
     print(f'log_perf_model_errors: {log_perf_model_errors}')
+    print(f'include_perf_model_time_lists: {include_perf_model_time_lists}')
+    print(f'draw_perf_model_error_figure: {draw_perf_model_error_figure}')
     print('--End of Problem Grid--')
     results = {}
     if os.path.exists(f'{experiment_dir}/results.jsonl'):
@@ -1908,6 +2060,8 @@ def run(
             enable_session_replay=enable_session_replay,
             session_pause_s=session_pause_s,
             log_perf_model_errors=log_perf_model_errors,
+            include_perf_model_time_lists=include_perf_model_time_lists,
+            draw_perf_model_error_figure=draw_perf_model_error_figure,
         )
         if not len(problems):
             logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
@@ -1968,6 +2122,28 @@ def run(
         if 'perf_model_error_file' in best_result.results:
             result['perf_model_error_file'] = (
                 f'{problems[0].store_prefix}.perf_model_errors.jsonl')
+        if 'perf_model_error_figure' in best_result.results:
+            result['perf_model_error_figure'] = (
+                f'{problems[0].store_prefix}.perf_model_estimated_vs_measured.png')
+        if 'perf_model_old_hardware_params' in best_result.results:
+            result['perf_model_old_hardware_params'] = best_result.results[
+                'perf_model_old_hardware_params']
+        if 'perf_model_regressed_hardware_params' in best_result.results:
+            result['perf_model_regressed_hardware_params'] = best_result.results[
+                'perf_model_regressed_hardware_params']
+        if 'perf_model_regressed_hardware_params_delta' in best_result.results:
+            result['perf_model_regressed_hardware_params_delta'] = (
+                best_result.results[
+                    'perf_model_regressed_hardware_params_delta'])
+        if 'perf_model_regression_stats' in best_result.results:
+            result['perf_model_regression_stats'] = best_result.results[
+                'perf_model_regression_stats']
+        if 'perf_model_estimated_time_list' in best_result.results:
+            result['perf_model_estimated_time_list'] = best_result.results[
+                'perf_model_estimated_time_list']
+        if 'perf_model_measured_time_list' in best_result.results:
+            result['perf_model_measured_time_list'] = best_result.results[
+                'perf_model_measured_time_list']
         print('--Result--')
         pprint.pprint(result)
         print('--End of Result--')
@@ -1987,6 +2163,10 @@ def run(
             dst = f'{problems[0].store_prefix}.{surfix}.jsonl'
             if os.path.exists(src):
                 os.system(f'cp {src} {dst}')
+        src = f'{best_result.event_file}.perf_model_estimated_vs_measured.png'
+        dst = f'{problems[0].store_prefix}.perf_model_estimated_vs_measured.png'
+        if os.path.exists(src):
+            os.system(f'cp {src} {dst}')
     
         for r in run_results:
             os.system(f'rm {r.event_file}*')
@@ -2100,6 +2280,10 @@ if __name__ == '__main__':
                         help='fixed think-time delay between turns of the same session when replay is enabled')
     parser.add_argument('--disable_perf_model_error_log', action='store_true',
                         help='disable post-run batch-level estimated-vs-measured perf-model error logging')
+    parser.add_argument('--include_perf_model_time_lists', action='store_true',
+                        help='include raw estimated_time and measured_time lists in perf-model outputs and results.jsonl')
+    parser.add_argument('--disable_perf_model_error_figure', action='store_true',
+                        help='disable the default estimated-vs-measured perf-model figure')
     args = parser.parse_args()
     
     if not args.run_all:
@@ -2130,6 +2314,9 @@ if __name__ == '__main__':
                 enable_session_replay = args.enable_session_replay,
                 session_pause_s = args.session_pause_s,
                 log_perf_model_errors = not args.disable_perf_model_error_log,
+                include_perf_model_time_lists = args.include_perf_model_time_lists,
+                draw_perf_model_error_figure = (
+                    not args.disable_perf_model_error_figure),
                 update_clients = not args.skip_update_clients,
             )
         exit(0)
@@ -2192,6 +2379,10 @@ if __name__ == '__main__':
                 'enable_session_replay': args.enable_session_replay,
                 'session_pause_s': args.session_pause_s,
                 'log_perf_model_errors': not args.disable_perf_model_error_log,
+                'include_perf_model_time_lists': args.include_perf_model_time_lists,
+                'draw_perf_model_error_figure': (
+                    not args.disable_perf_model_error_figure),
+                'update_clients': not args.skip_update_clients,
             })
         p.start()
         running_jobs.append((p, clients_str, router))

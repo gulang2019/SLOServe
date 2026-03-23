@@ -54,7 +54,11 @@ def save_prediction_scatter(
     return output_path
 
 
-def fit_linear_perf_model(batch_times: list[BatchTimingSample]) -> dict[str, Any]:
+def fit_linear_perf_model(
+    batch_times: list[BatchTimingSample],
+    *,
+    min_abs_num_reqs_coef: float = 1e-9,
+) -> dict[str, Any]:
     xs: list[list[float]] = []
     ys: list[float] = []
     records: list[dict[str, Any]] = []
@@ -101,7 +105,17 @@ def fit_linear_perf_model(batch_times: list[BatchTimingSample]) -> dict[str, Any
     x_data = np.asarray(xs, dtype=float)
     y_data = np.asarray(ys, dtype=float)
     params, *_ = np.linalg.lstsq(x_data, y_data, rcond=None)
-    predicted = x_data @ params
+
+    adjusted_params = np.asarray(params, dtype=float).copy()
+    raw_num_reqs_coef = float(adjusted_params[1])
+    clamped_num_reqs_coef = False
+    min_abs_num_reqs_coef = float(abs(min_abs_num_reqs_coef))
+    if min_abs_num_reqs_coef > 0.0 and abs(raw_num_reqs_coef) < min_abs_num_reqs_coef:
+        sign = -1.0 if raw_num_reqs_coef < 0.0 else 1.0
+        adjusted_params[1] = sign * min_abs_num_reqs_coef
+        clamped_num_reqs_coef = True
+
+    predicted = x_data @ adjusted_params
 
     residuals = y_data - predicted
     centered = y_data - np.mean(y_data)
@@ -117,11 +131,11 @@ def fit_linear_perf_model(batch_times: list[BatchTimingSample]) -> dict[str, Any
 
     return {
         "hardware_params": [
-            float(params[0]),
-            float(params[1]),
-            float(params[2]),
+            float(adjusted_params[0]),
+            float(adjusted_params[1]),
+            float(adjusted_params[2]),
             0.0,
-            float(params[3]),
+            float(adjusted_params[3]),
         ],
         "predicted_times": predicted_list,
         "measured_times": y_data.astype(float).tolist(),
@@ -131,5 +145,8 @@ def fit_linear_perf_model(batch_times: list[BatchTimingSample]) -> dict[str, Any
             "mae": mae,
             "rmse": rmse,
             "r2": float(r2),
+            "raw_num_reqs_coef": raw_num_reqs_coef,
+            "min_abs_num_reqs_coef": min_abs_num_reqs_coef,
+            "num_reqs_coef_was_clamped": clamped_num_reqs_coef,
         },
     }

@@ -177,9 +177,12 @@ class Instance:
             if len(self.active_requests) == 1:
                 self._begin_next_batch(now)
         else:
-            if 'MEM' in self.batch_planner._last_infeasible_reason:
+            if self.batch_planner._last_infeasible_reason == 'MEM':
                 self.failure_reasons['mem'] += 1
-            else: self.failure_reasons['comp'] += 1
+            elif self.batch_planner._last_infeasible_reason == 'CMP':
+                self.failure_reasons['comp'] += 1
+            else:
+                self.failure_reasons['comp'] += 1
         return suc
     
     def on_batch_finish(self, now: float, n_scheduled_tokens: dict):
@@ -292,11 +295,13 @@ def calc_avg_num_servers(
     }
 
     def _categorize_reject_reason(reason: str) -> str:
-        if 'MEM' in reason:
+        if reason == 'MEM':
             return 'mem'
+        if reason == 'CMP':
+            return 'comp'
         if reason == "UNKNOWN":
             return 'unknown'
-        return 'comp'
+        return 'unknown'
 
     while len(event_queue):
         now, event_type, device_id, obj = event_queue.pop()

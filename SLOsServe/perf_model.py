@@ -89,14 +89,18 @@ class PerfModel:
     def fit(self,
             batch_times: list[tuple[list[tuple[int, int]], float]],
             tag: str, 
-            viz=False):
+            viz=False,
+            min_abs_num_reqs_coef: float = 1e-9):
         '''
         fit the linear regression model 
         @param batch_times list of batches: [[(past_len, currentlen)], measured_time]
         @param tag: the store prefix 
         @param viz: visualize or not 
         '''
-        fit_result = fit_linear_perf_model(batch_times)
+        fit_result = fit_linear_perf_model(
+            batch_times,
+            min_abs_num_reqs_coef=min_abs_num_reqs_coef,
+        )
         self.hardware_params = copy.deepcopy(fit_result["hardware_params"])
         upsert_hardware_params(self.model_name, tag, self.hardware_params)
 

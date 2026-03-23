@@ -273,18 +273,25 @@ class BatchPlanner:
             arrival_time=req.kv_ready_time - now if req.kv_ready_time is not None else 0,
         )
 
-    def _cpp_feasible_with_new(self, new_req: Request, now: float) -> bool:
+    def _cpp_feasible_with_new(self, new_req: Request, now: float) -> tuple[bool, str | None]:
         start = time.time()
         reqs = list(self._requests.values()) + [new_req]
         tpot = min(r.slo_tpot for r in reqs) if reqs else new_req.slo_tpot
         self._ensure_cpp_planner(tpot)
         c_reqs = [self._to_cpp_request(r, is_new_req=False, now=now) for r in self._requests.values()]
         c_reqs.append(self._to_cpp_request(new_req, is_new_req=True, now=now))
-        is_feasible, is_accepteds = self._adm_ctrler.adm_ctrl(c_reqs, self._num_free_blocks, 0.0)
+        reject_reason = None
+        if hasattr(self._adm_ctrler, "adm_ctrl_with_reason"):
+            is_feasible, is_accepteds, reject_reason = self._adm_ctrler.adm_ctrl_with_reason(
+                c_reqs, self._num_free_blocks, 0.0
+            )
+        else:
+            is_feasible, is_accepteds = self._adm_ctrler.adm_ctrl(c_reqs, self._num_free_blocks, 0.0)
         # print('c_reqs', c_reqs, 'num_free_blocks', self._num_free_blocks)
         # print('is_feasible', is_feasible, 'is_accepteds', is_accepteds)
         self._cpp_adm_ctrl_iterations += 1
         elapsed = time.time() - start
+        accepted = bool(is_feasible and len(is_accepteds) == len(c_reqs) and is_accepteds[-1])
         if DUMP_ADM and hasattr(self, "_profile_events"):
             self._profile_events.append({
                 'event_type': 'local_admission', 
@@ -293,6 +300,8 @@ class BatchPlanner:
                 'extra_args': {
                     'now': now,
                     'is_feasible': is_feasible,
+                    'accepted': accepted,
+                    'reject_reason': reject_reason,
                     'state': {
                         req.id: (req.is_new_req, is_acc, req.n_computed_tokens, req.input_length, req.ddl, req.max_tokens, req.arrival_time) for req, is_acc in zip(c_reqs, is_accepteds)
                     },
@@ -307,7 +316,11 @@ class BatchPlanner:
                 is_feasible=bool(is_feasible),
                 surfix = f'adm_ctrl_{new_req.request_id}'
             )
-        return bool(is_feasible and len(is_accepteds) == len(c_reqs) and is_accepteds[-1])
+        if accepted:
+            return True, None
+        if reject_reason not in {"MEM", "CMP", "UNKNOWN"}:
+            reject_reason = "UNKNOWN"
+        return False, reject_reason
     
     def add_request(self, 
                         *,
@@ -330,9 +343,9 @@ class BatchPlanner:
                           kv_ready_time = kv_ready_time,
                           output_length = output_length)
         now = self._next_batch_time if self._next_batch_time is not None else self._now()
-        feasible = self._cpp_feasible_with_new(new_req, now)
+        feasible, reject_reason = self._cpp_feasible_with_new(new_req, now)
         if (not feasible) and (not must_admit):
-            self._last_infeasible_reason = "CPP admission rejected new request"
+            self._last_infeasible_reason = reject_reason or "UNKNOWN"
         else:
             self._requests[request_id] = new_req
             if not feasible:

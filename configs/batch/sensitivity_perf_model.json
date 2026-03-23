@@ -16,6 +16,7 @@
       "n_devices": [8],
       "perf_model_errs": [0.4, 0.6, 0.8, 1.0, 1.2, 1.4]
     }
-  }
+  },
+  "extra_args": "--include_perf_model_time_lists"
 }
 
