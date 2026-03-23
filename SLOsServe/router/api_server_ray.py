@@ -298,6 +298,14 @@ def _parse_clients_arg(raw_clients: str | None) -> list[str]:
     return parse_client_spec(raw_clients)
 
 
+async def _wait_for_engine_actors_ready() -> None:
+    if not engine_actors:
+        return
+    await asyncio.gather(*[
+        ea.engine_actor.wait_until_ready.remote() for ea in engine_actors
+    ])
+
+
 def _parse_worker_env_args(raw_envs: list[str] | None) -> dict[str, str]:
     env_vars: dict[str, str] = {}
     if not raw_envs:
@@ -3595,6 +3603,7 @@ async def update_config(request: Request):
             })
     request_pool.update_config(request_json)
     logger.info(f"Updated router: {request_pool.router}")
+    await _wait_for_engine_actors_ready()
 
     # Fan out config to per-replica actors
     for i, client in enumerate(request_pool.clients):
@@ -3669,6 +3678,9 @@ async def update_clients(request: Request):
             name="routing_loop_with_error_monitoring",
         )
         routing_loop_task.add_done_callback(_task_done)
+    else:
+        logger.info("Client set unchanged; waiting for existing engine actors to report ready")
+    await _wait_for_engine_actors_ready()
     request_pool.clients = clients
     logger.info(f"Updated clients: {clients}")
     return JSONResponse(status_code=200, content={"message": "Clients updated."})

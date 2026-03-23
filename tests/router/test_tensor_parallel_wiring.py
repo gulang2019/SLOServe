@@ -33,10 +33,12 @@ def test_normalize_router_clients_arg_preserves_replica_semantics(
 
 def test_parse_clients_arg_splits_logical_replica_labels():
     assert api_server_ray._parse_clients_arg(None) == []
-    assert api_server_ray._parse_clients_arg("r0, r1 ,, r2") == [
-        "r0",
-        "r1",
-        "r2",
+    assert api_server_ray._parse_clients_arg("r0, r1 ,, r2") == ["r0", "r1", "r2"]
+    assert api_server_ray._parse_clients_arg("0-3") == ["r0", "r1", "r2", "r3"]
+    assert api_server_ray._parse_clients_arg("0:4") == ["r0", "r1", "r2", "r3"]
+    assert api_server_ray._parse_clients_arg("8001:2") == [
+        "http://localhost:8001",
+        "http://localhost:8002",
     ]
 
 
@@ -102,6 +104,110 @@ async def test_update_clients_restarts_when_replica_order_changes(monkeypatch):
     assert fake_pool.clients == ["r1", "r0"]
 
 
+@pytest.mark.asyncio
+async def test_update_clients_does_not_restart_when_clients_match(monkeypatch):
+    started = {"called": False}
+    ready_waits = []
+
+    def fake_start_engine(clients):
+        started["called"] = True
+
+    class FakeWaitHandle:
+        async def remote(self):
+            ready_waits.append("ready")
+            return True
+
+    fake_pool = SimpleNamespace(clients=["r0", "r1"])
+
+    monkeypatch.setattr(api_server_ray, "request_pool", fake_pool)
+    monkeypatch.setattr(
+        api_server_ray,
+        "engine_actors",
+        [SimpleNamespace(engine_actor=SimpleNamespace(wait_until_ready=FakeWaitHandle()))],
+    )
+    monkeypatch.setattr(api_server_ray, "engine_tasks", [])
+    monkeypatch.setattr(api_server_ray, "routing_loop_task", None)
+    monkeypatch.setattr(api_server_ray, "start_engine", fake_start_engine)
+
+    class FakeRequest:
+        async def json(self):
+            return {"clients": "0-1"}
+
+    response = await api_server_ray.update_clients(FakeRequest())
+
+    assert response.status_code == 200
+    assert started["called"] is False
+    assert ready_waits == ["ready"]
+    assert fake_pool.clients == ["r0", "r1"]
+
+
+@pytest.mark.asyncio
+async def test_update_config_waits_for_ready_before_fanout(monkeypatch):
+    ready_waits = []
+    updated = []
+
+    class FakeWaitHandle:
+        def __init__(self, actor_id):
+            self.actor_id = actor_id
+
+        async def remote(self):
+            ready_waits.append(self.actor_id)
+            return True
+
+    class FakeUpdateHandle:
+        def __init__(self, actor_id):
+            self.actor_id = actor_id
+
+        async def remote(self, request_json):
+            updated.append((self.actor_id, request_json))
+            return None
+
+    fake_pool = SimpleNamespace(
+        clients=["r0", "r1"],
+        router=SimpleNamespace(update_json=lambda request_json, _: request_json),
+        enable_rescheduling=False,
+        update_config=MagicMock(),
+    )
+
+    monkeypatch.setattr(api_server_ray, "request_pool", fake_pool)
+    monkeypatch.setattr(
+        api_server_ray,
+        "engine_actors",
+        [
+            SimpleNamespace(engine_actor=SimpleNamespace(
+                wait_until_ready=FakeWaitHandle(0),
+                update_config=FakeUpdateHandle(0),
+            )),
+            SimpleNamespace(engine_actor=SimpleNamespace(
+                wait_until_ready=FakeWaitHandle(1),
+                update_config=FakeUpdateHandle(1),
+            )),
+        ],
+    )
+    monkeypatch.setattr(
+        api_server_ray,
+        "args",
+        SimpleNamespace(tensor_parallel_size=1, mock_connector=False),
+        raising=False,
+    )
+
+    class FakeRequest:
+        async def json(self):
+            return {
+                "n_devices": 2,
+                "routing_policy": "round_robin",
+                "routing_kwargs": {},
+                "tensor_parallel_size": 1,
+            }
+
+    response = await api_server_ray.update_config(FakeRequest())
+
+    assert response.status_code == 200
+    assert sorted(ready_waits) == [0, 1]
+    assert [actor_id for actor_id, _ in updated] == [0, 1]
+    fake_pool.update_config.assert_called_once()
+
+
 def test_start_engine_uses_tensor_parallel_gpu_reservations(monkeypatch):
     queue_sizes = []
     launches = []
@@ -138,6 +244,7 @@ def test_start_engine_uses_tensor_parallel_gpu_reservations(monkeypatch):
         tensor_parallel_size=2,
         vllm_port_base=31000,
         vllm_port_stride=32,
+        worker_env=[],
         mock_engine=False,
         model_name="demo-model",
         mock_connector=False,

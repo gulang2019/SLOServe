@@ -811,17 +811,21 @@ async def _configure_router_endpoint(
 ) -> None:
     print(f"Posting problem to endpoint: {endpoint}")
     print(f"Problem: {problem}")
+    timeout = aiohttp.ClientTimeout(total=3000.0)
 
     async with aiohttp.ClientSession() as session:
         if clients is not None and update_clients:
-            timeout = aiohttp.ClientTimeout(total=3000.0)
             response = await session.post(
                 endpoint + "/update_clients",
                 json={"clients": clients},
                 timeout=timeout,
             )
             response.raise_for_status()
-        response = await session.post(endpoint + "/update_config", json=asdict(problem))
+        response = await session.post(
+            endpoint + "/update_config",
+            json=asdict(problem),
+            timeout=timeout,
+        )
         response.raise_for_status()
 
 
