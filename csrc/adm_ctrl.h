@@ -268,6 +268,12 @@ protected:
         double current_time
     );
 
+    std::tuple<bool, std::vector<bool>, std::string> _admission_control_edf_sim_with_reason(
+        std::vector<Request>& reqs,
+        const int M,
+        double current_time
+    );
+
 
 public: 
     AdmCtrlScheduler(): mode("fcfs"), block_size(16), fifo_fair(false), continuous(false) {}
@@ -329,6 +335,12 @@ public:
     );
 
     std::tuple<bool, std::vector<bool> > admission_control(
+        std::vector<Request>& reqs,
+        const int M,
+        double current_time
+    );
+
+    std::tuple<bool, std::vector<bool>, std::string> admission_control_with_reason(
         std::vector<Request>& reqs,
         const int M,
         double current_time

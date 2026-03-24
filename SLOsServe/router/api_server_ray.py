@@ -306,6 +306,71 @@ async def _wait_for_engine_actors_ready() -> None:
     ])
 
 
+def _engine_actor_shutdown_timeout_s() -> float:
+    raw = os.getenv(
+        "SLOSSERVE_ENGINE_ACTOR_SHUTDOWN_TIMEOUT_S",
+        os.getenv("SLOSSERVE_ENGINE_SHUTDOWN_TIMEOUT_S", "5.0"),
+    )
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 5.0
+
+
+async def _shutdown_engine_actor_handle(
+    actor_handle: Any,
+    label: str,
+    *,
+    always_kill: bool = False,
+) -> None:
+    shutdown_succeeded = False
+    timeout_s = _engine_actor_shutdown_timeout_s()
+
+    try:
+        shutdown_ref = actor_handle.shutdown.remote()
+        if timeout_s == 0.0:
+            await shutdown_ref
+        else:
+            await asyncio.wait_for(shutdown_ref, timeout=timeout_s)
+        shutdown_succeeded = True
+    except asyncio.TimeoutError:
+        logger.warning(
+            "%s shutdown hung for %.3fs; killing Ray actor",
+            label,
+            timeout_s,
+        )
+    except Exception as exc:
+        logger.warning(
+            "%s shutdown failed with %r; killing Ray actor",
+            label,
+            exc,
+        )
+
+    if always_kill or not shutdown_succeeded:
+        try:
+            ray.kill(actor_handle)
+        except Exception as exc:
+            logger.warning("Failed to kill %s: %r", label, exc)
+
+
+async def _shutdown_engine_actors(
+    actors: list[EngineActor] | None,
+    *,
+    always_kill: bool = False,
+) -> None:
+    if not actors:
+        return
+
+    await asyncio.gather(*[
+        _shutdown_engine_actor_handle(
+            actor.engine_actor,
+            f"engine_actor[{idx}]",
+            always_kill=always_kill,
+        )
+        for idx, actor in enumerate(actors)
+    ])
+
+
 def _parse_worker_env_args(raw_envs: list[str] | None) -> dict[str, str]:
     env_vars: dict[str, str] = {}
     if not raw_envs:
@@ -478,12 +543,21 @@ class EngineWorker:
     async def shutdown(self):
         if self._energy_profiler is not None:
             self._energy_profiler.stop()
-        await shutdown_engine_instance(self.engine)
-        self._mux_task.cancel()
+        shutdown_error = None
         try:
-            await self._mux_task
-        except asyncio.CancelledError:
-            pass 
+            await shutdown_engine_instance(self.engine)
+        except Exception as exc:
+            shutdown_error = exc
+        finally:
+            self.engine = None
+            self._mux_task.cancel()
+            try:
+                await self._mux_task
+            except asyncio.CancelledError:
+                pass
+
+        if shutdown_error is not None:
+            raise shutdown_error
 
     async def _mux(self):
         FLUSH_T = 0.05
@@ -3495,7 +3569,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown Ray actors cleanly
     if engine_actors:
-        await asyncio.gather(*[a.engine_actor.shutdown.remote() for a in engine_actors])
+        await _shutdown_engine_actors(engine_actors)
     if execplan_bus_actor is not None:
         execplan_bus_actor.reset.remote()
     routing_loop_task.cancel()
@@ -3689,12 +3763,7 @@ async def update_clients(request: Request):
                     logger.error(f"Error cancelling engine queue task: {e}")
             engine_tasks = []
         if old_engine_actors:
-            await asyncio.gather(*[a.engine_actor.shutdown.remote() for a in old_engine_actors])
-            for old_actor in old_engine_actors:
-                try:
-                    ray.kill(old_actor.engine_actor)
-                except Exception as e:
-                    logger.warning(f"Failed to kill old engine actor: {e!r}")
+            await _shutdown_engine_actors(old_engine_actors, always_kill=True)
         start_engine(clients)
         engine_tasks = []
         for idx, ea in enumerate(engine_actors):

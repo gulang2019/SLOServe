@@ -1704,6 +1704,12 @@ def _session_replay_suffix(enable_session_replay: bool, session_pause_s: float) 
     return f"_sessionreplay_{pause}s"
 
 
+def _baseline_cap_suffix(baseline_decode_cap: int | None) -> str:
+    if baseline_decode_cap is None:
+        return ""
+    return f"_bcap{int(baseline_decode_cap)}"
+
+
 def build_problems(
     model_name: str,
     trace: str,
@@ -1729,16 +1735,18 @@ def build_problems(
     log_perf_model_errors: bool = True,
     include_perf_model_time_lists: bool = False,
     draw_perf_model_error_figure: bool = True,
+    baseline_decode_cap: int | None = None,
 ):
     session_replay_suffix = _session_replay_suffix(
         enable_session_replay,
         session_pause_s,
     )
+    baseline_cap_suffix = _baseline_cap_suffix(baseline_decode_cap)
     store_prefix = (
         f'{experiment_dir}/{scheduling_policy}_{routing_policy}_{load_scale}_'
         f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
         f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
-        f'{session_replay_suffix}')
+        f'{session_replay_suffix}{baseline_cap_suffix}')
     
     if ":" in trace: 
         requests_trace, arrival_times_trace = trace.split(":")
@@ -1808,7 +1816,22 @@ def build_problems(
         profit_per_output_token = 10.0e-6
         profit_base = 0
     
-    max_num_batched_tokens_vllm = min(max_decode_batch_size - 10, 16384)
+    default_capped_baseline_tokens = max(
+        1,
+        min(max_decode_batch_size - 10, 16384),
+    )
+    capped_baseline_tokens = (
+        int(baseline_decode_cap)
+        if baseline_decode_cap is not None else default_capped_baseline_tokens
+    )
+    if capped_baseline_tokens <= 0:
+        raise ValueError(
+            f"baseline_decode_cap must be positive, got {baseline_decode_cap}"
+        )
+    print(
+        f'capped_baseline_tokens: {capped_baseline_tokens} '
+        f'(default={default_capped_baseline_tokens})'
+    )
     ablation_no_global = False
     ablation_no_local = False
     oracle_mem = False
@@ -1836,8 +1859,8 @@ def build_problems(
     elif scheduling_policy == 'sarathi':
         scheduling_kwargss.append({
             'scheduling_policy': 'vllm-sarathi',
-            'max_num_batched_tokens': max_num_batched_tokens_vllm,
-            'long_prefill_token_threshold': max_num_batched_tokens_vllm,
+            'max_num_batched_tokens': capped_baseline_tokens,
+            'long_prefill_token_threshold': capped_baseline_tokens,
             'max_num_seqs': 512,
             'enable_chunked_prefill': True,
             'enable_admission': False,
@@ -1846,8 +1869,8 @@ def build_problems(
         
     elif scheduling_policy == 'sarathi+':
         scheduling_kwargss.append({
-            'max_num_batched_tokens': max_num_batched_tokens_vllm,
-            'long_prefill_token_threshold': max_num_batched_tokens_vllm,
+            'max_num_batched_tokens': capped_baseline_tokens,
+            'long_prefill_token_threshold': capped_baseline_tokens,
             'max_num_seqs': 512,
             'enable_chunked_prefill': True,
             'enable_admission': False,
@@ -1859,9 +1882,9 @@ def build_problems(
         # for maximum_queue_length in [10, 20, 50]:
         scheduling_kwargss.append({
             'enable_chunked_prefill': True,
-            'max_num_batched_tokens': max_num_batched_tokens_vllm,
+            'max_num_batched_tokens': capped_baseline_tokens,
             'max_num_seqs': 512,
-            'long_prefill_token_threshold': max_num_batched_tokens_vllm,
+            'long_prefill_token_threshold': capped_baseline_tokens,
             'enable_admission': False,
             'allow_rejection': False,
             'scheduling_policy': 'vllm-edf',
@@ -2091,7 +2114,7 @@ def build_problems(
             extra_kwargs = {
                 'is_pd_disagg': True,
                 'n_prefill_per_group': n_prefill_server_per_group,
-                'max_decode_bs': max_num_batched_tokens_vllm,
+                'max_decode_bs': default_capped_baseline_tokens,
                 "enable_rerouting": True,
                 'use_planner': use_planner,
                 'ablation': ablation_no_global
@@ -2199,6 +2222,7 @@ def run(
     log_perf_model_errors: bool,
     include_perf_model_time_lists: bool,
     draw_perf_model_error_figure: bool,
+    baseline_decode_cap: int | None,
     update_clients: bool = True,
 ):
     output_dir = os.path.abspath(output_dir)
@@ -2240,6 +2264,7 @@ def run(
     print(f'log_perf_model_errors: {log_perf_model_errors}')
     print(f'include_perf_model_time_lists: {include_perf_model_time_lists}')
     print(f'draw_perf_model_error_figure: {draw_perf_model_error_figure}')
+    print(f'baseline_decode_cap: {baseline_decode_cap}')
     print('--End of Problem Grid--')
     results = {}
     if os.path.exists(f'{experiment_dir}/results.jsonl'):
@@ -2257,6 +2282,7 @@ def run(
                     r['ttft_slo_scale'],
                     r['slo_tpot'],
                     r['perf_model_err'],
+                    r.get('baseline_decode_cap'),
                     r.get('enable_session_replay', False),
                     r.get('session_pause_s', 0.0),
                 ): r for r in results
@@ -2290,6 +2316,7 @@ def run(
             ttft_slo_scale,
             slo_tpot,
             perf_model_err,
+            baseline_decode_cap,
             enable_session_replay,
             session_pause_s,
         )
@@ -2321,6 +2348,7 @@ def run(
             log_perf_model_errors=log_perf_model_errors,
             include_perf_model_time_lists=include_perf_model_time_lists,
             draw_perf_model_error_figure=draw_perf_model_error_figure,
+            baseline_decode_cap=baseline_decode_cap,
         )
         if not len(problems):
             logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
@@ -2358,6 +2386,7 @@ def run(
             'slo_tpot': slo_tpot,
             'slo_violation_rate': 1 - best_result.results['slo_attainment_rate'],
             'perf_model_err': perf_model_err,
+            'baseline_decode_cap': baseline_decode_cap,
             'enable_session_replay': enable_session_replay,
             'session_pause_s': session_pause_s,
             
@@ -2543,6 +2572,17 @@ if __name__ == '__main__':
                         help='include raw estimated_time and measured_time lists in perf-model outputs and results.jsonl')
     parser.add_argument('--disable_perf_model_error_figure', action='store_true',
                         help='disable the default estimated-vs-measured perf-model figure')
+    parser.add_argument(
+        '--baseline_decode_cap',
+        '--sarathi_max_decode_batch_size',
+        dest='baseline_decode_cap',
+        type=int,
+        default=None,
+        help=(
+            'override the capped token budget used by Sarathi-like baselines '
+            '(Sarathi and QLM); defaults to the perf-model-derived cap'
+        ),
+    )
     args = parser.parse_args()
     
     if not args.run_all:
@@ -2576,6 +2616,7 @@ if __name__ == '__main__':
                 include_perf_model_time_lists = args.include_perf_model_time_lists,
                 draw_perf_model_error_figure = (
                     not args.disable_perf_model_error_figure),
+                baseline_decode_cap = args.baseline_decode_cap,
                 update_clients = not args.skip_update_clients,
             )
         exit(0)

@@ -107,6 +107,8 @@ PYBIND11_MODULE(SLOsServe_C, m) {
              py::arg("verbose") = false)
         .def("adm_ctrl", &AdmCtrlScheduler::admission_control,
              py::arg("reqs"), py::arg("M"), py::arg("current_time"))
+        .def("adm_ctrl_with_reason", &AdmCtrlScheduler::admission_control_with_reason,
+             py::arg("reqs"), py::arg("M"), py::arg("current_time"))
         .def("__repr__", [](const AdmCtrlScheduler& scheduler) {
             return "<AdmCtrlScheduler>";
         });

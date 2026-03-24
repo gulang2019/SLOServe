@@ -1221,6 +1221,30 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::admission_control(
     return {true, is_accepted};
 }
 
+std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::admission_control_with_reason(
+    std::vector<Request>& reqs,
+    const int M,
+    double current_time
+) {
+    if (!fifo_fair && mode == "edf_sim") {
+        return _admission_control_edf_sim_with_reason(reqs, M, current_time);
+    }
+
+    auto [is_feasible, is_accepted] = admission_control(reqs, M, current_time);
+    std::string reject_reason = "NONE";
+    if (!is_feasible) {
+        reject_reason = "UNKNOWN";
+    } else {
+        for (size_t i = 0; i < reqs.size(); ++i) {
+            if (reqs[i].is_new_req && (i >= is_accepted.size() || !is_accepted[i])) {
+                reject_reason = "UNKNOWN";
+                break;
+            }
+        }
+    }
+    return {is_feasible, is_accepted, reject_reason};
+}
+
 std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_fcfs(
     std::vector<Request>& reqs,
     const int M,
@@ -1231,6 +1255,16 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_fcfs(
 
 
 std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_sim(
+    std::vector<Request>& reqs,
+    const int M,
+    double current_time
+) {
+    auto [is_feasible, is_accepted, _reject_reason] =
+        _admission_control_edf_sim_with_reason(reqs, M, current_time);
+    return {is_feasible, is_accepted};
+}
+
+std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::_admission_control_edf_sim_with_reason(
     std::vector<Request>& reqs,
     const int M,
     double current_time
@@ -1251,7 +1285,7 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
         return req.ddl + std::max(0, req.n_computed_tokens - req.input_length + 1) * planner->tpots[0];
     };
     // TODO(Yi): implement the memory feasibility check with MontCaro;
-    auto feasibility_check = [&](const std::vector<Request>& reqs) -> bool {
+    auto feasibility_check = [&](const std::vector<Request>& reqs) -> std::pair<bool, std::string> {
         std::vector<std::tuple<double, std::string, Request> > events;
         double tpot = planner->tpots[0];
         double decode_bs = planner->time_to_batch(tpot);
@@ -1259,7 +1293,7 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
         for (auto& req: reqs) {
             auto next_token_ddl = get_next_ddl(req);
             if (req.arrival_time >= next_token_ddl) {
-                return false;
+                return {false, "CMP"};
             }
             if (req.arrival_time > current_time) {
                 events.push_back({req.arrival_time, "arrival", req});
@@ -1290,15 +1324,15 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
         for (auto& e: events) {
             auto [t, type, req] = e;
             if (t < now) 
-                return false;
+                return {false, "CMP"};
             if (n_decode > decode_bs) 
-                return false;
+                return {false, "CMP"};
             if (n_decode > 0) {
                 double elapsed = t - now;
                 size_t n_batch = std::floor(elapsed / decode_time);
                 remained_mem -= n_batch * n_decode;
                 if (remained_mem < 0) {
-                    return false;
+                    return {false, "MEM"};
                 }
                 now += n_batch * decode_time;
                 remained_tks.back() += (decode_bs - n_decode) * n_batch;
@@ -1307,7 +1341,7 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
                 auto next_load = get_next_load(req);
                 remained_mem -= next_load;
                 if (remained_mem < 0) {
-                    return false;
+                    return {false, "MEM"};
                 }
                 size_t remained_tk = 0;
                 for (size_t idx = req_remained_tk_idx[req.id]; idx < remained_tks.size(); idx++) {
@@ -1316,7 +1350,7 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
                 if (remained_tk < next_load) {
                     auto extra_bgt = planner->time_to_batch(t - now);
                     if ((extra_bgt + remained_tk) < next_load) {
-                        return false;
+                        return {false, "CMP"};
                     }
                     remained_tks.back() += extra_bgt;
                     remained_tk += extra_bgt; 
@@ -1343,7 +1377,7 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
                 remained_tks.push_back(0);
             }
         }
-        return true; 
+        return {true, "NONE"};
     };
 
     Timer timer;
@@ -1360,9 +1394,9 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
         }
     }
 
-    bool feasible = feasibility_check(working_reqs);
+    auto [feasible, baseline_reason] = feasibility_check(working_reqs);
     if (!feasible) {
-        return {false, std::vector<bool>(reqs.size(), false)};
+        return {false, std::vector<bool>(reqs.size(), false), baseline_reason};
     }
 
     timer("feasibility_old_reqs");
@@ -1386,17 +1420,21 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
         });
 
     int idx = 0;
+    std::string reject_reason = "NONE";
     for (const auto& cand : new_cands) {
         const auto& req = reqs[cand.idx];
         auto candidate_reqs = working_reqs;
         candidate_reqs.push_back(req);
 
-        const bool candidate_feasible = feasibility_check(candidate_reqs);
+        auto [candidate_feasible, candidate_reason] = feasibility_check(candidate_reqs);
         if (candidate_feasible) {
             working_reqs = std::move(candidate_reqs);
             is_accepted[cand.idx] = true;
         } else {
             is_accepted[cand.idx] = false;
+            if (reject_reason == "NONE") {
+                reject_reason = candidate_reason;
+            }
         }
         timer("feasibility_new_reqs" + std::to_string(idx));
         idx++;
@@ -1404,7 +1442,7 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf_si
 
     // if (_verbose)
     //     timer.display();
-    return {true, is_accepted};
+    return {true, is_accepted, reject_reason};
 }
 
 std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::_admission_control_edf(
