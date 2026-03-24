@@ -36,6 +36,14 @@ REQUEST_CANCEL_GRACE_S = 5.0
 from SLOsServe.perf_model import get_model_max_tokens, get_easy_name
 
 
+def _request_id_sort_key(request_id: Any) -> tuple[int, int | str]:
+    request_id_str = str(request_id)
+    try:
+        return (0, int(request_id_str))
+    except (TypeError, ValueError):
+        return (1, request_id_str)
+
+
 def _extract_batch_perf_sample(
     event: Dict[str, Any],
 ) -> tuple[Dict[str, Any], list[tuple[int, int]]] | None:
@@ -1422,7 +1430,7 @@ async def main(
         for req_id, arrival_time in real_arrival_times.items():
             events.append({
                 'event_type': 'global_arrival',
-                'request_id': req_id,
+                'request_id': backend_id_2_id(req_id),
                 'timestamp': apply_time_offsets(arrival_time),
             })
         for event in events:
@@ -1549,7 +1557,10 @@ async def main(
             auto_scaling_analysis = {}
         results['auto_scaling_analysis'] = auto_scaling_analysis
         
-    execution_results = sorted(execution_results, key=lambda x: int(x.request_id))
+    execution_results = sorted(
+        execution_results,
+        key=lambda x: _request_id_sort_key(x.request_id),
+    )
     per_gpu_energy_consumption = dump_profile_response.get(
         "per_gpu_energy_consumption", [])
     energy_consumption = dump_profile_response.get("energy_consumption")
@@ -1573,7 +1584,7 @@ async def main(
     )
     with open(f'{problem.store_prefix}.execution_results.jsonl', 'w') as f:
         json.dump([asdict(execution_result) for execution_result in execution_results], f, indent=4)
-    reqs = sorted(list(reqs.values()), key=lambda x: int(x.req_id))
+    reqs = sorted(list(reqs.values()), key=lambda x: _request_id_sort_key(x.req_id))
     with open(f'{problem.store_prefix}.reqs.jsonl', 'w') as f:
         json.dump([asdict(req) for req in reqs], f, indent=4)
     print(f'Saved {problem.store_prefix}.{i}.execution_results.jsonl')
