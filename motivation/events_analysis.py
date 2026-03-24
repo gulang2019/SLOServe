@@ -707,6 +707,7 @@ def _compute_active_device_series(
     window_size: float = 1.0,
     start_time: float | None = None,
     end_time: float | None = None,
+    n_device: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float, dict[str, float]]:
     batch_events = [event for event in events if event.event_type == 'batch']
     if not batch_events:
@@ -726,6 +727,10 @@ def _compute_active_device_series(
             batch_start = float(event.timestamp - event.elapsed)
             batch_end = float(event.timestamp)
             if batch_end > start and batch_start < end:
+                if n_device is not None:
+                    device_id = int(event.device_id)
+                    if device_id < 0 or device_id >= n_device:
+                        continue
                 device_ids.add(event.device_id)
         num_active_devices_per_bin.append(len(device_ids))
 
@@ -868,7 +873,14 @@ def _plot_step_series(
         alpha=alpha,
     )
 
-def calc_n_active_servers(events: list, window_size: float = 1.0, ax = None, label: str = "", color: str = "tab:blue"):
+def calc_n_active_servers(
+    events: list,
+    window_size: float = 1.0,
+    ax = None,
+    label: str = "",
+    color: str = "tab:blue",
+    n_device: int | None = None,
+):
     """
     Plots the exact number of active servers (distinct device ids running batches) in each time window for 'batch' events,
     using vlines and hlines for a stepwise plot.
@@ -880,6 +892,7 @@ def calc_n_active_servers(events: list, window_size: float = 1.0, ax = None, lab
     times, counts, average, breakdown = _compute_active_device_series(
         events,
         window_size=window_size,
+        n_device=n_device,
     )
     if ax:
         _plot_step_series(ax, times, counts, label=label, color=color)
@@ -2038,6 +2051,7 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
         window_size=window_size,
         start_time=service_start_time,
         end_time=service_end_time,
+        n_device=n_device,
     )
     batch_token_time, avg_batch_tokens_series = _compute_avg_batch_tokens_series(
         all_events,
