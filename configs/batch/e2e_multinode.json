@@ -27,5 +27,5 @@
       "n_devices": [16,12,8,4]
     }
   },
-  "extra_server_args": "--ray-address 10.202.0.4:6379"
+  "extra_server_args": "--ray_address 10.202.0.4:6379"
 }

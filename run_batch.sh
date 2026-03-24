@@ -187,6 +187,22 @@ wait_for_server() {
   return 1
 }
 
+ensure_server_ready() {
+  if [[ -z "${server_pid:-}" ]]; then
+    start_server
+    return 0
+  fi
+
+  if curl -fsS "http://localhost:${RUN_BATCH_PORT}/health_check" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "RESTARTING UNHEALTHY SERVER on port ${RUN_BATCH_PORT}"
+  cleanup_server "$server_pid"
+  server_pid=""
+  start_server
+}
+
 count_clients_spec() {
   local spec="$1"
   local start
@@ -350,6 +366,8 @@ run_suite() {
         echo "  available_clients=$available_clients"
       fi
 
+      ensure_server_ready
+
       cmd=(
         python motivation/bench_api_server.py
         --overwrite
@@ -390,6 +408,8 @@ run_suite() {
         echo "FAILED: $run_key"
         echo "$run_key" >> "$FAILED_LOG"
         log_run_cmd "FAILED" "$run_key" "$cmd_str"
+        cleanup_server "$server_pid"
+        server_pid=""
       fi
     done
   done
