@@ -336,6 +336,38 @@ def test_slosserve_router_run_with_planner_prefers_session_home_device():
     assert captured["waiting_requests"] == [waiting_request]
 
 
+def test_slosserve_router_select_asap_server_reuses_last_device():
+    router = api_server_ray.SLOsServeRouter.__new__(api_server_ray.SLOsServeRouter)
+    router.is_pd_disagg = False
+
+    unscheduled_request = _make_router_request("req-new")
+    assert router.select_asap_server(None, request=unscheduled_request) == (0, 0)
+
+    placed_request = _make_router_request("req-old")
+    placed_request.prefill_device_id = 1
+    placed_request.decode_device_id = 1
+    assert router.select_asap_server(None, request=placed_request) == (1, 1)
+
+
+def test_slosserve_router_select_asap_server_reuses_last_pd_devices():
+    router = api_server_ray.SLOsServeRouter.__new__(api_server_ray.SLOsServeRouter)
+    router.is_pd_disagg = True
+    router.group_size = 4
+    router.n_prefill_or_mixed_per_group = 2
+
+    unscheduled_request = _make_router_request("req-new")
+    assert router.select_asap_server(None, request=unscheduled_request) == (0, 3)
+
+    prefill_only_request = _make_router_request("req-prefill")
+    prefill_only_request.prefill_device_id = 4
+    assert router.select_asap_server(None, request=prefill_only_request) == (4, 7)
+
+    placed_request = _make_router_request("req-old")
+    placed_request.prefill_device_id = 4
+    placed_request.decode_device_id = 7
+    assert router.select_asap_server(None, request=placed_request) == (4, 7)
+
+
 def test_slosserve_router_pre_adm_planner_uses_cached_tokens_on_home_device(
     monkeypatch,
 ):

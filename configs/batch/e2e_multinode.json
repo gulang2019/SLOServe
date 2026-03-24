@@ -26,5 +26,6 @@
       "load_scale": 1.0,
       "n_devices": [16,12,8,4]
     }
-  }
+  },
+  "extra_server_args": "--ray-address 10.202.0.4:6379"
 }

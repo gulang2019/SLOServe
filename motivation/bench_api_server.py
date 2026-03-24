@@ -1188,7 +1188,7 @@ async def main(
                 prompt = request.prompt
                 assert prompt is not None
                 task_start_time = time.time()
-                request_id_backend = str(request_idx)
+                request_id_backend = str(uuid.uuid1()) # str(request_idx)
                 request_id = str(request_idx)
                 bid_to_id[request_id_backend] = request_id
                 if problem.enable_session_replay and request.session_id:

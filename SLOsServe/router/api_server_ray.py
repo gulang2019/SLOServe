@@ -1145,10 +1145,22 @@ class Router(ABC):
         '''
         return request_json
     
-    def select_asap_server(self, load_stat: LoadStat) -> tuple[int, int]:
+    def select_asap_server(
+        self,
+        load_stat: LoadStat,
+        request: RequestInstance | None = None,
+    ) -> tuple[int, int]:
         '''
-        Optional server selection when a request missed the SLO, default to the lighest load server.
+        Optional server selection when a request missed the SLO.
+        Reuse the last placement when available; otherwise start from the top.
         '''
+        if request is not None and request.prefill_device_id >= 0:
+            decode_device_id = request.decode_device_id
+            if decode_device_id < 0:
+                decode_device_id = request.prefill_device_id
+            return request.prefill_device_id, decode_device_id
+        if request is not None:
+            return 0, 0
         n_reqs = [stat.n_requests for stat in load_stat.get_stat()]
         min_n_req = min(n_reqs)
         freest_device_id = n_reqs.index(min_n_req)
@@ -2460,10 +2472,26 @@ class SLOsServeRouter(Router):
         # else: 
         #     raise NotImplementedError(f"state update for {new_state} is not impled")
 
-    def select_asap_server(self, load_stat):
+    def select_asap_server(
+        self,
+        load_stat,
+        request: RequestInstance | None = None,
+    ):
         if not self.is_pd_disagg:
-            return super().select_asap_server(load_stat)
-        
+            return super().select_asap_server(load_stat, request=request)
+
+        if request is not None:
+            if request.prefill_device_id >= 0:
+                prefill_device_id = request.prefill_device_id
+            else:
+                prefill_device_id = 0
+            if request.decode_device_id >= 0:
+                decode_device_id = request.decode_device_id
+            else:
+                group_start = (prefill_device_id // self.group_size) * self.group_size
+                decode_device_id = group_start + self.group_size - 1
+            return prefill_device_id, decode_device_id
+
         n_reqs = [stat.n_requests for stat in load_stat.get_stat()]
         is_decode, n_req, freest_prefill_device_id = min(((did % self.group_size) >= self.n_prefill_or_mixed_per_group,n_req,did) for did, n_req in enumerate(n_reqs))
         assert not is_decode
@@ -3130,13 +3158,16 @@ class RequestPool:
                         await request.response_queue.put(None)
                         continue
                     elif self.fallback_policy == 'asap': 
-                        # When this request cannot be served w/in SLO, we route it to the freest server and serve it asap by forcing admission;
+                        # When this request cannot be served w/in SLO, we keep it
+                        # on its last placement when available; otherwise route it
+                        # to the top of the packing chain and force admission.
                         logger.info(f'[SLO Packer] route {request.request_id} asap from ({request.prefill_device_id=}, {request.decode_device_id=}) ')
-                        request.prefill_device_id, request.decode_device_id = self.router.select_asap_server(self.load_stat)
+                        request.prefill_device_id, request.decode_device_id = self.router.select_asap_server(self.load_stat, request=request)
                         logger.info(f'[SLO Packer] route {request.request_id} asap to ({request.prefill_device_id=}, {request.decode_device_id=}) ')
                         assert 0 <= request.prefill_device_id < self.n_devices, f'not 0 <= {request.prefill_device_id=} < {self.n_devices=}'
                         assert 0 <= request.decode_device_id < self.n_devices, f'not 0 <= {request.decode_device_id=} < {self.n_devices=}'
                         request.payload['vllm_xargs']['must_admit'] = True
+                        request.payload['vllm_xargs']['service_tier'] = 'best_effort'
                         request.admitted = True
                         
                 logger.debug(f"Request {request.request_id} admitted, prefill_device_id={request.prefill_device_id}, decode_device_id={request.decode_device_id}")

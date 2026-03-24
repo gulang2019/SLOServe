@@ -28,6 +28,7 @@ class Request:
     prefill_only: bool
     kv_ready_time: float | None
     output_length: int 
+    service_tier: str = "default"
     
     num_computed_tokens: int = 0
     last_sch_bid: int = -1
@@ -332,8 +333,11 @@ class BatchPlanner:
                         prefill_only: bool = False,
                         kv_ready_time: float | None = None,
                         must_admit: bool = False,
+                        service_tier: str | None = None,
                         output_length: int | None = None):
         assert not self._is_oracle or output_length is not None
+        if service_tier is None:
+            service_tier = "best_effort" if must_admit else "default"
         new_req = Request(request_id = request_id, 
                           num_prompt_tokens=num_prompt_tokens,
                           num_computed_tokens=num_computed_tokens,
@@ -341,6 +345,7 @@ class BatchPlanner:
                           slo_tpot = slo_tpot, 
                           prefill_only = prefill_only,
                           kv_ready_time = kv_ready_time,
+                          service_tier = service_tier,
                           output_length = output_length)
         now = self._next_batch_time if self._next_batch_time is not None else self._now()
         feasible, reject_reason = self._cpp_feasible_with_new(new_req, now)
@@ -450,16 +455,29 @@ class BatchPlanner:
             return True, [], "|"
 
         cutoff = baseline_batch_time
-        feasible_load_ddls = [x for x in load_ddls if x[1] >= cutoff]
-        overdue_load_ddls = [x for x in load_ddls if x[1] < cutoff]
+        regular_load_ddls = [
+            x for x in load_ddls
+            if self._requests[x[0]].service_tier != "best_effort"
+        ]
+        best_effort_load_ddls = [
+            x for x in load_ddls
+            if self._requests[x[0]].service_tier == "best_effort"
+        ]
+        feasible_load_ddls = [x for x in regular_load_ddls if x[1] >= cutoff]
+        overdue_load_ddls = [x for x in regular_load_ddls if x[1] < cutoff]
 
         if feasible_load_ddls:
             batch_time_budget = feasible_load_ddls[0][1]
             batch_size = self._cap_batch_size(
                 self._perf_model.get_bs(batch_time_budget, num_reqs=1))
-        else:
+        elif regular_load_ddls:
             # Recover overdue work aggressively without exceeding the engine
             # token budget.
+            batch_size = self._cap_batch_size(16384)
+            batch_time_budget = self._perf_model.get_batch_time([(0, batch_size)])
+        else:
+            # If only downgraded work remains, let it use the leftover engine
+            # capacity while still respecting the batch-size limit.
             batch_size = self._cap_batch_size(16384)
             batch_time_budget = self._perf_model.get_batch_time([(0, batch_size)])
 
@@ -467,8 +485,11 @@ class BatchPlanner:
         total_scheduled_tokens = 0
         total_past_tokens = 0
         num_scheduled_reqs = 0
-        # Give missed deadlines only whatever capacity remains after EDF-feasible work.
-        for req_id, _next_ddl, next_load in feasible_load_ddls + overdue_load_ddls:
+        # Give missed deadlines only whatever capacity remains after EDF-feasible
+        # work, then let downgraded best-effort requests consume whatever is left.
+        for req_id, _next_ddl, next_load in (
+            feasible_load_ddls + overdue_load_ddls + best_effort_load_ddls
+        ):
             if b.unscheduled_tokens <= 0:
                 break
             req = self._requests[req_id]
