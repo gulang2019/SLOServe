@@ -814,7 +814,7 @@ def _compute_measured_power_series(
     n_windows = len(bins) - 1
     max_device_id = max(int(event.device_id) for event in energy_events)
     if n_device > 0:
-        device_ids = list(range(max(n_device, max_device_id + 1)))
+        device_ids = list(range(n_device))
     else:
         device_ids = list(range(max_device_id + 1))
 
@@ -829,10 +829,10 @@ def _compute_measured_power_series(
         if idx < 0 or idx >= n_windows:
             continue
         device_id = int(event.device_id)
+        if device_id not in per_device_energy:
+            continue
         energy = float(event.energy)
         total_energy[idx] += energy
-        if device_id not in per_device_energy:
-            per_device_energy[device_id] = np.zeros(n_windows, dtype=np.float64)
         per_device_energy[device_id][idx] += energy
 
     if recover_idle_gaps and n_windows > 0 and device_ids:

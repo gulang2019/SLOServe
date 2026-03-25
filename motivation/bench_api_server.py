@@ -715,17 +715,30 @@ async def run_request(client: httpx.AsyncClient,
         # print(f'Request {request_id} finished with {len(timestamps)} timestamps IL: {input_length} OL: {output_length} .')
         return is_rejected, response_text, timestamps
 
-def summarize_energy_events(events: List[Dict[str, Any]]) -> tuple[List[float], float]:
+def summarize_energy_events(
+    events: List[Dict[str, Any] | Any],
+    n_devices: int | None = None,
+) -> tuple[List[float], float]:
     per_gpu: Dict[int, float] = {}
+    limit = None if n_devices is None else max(0, int(n_devices))
     for event in events:
         if _event_value(event, "event_type") != "energy":
             continue
         device_id = int(_event_value(event, "device_id", 0))
+        if device_id < 0:
+            continue
+        if limit is not None and device_id >= limit:
+            continue
         per_gpu[device_id] = per_gpu.get(device_id, 0.0) + float(
             _event_value(event, "energy", 0.0) or 0.0)
     if not per_gpu:
+        if limit is not None:
+            return [0.0 for _ in range(limit)], 0.0
         return [], 0.0
-    ordered = [per_gpu.get(i, 0.0) for i in range(max(per_gpu) + 1)]
+    if limit is not None:
+        ordered = [per_gpu.get(i, 0.0) for i in range(limit)]
+    else:
+        ordered = [per_gpu.get(i, 0.0) for i in range(max(per_gpu) + 1)]
     return ordered, sum(ordered)
 
 
@@ -2227,12 +2240,23 @@ async def main(
         execution_results,
         key=lambda x: _request_id_sort_key(x.request_id),
     )
-    per_gpu_energy_consumption = dump_profile_response.get(
-        "per_gpu_energy_consumption", [])
-    energy_consumption = dump_profile_response.get("energy_consumption")
-    if energy_consumption is None:
+    raw_per_gpu_energy = dump_profile_response.get("per_gpu_energy_consumption", [])
+    per_gpu_energy_consumption = [
+        float(value or 0.0)
+        for value in list(raw_per_gpu_energy)[:max(0, int(problem.n_devices))]
+    ]
+    if len(per_gpu_energy_consumption) < max(0, int(problem.n_devices)):
+        per_gpu_energy_consumption.extend(
+            [0.0] * (int(problem.n_devices) - len(per_gpu_energy_consumption))
+        )
+    energy_consumption = float(sum(per_gpu_energy_consumption))
+    if not per_gpu_energy_consumption or all(
+        energy <= 0.0 for energy in per_gpu_energy_consumption
+    ):
         per_gpu_energy_consumption, energy_consumption = summarize_energy_events(
-            events)
+            events,
+            n_devices=problem.n_devices,
+        )
     results, energy_consumption = _scale_rr_energy_results(
         results=results,
         energy_consumption=energy_consumption,
