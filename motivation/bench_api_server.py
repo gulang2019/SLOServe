@@ -3226,7 +3226,7 @@ def run(
 
     # 1. Plot: for each load_scale, create a subfigure showing profit vs n_device for each (scheduling_policy, routing_policy) pair
     os.makedirs(f'{experiment_dir}/figs', exist_ok=True)
-    features = ['load_scale', 'n_device', 'ttft_slo_scale', 'slo_tpot', 'slo_violation_rate']
+    features = ['load_scale', 'n_device', 'ttft_slo_scale', 'slo_tpot']
     for feature in features:
         if len(df[feature].unique()) == 1:
             continue
@@ -3234,12 +3234,13 @@ def run(
         n_groups = len(df.groupby(other_features))
         ncols = min(3, n_groups)
         nrows = math.ceil(n_groups / ncols)
-        for ylabel in [
-            'energy_est',
-            'slo_violation_rate',
-            'energy_consumption',
-            'energy_consumption_active',
-            'energy_consumption_non_idle',
+        for xlabel, ylabel in [
+            (xlabel, 'energy_est'),
+            (xlabel, 'slo_violation_rate'),
+            (xlabel, 'energy_consumption'),
+            (xlabel, 'energy_consumption_active'),
+            (xlabel, 'energy_consumption_non_idle'),
+            ('slo_violation_rate', 'energy_consumption')
         ]:
             if ylabel not in df.columns:
                 continue
@@ -3250,17 +3251,17 @@ def run(
                 ax = axes[row][col]
                 idx += 1
                 for (sched, route), group in group.groupby(['scheduling_policy', 'routing_policy']):
-                    group_sorted = group.sort_values(feature)
+                    group_sorted = group.sort_values(xlabel)
                     label = f"{sched} / {route}"
-                    ax.plot(group_sorted[feature], group_sorted[ylabel], marker='o', label=label)
+                    ax.plot(group_sorted[xlabel], group_sorted[ylabel], marker='o', label=label)
                 other_features_dict = {f: v for f, v in zip(other_features, other_feature_values)}
-                ax.set_xlabel(feature)
+                ax.set_xlabel(xlabel)
                 ax.set_ylabel(ylabel)
-                ax.set_title(f'{ylabel} vs {feature}\n({other_features_dict})')
+                ax.set_title(f'{ylabel} vs {xlabel}\n({other_features_dict})')
                 ax.legend()
             fig.tight_layout()
-            fig.savefig(f'{experiment_dir}/figs/{ylabel}_vs_{feature}.png', dpi=300)
-            print(f"Saved plot to {experiment_dir}/figs/{ylabel}_vs_{feature}.png")
+            fig.savefig(f'{experiment_dir}/figs/{ylabel}_vs_{xlabel}_change_{feature}.png', dpi=300)
+            print(f"Saved plot to {experiment_dir}/figs/{ylabel}_vs_{xlabel}_change_{feature}.png")
 
 PROBLEM_GRID = {
     'model_name': [
