@@ -789,6 +789,9 @@ def _compute_measured_power_series(
     window_size: float = 1.0,
     start_time: float | None = None,
     end_time: float | None = None,
+    recover_idle_gaps: bool = False,
+    idle_power_per_device: float = 70.0,
+    gap_threshold: float | None = None,
 ) -> dict[str, Any]:
     energy_events = [event for event in events if event.event_type == "energy"]
     if not energy_events:
@@ -832,6 +835,30 @@ def _compute_measured_power_series(
             per_device_energy[device_id] = np.zeros(n_windows, dtype=np.float64)
         per_device_energy[device_id][idx] += energy
 
+    if recover_idle_gaps and n_windows > 0 and device_ids:
+        unique_sample_times = sorted({float(event.timestamp) for event in energy_events})
+        if gap_threshold is None:
+            gap_threshold = max(2.0 * window_size, 1.0)
+        for prev_ts, next_ts in zip(unique_sample_times, unique_sample_times[1:]):
+            if next_ts - prev_ts <= gap_threshold:
+                continue
+            left = max(start_time, prev_ts)
+            right = min(end_time, next_ts)
+            if right <= left:
+                continue
+            left_idx = max(0, int(np.floor((left - start_time) / window_size)))
+            right_idx = min(n_windows, int(np.ceil((right - start_time) / window_size)))
+            for idx in range(left_idx, right_idx):
+                win_start = bins[idx]
+                win_end = bins[idx + 1]
+                overlap = max(0.0, min(right, win_end) - max(left, win_start))
+                if overlap <= 0.0:
+                    continue
+                idle_energy = idle_power_per_device * overlap
+                for device_id in device_ids:
+                    per_device_energy[device_id][idx] += idle_energy
+                    total_energy[idx] += idle_energy
+
     per_device_power = {
         device_id: energy / window_size
         for device_id, energy in per_device_energy.items()
@@ -845,7 +872,7 @@ def _compute_measured_power_series(
             device_id: float(np.sum(energy))
             for device_id, energy in per_device_energy.items()
         },
-        "source": "measured",
+        "source": "measured_recovered" if recover_idle_gaps else "measured",
     }
 
 
@@ -903,6 +930,119 @@ def calc_n_active_servers(
             ax.legend()
     return average, breakdown
 
+def _compute_state_based_power_series(
+    events: list[Event],
+    *,
+    n_device: int = -1,
+    window_size: float = 1.0,
+    start_time: float | None = None,
+    end_time: float | None = None,
+    idle_power: float = 70.0,
+) -> dict[str, Any]:
+    batch_events = [event for event in events if event.event_type == "batch"]
+    if not batch_events:
+        empty = np.array([], dtype=np.float64)
+        return {
+            "time": empty,
+            "total_power": empty,
+            "per_device_power": {},
+            "total_energy_joules": 0.0,
+            "per_device_energy_joules": {},
+            "source": "state_based",
+        }
+
+    if start_time is None:
+        start_time = min(float(event.timestamp - event.elapsed) for event in batch_events)
+    if end_time is None:
+        end_time = max(float(event.timestamp) for event in batch_events)
+
+    bins = _make_time_bins(start_time, end_time, window_size)
+    n_windows = len(bins) - 1
+    max_device_id = max(int(event.device_id) for event in batch_events)
+    if n_device > 0:
+        device_ids = list(range(max(n_device, max_device_id + 1)))
+    else:
+        device_ids = list(range(max_device_id + 1))
+
+    per_device_power = {
+        device_id: np.full(n_windows, idle_power, dtype=np.float64)
+        for device_id in device_ids
+    }
+
+    by_type_feature_names = {
+        "decode": "decode_active",
+        "mixed": "mixed_active",
+        "prefill": "prefill_active",
+    }
+    state_features = {
+        device_id: {
+            "decode_active": np.zeros(n_windows, dtype=np.float64),
+            "mixed_active": np.zeros(n_windows, dtype=np.float64),
+            "prefill_active": np.zeros(n_windows, dtype=np.float64),
+            "decode_present": np.zeros(n_windows, dtype=np.float64),
+            "mixed_present": np.zeros(n_windows, dtype=np.float64),
+            "prefill_present": np.zeros(n_windows, dtype=np.float64),
+        }
+        for device_id in device_ids
+    }
+
+    for event in batch_events:
+        device_id = int(event.device_id)
+        if device_id not in state_features:
+            continue
+        batch_start = max(start_time, float(event.timestamp - event.elapsed))
+        batch_end = min(end_time, float(event.timestamp))
+        if batch_end <= batch_start:
+            continue
+        nreq = float(len(event.req_ids))
+        if event.decode_only:
+            batch_type = "decode"
+        elif event.prefill_only:
+            batch_type = "prefill"
+        else:
+            batch_type = "mixed"
+        left = max(0, int(np.floor((batch_start - start_time) / window_size)))
+        right = min(n_windows, int(np.ceil((batch_end - start_time) / window_size)))
+        for idx in range(left, right):
+            win_start = bins[idx]
+            win_end = bins[idx + 1]
+            overlap = max(0.0, min(batch_end, win_end) - max(batch_start, win_start))
+            if overlap <= 0.0:
+                continue
+            frac = overlap / window_size
+            state_features[device_id][by_type_feature_names[batch_type]][idx] += nreq * frac
+            state_features[device_id][f"{batch_type}_present"][idx] = 1.0
+
+    # Fitted from the user's traces with idle power pinned at 70W.
+    coeffs = {
+        "decode_active": 89.341,
+        "mixed_active": 58.585,
+        "prefill_active": 376.009,
+        "decode_present": 130.004,
+        "mixed_present": 77.342,
+        "prefill_present": 0.0,
+    }
+    for device_id in device_ids:
+        features = state_features[device_id]
+        for key, value in coeffs.items():
+            per_device_power[device_id] += features[key] * value
+
+    total_power = np.sum(
+        np.vstack([per_device_power[device_id] for device_id in device_ids]),
+        axis=0,
+    ) if device_ids else np.zeros(n_windows, dtype=np.float64)
+    return {
+        "time": bins[:-1] - start_time,
+        "total_power": total_power,
+        "per_device_power": per_device_power,
+        "total_energy_joules": float(np.sum(total_power) * window_size),
+        "per_device_energy_joules": {
+            device_id: float(np.sum(power) * window_size)
+            for device_id, power in per_device_power.items()
+        },
+        "source": "state_based",
+    }
+
 def calc_energy(
     events: list,
     n_device: int,
@@ -916,80 +1056,28 @@ def calc_energy(
     add_direct_label: bool = False # NEW: label curve at right edge
 ):
     """
-    Computes and (optionally) plots per-window GPU power and active device count.
-    Keeps stepwise rendering similar to original, but avoids O(bins * events) scanning.
+    Computes and (optionally) plots per-window GPU power and active device count
+    using the state-based estimator calibrated from trace data.
     """
-    import numpy as np
-
-    # Gather and sort batch events by start time
-    batch_events = [e for e in events if e.event_type == "batch"]
-    if not batch_events:
-        return []
-
-    batch_events = sorted(batch_events, key=lambda e: e.timestamp - e.elapsed)
-
-    # Window bins
-    t0 = min(e.timestamp - e.elapsed for e in batch_events)
-    tN = max(e.timestamp for e in batch_events)
-    bins = np.arange(t0, tN + window_size, window_size)
-
-    # Power model (same as yours)
-    IDLE_POWER = 17
-    BASELINE_POWER = 250
-    INCREMENTAL_POWER = 0.35
-
-    # Precompute start/end times for sweep
-    starts = np.array([e.timestamp - e.elapsed for e in batch_events], dtype=np.float64)
-    ends   = np.array([e.timestamp for e in batch_events], dtype=np.float64)
-
-    # Active events: store indices of batch_events currently overlapping
-    active = set()
-    j = 0  # pointer to events that have started
-
+    power_summary = _compute_state_based_power_series(
+        events,
+        n_device=n_device,
+        window_size=window_size,
+    )
+    energy_per_bins = power_summary["total_power"].tolist()
     num_active_devices_per_bin = []
-    num_active_requests_per_bin = []
-    energy_per_bins = []
-
-    # Sweep bins left->right
-    for start, end in zip(bins[:-1], bins[1:]):
-        # Add newly started batches (start time < window end)
-        while j < len(batch_events) and starts[j] < end:
-            active.add(j)
-            j += 1
-
-        # Remove finished batches (end time <= window start)
-        # Iterate over a snapshot since we may discard
-        to_remove = []
-        for idx in active:
-            if ends[idx] <= start:
-                to_remove.append(idx)
-        for idx in to_remove:
-            active.discard(idx)
-
-        # Count unique devices + reqs among active batches
-        device_ids = set()
-        req_ids = set()
-        for idx in active:
-            e = batch_events[idx]
-            device_ids.add(e.device_id)
-            # req_ids might be large; still matches your logic
-            for r in e.req_ids:
-                req_ids.add(r)
-
-        n_active_dev = len(device_ids)
-        n_active_req = len(req_ids)
-
-        num_active_devices_per_bin.append(n_active_dev)
-        num_active_requests_per_bin.append(n_active_req)
-
-        energy_per_bin = (
-            n_active_dev * BASELINE_POWER
-            + n_active_req * INCREMENTAL_POWER
-            + (n_device - n_active_dev) * IDLE_POWER
+    for idx in range(len(power_summary["time"])):
+        n_active = sum(
+            1
+            for device_power in power_summary["per_device_power"].values()
+            if idx < len(device_power) and device_power[idx] > 70.0 + 1e-9
         )
-        energy_per_bins.append(energy_per_bin)
+        num_active_devices_per_bin.append(n_active)
+    bins = np.concatenate(
+        [power_summary["time"], [power_summary["time"][-1] + window_size]]
+    ) if len(power_summary["time"]) else np.array([], dtype=np.float64)
 
-    print(label, "average", float(np.mean(num_active_devices_per_bin)), "devices")
+    print(label, "average", float(np.mean(num_active_devices_per_bin)) if num_active_devices_per_bin else 0.0, "devices")
 
     # Helper: optional smoothing for nicer poster curves
     def _moving_avg(y, w):
@@ -2027,25 +2115,15 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
         start_time=service_start_time,
         end_time=service_end_time,
     )
+    estimated_power_summary = _compute_state_based_power_series(
+        all_events,
+        n_device=n_device,
+        window_size=window_size,
+        start_time=service_start_time,
+        end_time=service_end_time,
+    )
     if power_summary["source"] != "measured":
-        modeled_power = np.asarray(
-            calc_energy(
-                all_events,
-                window_size=window_size,
-                n_device=n_device,
-                ax=None,
-                n_device_ax=None,
-            ),
-            dtype=np.float64,
-        )
-        power_summary = {
-            "time": overview_time,
-            "total_power": modeled_power,
-            "per_device_power": {},
-            "total_energy_joules": float(np.sum(modeled_power) * window_size),
-            "per_device_energy_joules": {},
-            "source": "modeled",
-        }
+        power_summary = estimated_power_summary
     active_time, active_devices_series, average_n_active_servers, breakdown = _compute_active_device_series(
         all_events,
         window_size=window_size,
@@ -2060,83 +2138,118 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
         end_time=service_end_time,
     )
 
-    fig, axes = plt.subplots(5, 1, figsize=(18, 14), tight_layout=True, sharex=True)
+    device_power_series = [
+        (device_id, np.asarray(device_power, dtype=np.float64))
+        for device_id, device_power in sorted(power_summary["per_device_power"].items())
+    ]
+    num_device_power_axes = len(device_power_series)
+    num_axes = 5 + num_device_power_axes
+    fig_height = max(14, 2.6 * num_axes)
+    fig, axes = plt.subplots(
+        num_axes,
+        1,
+        figsize=(18, fig_height),
+        constrained_layout=True,
+        sharex=True,
+    )
+    axes = np.atleast_1d(axes)
+    ax_idx = 0
+
+    arrival_ax = axes[ax_idx]
+    ax_idx += 1
+    total_power_ax = axes[ax_idx]
+    ax_idx += 1
+    device_power_axes = axes[ax_idx: ax_idx + num_device_power_axes]
+    ax_idx += num_device_power_axes
+    active_ax = axes[ax_idx]
+    ax_idx += 1
+    violation_ax = axes[ax_idx]
+    ax_idx += 1
+    batch_tokens_ax = axes[ax_idx]
+
     _plot_step_series(
-        axes[0],
+        arrival_ax,
         overview_time,
         arrival_rate_series,
         label='arrival_rate',
         color='tab:blue',
         linewidth=2.5,
     )
-    axes[0].set_ylabel('Arrival Rate\n(req/s)')
-    axes[0].set_title('Arrival Rate')
-    axes[0].grid(True)
+    arrival_ax.set_ylabel('Arrival Rate\n(req/s)')
+    arrival_ax.set_title('Arrival Rate')
+    arrival_ax.grid(True)
 
     _plot_step_series(
-        axes[1],
+        total_power_ax,
         power_summary["time"],
         power_summary["total_power"],
         label='total_power',
         color='black',
         linewidth=2.8,
     )
-    for device_id, device_power in sorted(power_summary["per_device_power"].items()):
-        if not np.any(device_power):
-            continue
-        axes[1].plot(
-            power_summary["time"],
-            device_power,
-            label=f'device_{device_id}',
-            linewidth=1.7,
-            alpha=0.8,
-        )
-    axes[1].set_ylabel('Power (W)')
-    axes[1].set_title(
-        f"Measured Power by Device (total energy = {power_summary['total_energy_joules']:.1f} J)"
+    total_power_ax.set_ylabel('Total\nPower (W)')
+    total_power_ax.set_title(
+        f"Measured Total Power (total energy = {power_summary['total_energy_joules']:.1f} J)"
         if power_summary["source"] == "measured"
         else f"Modeled Power (fallback, total energy = {power_summary['total_energy_joules']:.1f} J)"
     )
-    axes[1].grid(True)
-    if power_summary["per_device_power"]:
-        axes[1].legend(loc='upper right', ncol=2, frameon=True)
+    total_power_ax.grid(True)
+
+    if device_power_series:
+        max_device_power = max(float(np.max(device_power)) for _, device_power in device_power_series)
+        shared_device_power_ymax = max(1.0, max_device_power * 1.05)
+        for device_ax, (device_id, device_power) in zip(device_power_axes, device_power_series):
+            _plot_step_series(
+                device_ax,
+                power_summary["time"],
+                device_power,
+                label=f'device_{device_id}',
+                color=f'C{device_id % 10}',
+                linewidth=2.0,
+            )
+            device_ax.set_ylabel(f'Device {device_id}\nPower (W)')
+            device_ax.set_ylim(0, shared_device_power_ymax)
+            device_ax.set_title(
+                f"Device {device_id} Power (energy = {power_summary['per_device_energy_joules'].get(device_id, 0.0):.1f} J)"
+            )
+            device_ax.grid(True)
 
     _plot_step_series(
-        axes[2],
+        active_ax,
         active_time,
         active_devices_series,
         label='active_devices',
         color='tab:green',
         linewidth=2.5,
     )
-    axes[2].set_ylabel('Active\nDevices')
-    axes[2].set_title('Active Devices')
-    axes[2].grid(True)
+    active_ax.set_ylabel('Active\nDevices')
+    active_ax.set_title('Active Devices')
+    active_ax.grid(True)
 
     _plot_step_series(
-        axes[3],
+        violation_ax,
         overview_time,
         violation_rate_series,
         label='slo_violation_rate',
         color='tab:red',
         linewidth=2.5,
     )
-    axes[3].set_ylabel('SLO\nViolation')
-    axes[3].set_title('SLO Violation Rate')
-    axes[3].grid(True)
+    violation_ax.set_ylabel('SLO\nViolation')
+    violation_ax.set_title('SLO Violation Rate')
+    violation_ax.grid(True)
 
     _plot_step_series(
-        axes[4],
+        batch_tokens_ax,
         batch_token_time,
         avg_batch_tokens_series,
         label='avg_batch_tokens',
         color='tab:purple',
         linewidth=2.5,
     )
-    axes[4].set_ylabel('Avg #Token\nin Batch')
-    axes[4].set_title('Average Batch Tokens')
-    axes[4].set_xlabel('Service Time (s)')
-    axes[4].grid(True)
+    batch_tokens_ax.set_ylabel('Avg #Token\nin Batch')
+    batch_tokens_ax.set_title('Average Batch Tokens')
+    batch_tokens_ax.set_xlabel('Service Time (s)')
+    batch_tokens_ax.grid(True)
 
     fig.savefig(f'{prefix}.energy.png', dpi=300, bbox_inches='tight')
     print(f'Energy saved to {prefix}.energy.png')
@@ -2170,9 +2283,10 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
                 'max_num_reqs_under_slo': float(np.max(num_reqs_series - num_violations)),
                 'rejection_rate': rejection_rate,
                 'device_stats': device_stats,
-                'energy_est': power_summary['total_energy_joules'],
+                'energy_est': estimated_power_summary['total_energy_joules'],
                 'energy_measured': power_summary['total_energy_joules'],
                 'power_source': power_summary['source'],
+                'energy_est_source': estimated_power_summary['source'],
                 'finish_reasons': dict(Counter(finish_reasons)),
                 'cross_node_admission': cross_node_admission,
                 **breakdown
@@ -2375,9 +2489,10 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
                 # 'max_num_reqs_under_slo': float(np.max(num_reqs_series - num_violations)),
                 'rejection_rate': rejection_rate,
                 'device_stats': device_stats,
-                'energy_est': power_summary['total_energy_joules'],
+                'energy_est': estimated_power_summary['total_energy_joules'],
                 'energy_measured': power_summary['total_energy_joules'],
                 'power_source': power_summary['source'],
+                'energy_est_source': estimated_power_summary['source'],
                 'finish_reasons': dict(Counter(finish_reasons)),
                 'cross_node_admission': cross_node_admission,
                 **breakdown

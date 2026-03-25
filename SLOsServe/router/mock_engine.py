@@ -307,7 +307,8 @@ class MockEngineCore:
                 publish_start = time.time()
                 if self.execplan_bus is not None:
                     exec_plan = _get_scheduler_exec_plan_snapshot(self.scheduler)
-                    exec_plan.batch_id = self.batch_id
+                    if exec_plan is not None:
+                        exec_plan.batch_id = self.batch_id
                     self.execplan_bus.publish.remote(
                         self.device_id,
                         time.time(),

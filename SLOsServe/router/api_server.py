@@ -269,6 +269,8 @@ class SLOsServeRouter(Router):
                 is_new_req = is_new_req,
                 ddl = prefill_ddl - self.routing_overhead,
                 input_length = input_length,
+                n_computed_tokens = 0,
+                max_tokens = request.payload['max_tokens'],
                 profit = profit,
                 mem = mem,
                 tpot_idx = 0,

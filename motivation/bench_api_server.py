@@ -12,14 +12,22 @@ from itertools import product
 import logging
 import uuid
 import random
-from collections import deque
+import bisect
+from collections import Counter, defaultdict, deque
 import aiohttp
 import httpx
 import pandas as pd
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-from motivation.events_analysis import analyze_events, analyze_slo_violation
+from motivation.events_analysis import (
+    _compute_active_device_series,
+    _compute_measured_power_series,
+    analyze_events,
+    analyze_slo_violation,
+    build_active_requests_step,
+    count_at_times,
+)
 from motivation.auto_scaling import eval_auto_scaling
 from Dataset.dataset import ArrivalTimes, Requests, Request
 
@@ -32,8 +40,15 @@ FRONTEND_DELAY=0.03
 FRONTEND_HEALTH_CHECK_INTERVAL_S = 5.0
 REQUEST_TIMEOUT_S = 60.0
 REQUEST_CANCEL_GRACE_S = 5.0
+BENCHMARK_METRIC_WINDOW_S = 1.0
+BENCHMARK_IDLE_POWER_PER_GPU_W = 70.0
+BENCHMARK_BATCH_POWER_MATCH_TOLERANCE_S = 0.2
 
 from SLOsServe.perf_model import get_model_max_tokens, get_easy_name
+
+
+class BenchmarkOverloadedError(RuntimeError):
+    """Raised when the serving stack dies mid-benchmark."""
 
 
 def _request_id_sort_key(request_id: Any) -> tuple[int, int | str]:
@@ -540,6 +555,84 @@ class ExecutionResults:
                 self.problem.profit_base for exec_result in self.execution_results]
     
         self.profit = (np.array(profits) * 1 - np.array(is_slo_violation)).sum() / len(self.execution_results)
+
+
+@dataclass
+class TerminalRunResult:
+    profit: float
+    results: Dict[str, Any]
+    event_file: str
+    energy_consumption: float = 0.0
+    per_gpu_energy_consumption: List[float] = field(default_factory=list)
+
+
+def _make_overload_run_result(
+    problem: Problem,
+    *,
+    requested_n_devices: int,
+    error: Exception,
+) -> TerminalRunResult:
+    window_start, window_end = problem.window.split(':')
+    arrival_times = ArrivalTimes.load(
+        problem.arrival_pattern,
+        problem.load_scale,
+        window_start=window_start,
+        window_end=window_end,
+    ).arrival_times
+    if len(arrival_times) > 1 and arrival_times[-1] > arrival_times[0]:
+        rps = len(arrival_times) / (arrival_times[-1] - arrival_times[0])
+    else:
+        rps = 0.0
+    request_count = len(arrival_times)
+    rr_sliced = problem.n_devices != requested_n_devices
+
+    event_prefix = f"{problem.store_prefix}.overloaded"
+    event_path = f"{event_prefix}.events.jsonl"
+    with open(event_path, "w", encoding="utf-8") as f:
+        json.dump([
+            {
+                "event_type": "benchmark_terminal",
+                "timestamp": time.time(),
+                "status": "overloaded",
+                "reason": "server_unhealthy",
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "requested_n_device": requested_n_devices,
+                "effective_n_device": problem.n_devices,
+            }
+        ], f, indent=4)
+
+    zero_metrics = [0.0 for _ in range(max(0, int(problem.n_devices)))]
+    return TerminalRunResult(
+        profit=-1.0,
+        results={
+            "rps": rps,
+            "requested_n_device": requested_n_devices,
+            "effective_n_device": problem.n_devices,
+            "rr_sliced": rr_sliced,
+            "rr_slice_kept_request_count": request_count,
+            "rr_slice_total_request_count": request_count,
+            "slo_attainment_rate": 0.0,
+            "run_status": "overloaded",
+            "overloaded": True,
+            "overload_reason": "server_unhealthy",
+            "overload_error_type": type(error).__name__,
+            "overload_error": str(error),
+            "extra_metrics": {
+                "energy_consumption_active": 0.0,
+                "energy_consumption_non_idle": 0.0,
+                "per_server_energy_consumption": zero_metrics.copy(),
+                "per_server_power": zero_metrics.copy(),
+                "per_server_rps": zero_metrics.copy(),
+                "benchmark_figure_replay": {},
+                "window_time_pct_vs_active_requests_figure": None,
+                "window_time_pct_vs_active_requests_figure_pdf": None,
+                "power_vs_active_servers_and_batch_tokens_figure": None,
+                "power_vs_active_servers_and_batch_tokens_figure_pdf": None,
+            },
+        },
+        event_file=event_prefix,
+    )
     
 
 async def run_request(client: httpx.AsyncClient,
@@ -625,11 +718,11 @@ async def run_request(client: httpx.AsyncClient,
 def summarize_energy_events(events: List[Dict[str, Any]]) -> tuple[List[float], float]:
     per_gpu: Dict[int, float] = {}
     for event in events:
-        if event.get("event_type") != "energy":
+        if _event_value(event, "event_type") != "energy":
             continue
-        device_id = int(event.get("device_id", 0))
+        device_id = int(_event_value(event, "device_id", 0))
         per_gpu[device_id] = per_gpu.get(device_id, 0.0) + float(
-            event.get("energy", 0.0))
+            _event_value(event, "energy", 0.0) or 0.0)
     if not per_gpu:
         return [], 0.0
     ordered = [per_gpu.get(i, 0.0) for i in range(max(per_gpu) + 1)]
@@ -693,6 +786,564 @@ def _summarize_per_server_energy_metrics(
     return {
         "per_server_energy_consumption": per_server_energy,
         "per_server_power": per_server_power,
+    }
+
+
+def _make_time_bins(
+    start_time: float,
+    end_time: float,
+    window_size: float,
+) -> np.ndarray:
+    if window_size <= 0:
+        raise ValueError("window_size must be positive.")
+    if end_time <= start_time:
+        end_time = start_time + window_size
+    n_windows = max(1, int(np.ceil((end_time - start_time) / window_size)))
+    return start_time + np.arange(n_windows + 1, dtype=np.float64) * window_size
+
+
+def _resolve_benchmark_window_bounds(
+    events: List[Dict[str, Any] | Any],
+    reqs: Dict[str, Any],
+    *,
+    window_size: float,
+) -> tuple[float, float]:
+    start_candidates: list[float] = []
+    end_candidates: list[float] = []
+
+    for event in events:
+        event_type = _event_value(event, "event_type")
+        timestamp = _event_value(event, "timestamp")
+        if timestamp is None:
+            continue
+        ts = float(timestamp)
+        if event_type == "energy":
+            start_candidates.append(ts)
+            end_candidates.append(ts + 1e-9)
+        elif event_type == "batch":
+            elapsed = float(_event_value(event, "elapsed", 0.0) or 0.0)
+            start_candidates.append(ts - elapsed)
+            end_candidates.append(ts + 1e-9)
+
+    for req in reqs.values():
+        arrival_time = getattr(req, "engine_arrival_time", -1.0)
+        if arrival_time is None or arrival_time < 0:
+            arrival_time = getattr(req, "arrival_time", -1.0)
+        if arrival_time is not None and arrival_time >= 0:
+            start_candidates.append(float(arrival_time))
+        finish_times = [
+            float(_event_value(event, "timestamp", arrival_time))
+            for event in getattr(req, "events", [])
+            if _event_value(event, "event_type") == "finish"
+        ]
+        if finish_times:
+            end_candidates.append(max(finish_times) + 1e-9)
+
+    if not start_candidates or not end_candidates:
+        return 0.0, window_size
+    return min(start_candidates), max(end_candidates)
+
+
+def _extract_request_intervals(
+    reqs: Dict[str, Any],
+    *,
+    end_time: float,
+) -> list[tuple[float, float]]:
+    intervals: list[tuple[float, float]] = []
+    for req in reqs.values():
+        arrival_time = getattr(req, "engine_arrival_time", -1.0)
+        if arrival_time is None or arrival_time < 0:
+            arrival_time = getattr(req, "arrival_time", -1.0)
+        if arrival_time is None or arrival_time < 0:
+            continue
+
+        finish_times = [
+            float(_event_value(event, "timestamp", arrival_time))
+            for event in getattr(req, "events", [])
+            if _event_value(event, "event_type") == "finish"
+        ]
+        finish_time = max(finish_times) if finish_times else float(end_time)
+        if finish_time < arrival_time:
+            finish_time = float(arrival_time)
+        intervals.append((float(arrival_time), float(finish_time)))
+    return intervals
+
+
+def _summarize_active_request_windows(
+    reqs: Dict[str, Any],
+    *,
+    start_time: float,
+    end_time: float,
+    window_size: float,
+) -> Dict[str, Any]:
+    bins = _make_time_bins(start_time, end_time, window_size)
+    n_windows = len(bins) - 1
+    centers = bins[:-1] + 0.5 * window_size
+    intervals = _extract_request_intervals(reqs, end_time=end_time)
+
+    center_counts = np.zeros(n_windows, dtype=np.int64)
+    any_active = np.zeros(n_windows, dtype=bool)
+    if intervals:
+        event_times, counts_after = build_active_requests_step(intervals)
+        center_counts = count_at_times(event_times, counts_after, centers).astype(
+            np.int64
+        )
+
+        diff = np.zeros(n_windows + 1, dtype=np.int64)
+        for arrival_time, finish_time in intervals:
+            if finish_time <= start_time or arrival_time >= end_time:
+                continue
+            left = max(0, int(np.floor((arrival_time - start_time) / window_size)))
+            right = min(
+                n_windows,
+                int(np.ceil((finish_time - start_time) / window_size)),
+            )
+            if right <= left:
+                if 0 <= left < n_windows:
+                    right = left + 1
+                else:
+                    continue
+            diff[left] += 1
+            diff[right] -= 1
+        any_active = np.cumsum(diff[:-1]) > 0
+
+    distribution = [
+        {
+            "active_requests": int(active_requests),
+            "window_count": int(count),
+            "window_time_pct": float(100.0 * count / n_windows) if n_windows else 0.0,
+        }
+        for active_requests, count in sorted(Counter(center_counts.tolist()).items())
+    ]
+    return {
+        "time": bins[:-1] - start_time,
+        "center_counts": center_counts,
+        "any_active": any_active,
+        "distribution": distribution,
+    }
+
+
+def _summarize_boxplot(values: List[float], *, label: str) -> Dict[str, Any] | None:
+    if not values:
+        return None
+    data = np.asarray(values, dtype=float)
+    return {
+        "label": label,
+        "count": int(data.size),
+        "mean": float(np.mean(data)),
+        "min": float(np.min(data)),
+        "max": float(np.max(data)),
+        "q1": float(np.percentile(data, 25)),
+        "med": float(np.percentile(data, 50)),
+        "q3": float(np.percentile(data, 75)),
+        "whislo": float(np.percentile(data, 10)),
+        "whishi": float(np.percentile(data, 90)),
+        "fliers": [],
+    }
+
+
+def _match_batch_power_rows(
+    events: List[Dict[str, Any] | Any],
+    *,
+    tolerance_s: float = BENCHMARK_BATCH_POWER_MATCH_TOLERANCE_S,
+) -> List[Dict[str, Any]]:
+    energy_times: Dict[int, List[float]] = defaultdict(list)
+    energy_powers: Dict[int, List[float]] = defaultdict(list)
+    for event in events:
+        if _event_value(event, "event_type") != "energy":
+            continue
+        try:
+            device_id = int(_event_value(event, "device_id", -1))
+        except (TypeError, ValueError):
+            continue
+        if device_id < 0:
+            continue
+        energy_times[device_id].append(float(_event_value(event, "timestamp", 0.0)))
+        energy_powers[device_id].append(float(_event_value(event, "power", 0.0) or 0.0))
+
+    rows: List[Dict[str, Any]] = []
+    for event in events:
+        if _event_value(event, "event_type") != "batch":
+            continue
+        try:
+            device_id = int(_event_value(event, "device_id", -1))
+        except (TypeError, ValueError):
+            continue
+        if device_id < 0 or device_id not in energy_times:
+            continue
+        ts = float(_event_value(event, "timestamp", 0.0))
+        idx = bisect.bisect_left(energy_times[device_id], ts)
+        best_delta = None
+        best_power = None
+        for probe_idx in (idx - 1, idx):
+            if not 0 <= probe_idx < len(energy_times[device_id]):
+                continue
+            delta = abs(energy_times[device_id][probe_idx] - ts)
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                best_power = energy_powers[device_id][probe_idx]
+        if best_delta is None or best_power is None or best_delta > tolerance_s:
+            continue
+        scheduled_tokens = _event_value(event, "num_scheduled_tokens", {}) or {}
+        if not isinstance(scheduled_tokens, dict) or not scheduled_tokens:
+            continue
+        rows.append({
+            "device_id": device_id,
+            "tokens": int(sum(scheduled_tokens.values(), start=0)),
+            "power": float(best_power),
+        })
+    return rows
+
+
+def _build_token_bins(tokens: List[int]) -> Dict[str, Any]:
+    if not tokens:
+        return {"kind": "empty", "bins": []}
+    unique_tokens = sorted({int(token) for token in tokens if int(token) > 0})
+    if not unique_tokens:
+        return {"kind": "empty", "bins": []}
+
+    if len(unique_tokens) <= 16 and unique_tokens[-1] <= 64:
+        return {
+            "kind": "exact",
+            "bins": [
+                {
+                    "label": str(token),
+                    "low": int(token),
+                    "high": int(token),
+                }
+                for token in unique_tokens
+            ],
+        }
+
+    bins: list[dict[str, int | str]] = []
+    power_of_two_edges = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+    prev = 0
+    min_token = unique_tokens[0]
+    max_token = unique_tokens[-1]
+    for edge in power_of_two_edges:
+        low = prev + 1
+        high = edge
+        prev = edge
+        if high < min_token:
+            continue
+        bins.append({
+            "label": str(high) if low == high else f"{low}-{high}",
+            "low": int(low),
+            "high": int(high),
+        })
+        if high >= max_token:
+            break
+    if not bins:
+        bins.append({
+            "label": str(max_token),
+            "low": int(max_token),
+            "high": int(max_token),
+        })
+    elif int(bins[-1]["high"]) < max_token:
+        low = int(bins[-1]["high"]) + 1
+        bins.append({
+            "label": f"{low}-{max_token}",
+            "low": int(low),
+            "high": int(max_token),
+        })
+    return {
+        "kind": "powers_of_two",
+        "bins": bins,
+    }
+
+
+def _summarize_power_vs_active_servers(
+    active_server_counts: np.ndarray,
+    total_power: np.ndarray,
+) -> Dict[str, Any]:
+    grouped_power: Dict[int, List[float]] = defaultdict(list)
+    for active_servers, power in zip(active_server_counts.tolist(), total_power.tolist()):
+        grouped_power[int(active_servers)].append(float(power))
+    stats = [
+        _summarize_boxplot(values, label=str(active_servers))
+        for active_servers, values in sorted(grouped_power.items())
+    ]
+    return {
+        "xlabel": "# Active Servers",
+        "ylabel": "Total Power (W)",
+        "stats": [item for item in stats if item is not None],
+    }
+
+
+def _summarize_power_vs_batch_tokens(
+    batch_power_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    token_bins = _build_token_bins([int(row["tokens"]) for row in batch_power_rows])
+    grouped_power: Dict[str, List[float]] = defaultdict(list)
+    grouped_ranges: Dict[str, tuple[int, int]] = {}
+    for row in batch_power_rows:
+        token_count = int(row["tokens"])
+        for bucket in token_bins["bins"]:
+            low = int(bucket["low"])
+            high = int(bucket["high"])
+            if low <= token_count <= high:
+                label = str(bucket["label"])
+                grouped_power[label].append(float(row["power"]))
+                grouped_ranges[label] = (low, high)
+                break
+
+    stats: list[dict[str, Any]] = []
+    for bucket in token_bins["bins"]:
+        label = str(bucket["label"])
+        summary = _summarize_boxplot(grouped_power.get(label, []), label=label)
+        if summary is None:
+            continue
+        low, high = grouped_ranges.get(label, (int(bucket["low"]), int(bucket["high"])))
+        summary["low"] = int(low)
+        summary["high"] = int(high)
+        stats.append(summary)
+    return {
+        "xlabel": "# Tokens in Batch",
+        "ylabel": "Server Power (W)",
+        "binning": token_bins,
+        "stats": stats,
+    }
+
+
+def _save_window_time_pct_figure(
+    summary: Dict[str, Any],
+    path: str | Path,
+    *,
+    title: str,
+) -> Path:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    points = summary.get("points", [])
+
+    fig, ax = plt.subplots(figsize=(7, 5), tight_layout=True)
+    if points:
+        x = [int(point["active_requests"]) for point in points]
+        y = [float(point["window_time_pct"]) for point in points]
+        ax.bar(x, y, width=0.8, color="#1f78b4", alpha=0.9)
+        ax.set_xticks(x)
+    else:
+        ax.text(0.5, 0.5, "No request activity", ha="center", va="center")
+    ax.set_xlabel("Active Requests")
+    ax.set_ylabel("Window Time (%)")
+    ax.set_title(title)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.savefig(output_path, dpi=220)
+    plt.close(fig)
+    return output_path
+
+
+def _draw_serialized_boxplot(
+    ax: plt.Axes,
+    stats: List[Dict[str, Any]],
+    *,
+    facecolor: str,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+) -> None:
+    if not stats:
+        ax.text(0.5, 0.5, "No samples", ha="center", va="center")
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, axis="y", alpha=0.3)
+        return
+    artists = ax.bxp(stats, showfliers=False, patch_artist=True)
+    for box in artists["boxes"]:
+        box.set_facecolor(facecolor)
+        box.set_alpha(0.65)
+    for median in artists["medians"]:
+        median.set_color("#222222")
+        median.set_linewidth(1.8)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(True, axis="y", alpha=0.3)
+
+
+def _save_power_distribution_figure(
+    active_servers_summary: Dict[str, Any],
+    batch_tokens_summary: Dict[str, Any],
+    path: str | Path,
+    *,
+    title_prefix: str,
+) -> Path:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), tight_layout=True)
+    _draw_serialized_boxplot(
+        axes[0],
+        active_servers_summary.get("stats", []),
+        facecolor="#c73e1d",
+        title=f"{title_prefix}: Power vs # Active Servers",
+        xlabel=active_servers_summary.get("xlabel", "# Active Servers"),
+        ylabel=active_servers_summary.get("ylabel", "Power (W)"),
+    )
+    _draw_serialized_boxplot(
+        axes[1],
+        batch_tokens_summary.get("stats", []),
+        facecolor="#1f78b4",
+        title=f"{title_prefix}: Power vs # Tokens in Batch",
+        xlabel=batch_tokens_summary.get("xlabel", "# Tokens in Batch"),
+        ylabel=batch_tokens_summary.get("ylabel", "Power (W)"),
+    )
+    if len(batch_tokens_summary.get("stats", [])) > 6:
+        axes[1].tick_params(axis="x", rotation=45)
+    fig.savefig(output_path, dpi=220)
+    plt.close(fig)
+    return output_path
+
+
+def save_benchmark_figures_from_result_row(
+    result: Dict[str, Any],
+    output_prefix: str | Path,
+) -> Dict[str, str]:
+    replay = result.get("benchmark_figure_replay")
+    if not isinstance(replay, dict):
+        return {}
+
+    prefix = str(output_prefix)
+    title_prefix = (
+        f"{result.get('scheduling_policy', 'benchmark')} / "
+        f"{result.get('routing_policy', 'policy')}"
+    )
+    window_png = _save_window_time_pct_figure(
+        replay.get("window_time_pct_vs_active_requests", {}),
+        f"{prefix}.window_time_pct_vs_active_requests.png",
+        title=f"{title_prefix}: Window Time % vs Active Requests",
+    )
+    window_pdf = _save_window_time_pct_figure(
+        replay.get("window_time_pct_vs_active_requests", {}),
+        f"{prefix}.window_time_pct_vs_active_requests.pdf",
+        title=f"{title_prefix}: Window Time % vs Active Requests",
+    )
+    power_png = _save_power_distribution_figure(
+        replay.get("power_vs_active_servers", {}),
+        replay.get("power_vs_batch_tokens", {}),
+        f"{prefix}.power_vs_active_servers_and_batch_tokens.png",
+        title_prefix=title_prefix,
+    )
+    power_pdf = _save_power_distribution_figure(
+        replay.get("power_vs_active_servers", {}),
+        replay.get("power_vs_batch_tokens", {}),
+        f"{prefix}.power_vs_active_servers_and_batch_tokens.pdf",
+        title_prefix=title_prefix,
+    )
+    return {
+        "window_time_pct_vs_active_requests_figure": str(window_png),
+        "window_time_pct_vs_active_requests_figure_pdf": str(window_pdf),
+        "power_vs_active_servers_and_batch_tokens_figure": str(power_png),
+        "power_vs_active_servers_and_batch_tokens_figure_pdf": str(power_pdf),
+    }
+
+
+def _summarize_benchmark_energy_and_figures(
+    events: List[Dict[str, Any] | Any],
+    reqs: Dict[str, Any],
+    *,
+    n_devices: int,
+    tensor_parallel_size: int,
+    output_prefix: str,
+    scheduling_policy: str,
+    routing_policy: str,
+    window_size: float = BENCHMARK_METRIC_WINDOW_S,
+    idle_power_per_gpu: float = BENCHMARK_IDLE_POWER_PER_GPU_W,
+) -> Dict[str, Any]:
+    start_time, end_time = _resolve_benchmark_window_bounds(
+        events,
+        reqs,
+        window_size=window_size,
+    )
+    power_summary = _compute_measured_power_series(
+        events,
+        n_device=n_devices,
+        window_size=window_size,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    total_power = np.asarray(power_summary["total_power"], dtype=float)
+    total_energy = total_power * window_size
+    idle_power_per_replica = float(
+        max(0.0, float(idle_power_per_gpu)) * max(1, int(tensor_parallel_size))
+    )
+
+    active_req_summary = _summarize_active_request_windows(
+        reqs,
+        start_time=start_time,
+        end_time=end_time,
+        window_size=window_size,
+    )
+    _, active_server_counts, _, _ = _compute_active_device_series(
+        events,
+        window_size=window_size,
+        start_time=start_time,
+        end_time=end_time,
+        n_device=n_devices,
+    )
+    active_server_counts = np.asarray(active_server_counts, dtype=np.int64)
+
+    n_windows = min(
+        len(total_energy),
+        len(active_req_summary["any_active"]),
+        len(active_server_counts),
+    )
+    total_power = total_power[:n_windows]
+    total_energy = total_energy[:n_windows]
+    active_server_counts = active_server_counts[:n_windows]
+    any_active = np.asarray(active_req_summary["any_active"][:n_windows], dtype=bool)
+
+    energy_consumption_active = float(np.sum(total_energy[any_active]))
+    idle_energy_per_window = float(
+        idle_power_per_replica * max(0, int(n_devices)) * window_size
+    )
+    energy_consumption_non_idle = float(
+        np.sum(np.maximum(total_energy - idle_energy_per_window, 0.0))
+    )
+
+    active_req_points = active_req_summary["distribution"]
+    window_time_pct_summary = {
+        "kind": "bar",
+        "window_size_seconds": float(window_size),
+        "xlabel": "Active Requests",
+        "ylabel": "Window Time (%)",
+        "points": active_req_points,
+    }
+    active_servers_summary = _summarize_power_vs_active_servers(
+        active_server_counts,
+        total_power,
+    )
+    batch_tokens_summary = _summarize_power_vs_batch_tokens(
+        _match_batch_power_rows(events)
+    )
+
+    replay = {
+        "window_size_seconds": float(window_size),
+        "idle_power_per_gpu_w": float(idle_power_per_gpu),
+        "idle_power_per_replica_w": float(idle_power_per_replica),
+        "tensor_parallel_size": int(tensor_parallel_size),
+        "power_source": str(power_summary.get("source", "measured")),
+        "window_time_pct_vs_active_requests": window_time_pct_summary,
+        "power_vs_active_servers": active_servers_summary,
+        "power_vs_batch_tokens": batch_tokens_summary,
+    }
+    figure_paths = save_benchmark_figures_from_result_row(
+        {
+            "benchmark_figure_replay": replay,
+            "scheduling_policy": scheduling_policy,
+            "routing_policy": routing_policy,
+        },
+        output_prefix,
+    )
+    return {
+        "energy_consumption_active": energy_consumption_active,
+        "energy_consumption_non_idle": energy_consumption_non_idle,
+        "benchmark_window_size_seconds": float(window_size),
+        "benchmark_idle_power_per_gpu_w": float(idle_power_per_gpu),
+        "benchmark_idle_power_per_replica_w": float(idle_power_per_replica),
+        "benchmark_power_source": str(power_summary.get("source", "measured")),
+        "benchmark_figure_replay": replay,
+        **figure_paths,
     }
 
 
@@ -1287,7 +1938,10 @@ async def main(
                             if problem.enable_session_replay and request.session_id:
                                 session_ready_at[request.session_id] = completion_elapsed_time + problem.session_pause_s
                             timed_out_requests.discard(request_id)
-                            continue
+                            raise BenchmarkOverloadedError(
+                                "Request task failed after the server became unhealthy. "
+                                f"request_id={request_id} error={exc!r}"
+                            ) from exc
 
                         # ===== task SUCCEEDED =====
                         try:
@@ -1339,7 +1993,7 @@ async def main(
                     if not healthy:
                         for task, *_ in tasks:
                             task.cancel()
-                        raise RuntimeError(
+                        raise BenchmarkOverloadedError(
                             "Server became unhealthy during benchmark; aborting this run. "
                             f"endpoint={endpoint} detail={health_detail}"
                         )
@@ -1499,11 +2153,23 @@ async def main(
     results['rr_sliced'] = rr_sliced
     results['rr_slice_kept_request_count'] = len(requests)
     results['rr_slice_total_request_count'] = original_request_count
+    results['run_status'] = 'completed'
+    results['overloaded'] = False
     extra_metrics = results.setdefault('extra_metrics', {})
     extra_metrics.update(_summarize_per_server_energy_metrics(
         events,
         problem.n_devices,
     ))
+    benchmark_energy_figure_metrics = _summarize_benchmark_energy_and_figures(
+        events,
+        reqs,
+        n_devices=problem.n_devices,
+        tensor_parallel_size=problem.tensor_parallel_size,
+        output_prefix=f'{problem.store_prefix}.{i}',
+        scheduling_policy=problem.scheduling_policy,
+        routing_policy=problem.routing_policy,
+    )
+    extra_metrics.update(benchmark_energy_figure_metrics)
     arrival_duration_s = (
         float(arrival_times[-1] - arrival_times[0])
         if len(arrival_times) > 1 else 0.0
@@ -1689,10 +2355,13 @@ def _scale_rr_energy_results(
     extra_metrics = scaled_results.get("extra_metrics")
     if isinstance(extra_metrics, dict):
         scaled_extra_metrics = dict(extra_metrics)
-        if "energy_est" in scaled_extra_metrics:
-            scaled_extra_metrics["energy_est"] = (
-                float(scaled_extra_metrics["energy_est"]) * multiplier
-            )
+        for key in (
+            "energy_est",
+            "energy_consumption_active",
+            "energy_consumption_non_idle",
+        ):
+            if key in scaled_extra_metrics:
+                scaled_extra_metrics[key] = float(scaled_extra_metrics[key]) * multiplier
         scaled_results["extra_metrics"] = scaled_extra_metrics
     return scaled_results, float(energy_consumption) * multiplier
 
@@ -1816,9 +2485,13 @@ def build_problems(
         profit_per_output_token = 10.0e-6
         profit_base = 0
     
-    default_capped_baseline_tokens = max(
+    raw_default_capped_baseline_tokens = max(
         1,
         min(max_decode_batch_size - 10, 16384),
+    )
+    default_capped_baseline_tokens = min(
+        16384,
+        ((raw_default_capped_baseline_tokens + 63) // 64) * 64,
     )
     capped_baseline_tokens = (
         int(baseline_decode_cap)
@@ -1830,7 +2503,8 @@ def build_problems(
         )
     print(
         f'capped_baseline_tokens: {capped_baseline_tokens} '
-        f'(default={default_capped_baseline_tokens})'
+        f'(default={default_capped_baseline_tokens}, '
+        f'raw_default={raw_default_capped_baseline_tokens})'
     )
     ablation_no_global = False
     ablation_no_local = False
@@ -1882,9 +2556,9 @@ def build_problems(
         # for maximum_queue_length in [10, 20, 50]:
         scheduling_kwargss.append({
             'enable_chunked_prefill': True,
-            'max_num_batched_tokens': capped_baseline_tokens,
+            'max_num_batched_tokens': 16384,
             'max_num_seqs': 512,
-            'long_prefill_token_threshold': capped_baseline_tokens,
+            'long_prefill_token_threshold': 16384,
             'enable_admission': False,
             'allow_rejection': False,
             'scheduling_policy': 'vllm-edf',
@@ -2357,16 +3031,37 @@ def run(
         for problem in problems:
             # print(f"Running problem: {problem}")
             problem.scheduling_kwargs['scheduling_overhead'] = scheduling_overhead
-            exec_result = asyncio.run(
-                main(
-                    problem,
-                    endpoint,
-                    clients,
-                    update_clients=update_clients,
+            try:
+                exec_result = asyncio.run(
+                    main(
+                        problem,
+                        endpoint,
+                        clients,
+                        update_clients=update_clients,
+                    )
                 )
-            )
+            except (BenchmarkOverloadedError,
+                    httpx.HTTPError,
+                    aiohttp.ClientError,
+                    asyncio.TimeoutError) as exc:
+                logger.error(
+                    "Benchmark run terminated as overloaded for %s: %r",
+                    problem.store_prefix,
+                    exc,
+                )
+                exec_result = _make_overload_run_result(
+                    problem,
+                    requested_n_devices=n_device,
+                    error=exc,
+                )
             run_results.append(exec_result)
-        best_result = max(run_results, key = lambda x: x.profit)
+        best_result = max(
+            run_results,
+            key=lambda x: (
+                not bool(x.results.get('overloaded', False)),
+                x.profit,
+            ),
+        )
         requested_n_device = best_result.results.get('requested_n_device', n_device)
         effective_n_device = best_result.results.get('effective_n_device', n_device)
         result = {
@@ -2395,15 +3090,40 @@ def run(
             'per_gpu_energy_consumption': best_result.per_gpu_energy_consumption,
             'scheduling_overhead': slo_routing_overhead,
             'burstiness_level': burstiness_level,
+            'run_status': best_result.results.get('run_status', 'completed'),
+            'overloaded': bool(best_result.results.get('overloaded', False)),
             'rr_slice_kept_request_count': best_result.results.get(
                 'rr_slice_kept_request_count'),
             'rr_slice_total_request_count': best_result.results.get(
                 'rr_slice_total_request_count'),
         }
+        if 'overload_reason' in best_result.results:
+            result['overload_reason'] = best_result.results['overload_reason']
+        if 'overload_error_type' in best_result.results:
+            result['overload_error_type'] = best_result.results[
+                'overload_error_type']
+        if 'overload_error' in best_result.results:
+            result['overload_error'] = best_result.results['overload_error']
         if 'auto_scaling_analysis' in best_result.results:
             result.update(best_result.results['auto_scaling_analysis'])
         if 'extra_metrics' in best_result.results:
             result.update(best_result.results['extra_metrics'])
+        if result.get('window_time_pct_vs_active_requests_figure') is not None:
+            result['window_time_pct_vs_active_requests_figure'] = (
+                f'{problems[0].store_prefix}.window_time_pct_vs_active_requests.png'
+            )
+        if result.get('window_time_pct_vs_active_requests_figure_pdf') is not None:
+            result['window_time_pct_vs_active_requests_figure_pdf'] = (
+                f'{problems[0].store_prefix}.window_time_pct_vs_active_requests.pdf'
+            )
+        if result.get('power_vs_active_servers_and_batch_tokens_figure') is not None:
+            result['power_vs_active_servers_and_batch_tokens_figure'] = (
+                f'{problems[0].store_prefix}.power_vs_active_servers_and_batch_tokens.png'
+            )
+        if result.get('power_vs_active_servers_and_batch_tokens_figure_pdf') is not None:
+            result['power_vs_active_servers_and_batch_tokens_figure_pdf'] = (
+                f'{problems[0].store_prefix}.power_vs_active_servers_and_batch_tokens.pdf'
+            )
         if 'perf_model_error_summary' in best_result.results:
             result['perf_model_error_summary'] = best_result.results[
                 'perf_model_error_summary']
@@ -2455,6 +3175,16 @@ def run(
         dst = f'{problems[0].store_prefix}.perf_model_estimated_vs_measured.png'
         if os.path.exists(src):
             os.system(f'cp {src} {dst}')
+        for figure_suffix in [
+            'window_time_pct_vs_active_requests.png',
+            'window_time_pct_vs_active_requests.pdf',
+            'power_vs_active_servers_and_batch_tokens.png',
+            'power_vs_active_servers_and_batch_tokens.pdf',
+        ]:
+            src = f'{best_result.event_file}.{figure_suffix}'
+            dst = f'{problems[0].store_prefix}.{figure_suffix}'
+            if os.path.exists(src):
+                os.system(f'cp {src} {dst}')
     
         for r in run_results:
             os.system(f'rm {r.event_file}*')
@@ -2480,7 +3210,15 @@ def run(
         n_groups = len(df.groupby(other_features))
         ncols = min(3, n_groups)
         nrows = math.ceil(n_groups / ncols)
-        for ylabel in ['energy_est', 'slo_violation_rate', 'energy_consumption']:
+        for ylabel in [
+            'energy_est',
+            'slo_violation_rate',
+            'energy_consumption',
+            'energy_consumption_active',
+            'energy_consumption_non_idle',
+        ]:
+            if ylabel not in df.columns:
+                continue
             fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 5 * nrows), squeeze=False)
             idx = 0
             for other_feature_values, group in df.groupby(other_features):
