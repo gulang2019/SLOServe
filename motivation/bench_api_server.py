@@ -3226,7 +3226,7 @@ def run(
 
     # 1. Plot: for each load_scale, create a subfigure showing profit vs n_device for each (scheduling_policy, routing_policy) pair
     os.makedirs(f'{experiment_dir}/figs', exist_ok=True)
-    features = ['load_scale', 'n_device', 'ttft_slo_scale', 'slo_tpot']
+    features = ['load_scale', 'n_device', 'ttft_slo_scale', 'slo_tpot', 'slo_violation_rate']
     for feature in features:
         if len(df[feature].unique()) == 1:
             continue
