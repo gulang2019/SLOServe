@@ -21,6 +21,10 @@ LIST_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     ),
 }
 
+TRACE_APPEND_LIST_ALIASES: dict[str, tuple[str, ...]] = {
+    "extra_policies": ("extra_policy",),
+}
+
 SCALAR_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "window": (),
     "model_name": (),
@@ -177,6 +181,14 @@ def _normalize_list_value(value: Any, *, field_name: str) -> list[str]:
     return [_format_scalar(value)]
 
 
+def _append_unique_list(base: list[str], extra: list[str]) -> list[str]:
+    merged = list(base)
+    for item in extra:
+        if item not in merged:
+            merged.append(item)
+    return merged
+
+
 def _parse_legacy_trace_config(value: str) -> dict[str, Any]:
     parts = value.split()
     if len(parts) < 3:
@@ -312,7 +324,21 @@ def _normalize_trace_spec(spec: Any, base: dict[str, Any] | None = None) -> dict
             locked_fields=explicit_scalar_fields,
         )
         if cleaned_extra_args:
-            normalized["extra_args"] = cleaned_extra_args
+            normalized["extra_args"] = [
+                *normalized.get("extra_args", []),
+                *cleaned_extra_args,
+            ]
+
+    extra_policies = _pick_field_value(
+        raw_spec,
+        "extra_policies",
+        TRACE_APPEND_LIST_ALIASES["extra_policies"],
+    )
+    if extra_policies is not None:
+        normalized["policies"] = _append_unique_list(
+            normalized.get("policies", []),
+            _normalize_list_value(extra_policies, field_name="extra_policies"),
+        )
 
     return normalized
 

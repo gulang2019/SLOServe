@@ -1,5 +1,5 @@
 {
-  "experiment_name": "e2e",
+  "experiment_name": "e2e_7B",
   "extends": [
     "base.json"
   ],
@@ -8,32 +8,60 @@
     "llumnix_load:qlm",
     "round_robin:atfc",
     "slosserve_planner:atfc",
+    "slosserve_planner_oracle_mem:atfc",
     "round_robin-disagg:qlm",
     "llumnix_load-disagg:qlm",
     "round_robin-disagg:atfc",
     "slosserve_disagg_planner:atfc",
-    "slosserve_planner_oracle_mem:atfc"
+    "slosserve_disagg_planner_oracle_mem:atfc"
   ],
   "traces": [
-    "azure_code_23:azure_code_23",
+    "sharegpt_code:azure_code_23",
     "azure_chat_23:azure_chat_23",
-    "sharegpt_code:azure_code_23"
+    "sharegpt_code:azure_code_23+azure_chat_23:azure_chat_23",
+    "sharegpt_chat:azure_chat_23",
+    "reasoning:azure_chat_23"
   ],
   "configs": {
-    "azure_code_23:azure_code_23": {
+    "sharegpt_code:azure_code_23": {
       "window": "t1200:1800",
       "load_scale": 1.0,
-      "n_devices": [8,6,4,2]
+      "n_devices": [8,6,4,2,1],
+      "slo_tpot": [0.025],
+      "extra_policies": ["slosserve_planner_ablation-no_local:atfc",
+    "slosserve_planner_ablation-no_global:atfc",
+    "round_robin:sarathi",
+    "round_robin:vllm"]
     },
     "azure_chat_23:azure_chat_23": {
       "window": "t1200:1800",
       "load_scale": 1.0,
-      "n_devices": [8,6,4,2]
+      "n_devices": [8,6,4,3,2,1],
+      "slo_tpot": [0.025],
+      "extra_policies": ["slosserve_planner_ablation-no_local:atfc",
+                          "slosserve_planner_ablation-no_global:atfc",
+                          "round_robin:sarathi",
+                          "round_robin:vllm"]
     },
-    "sharegpt_code:azure_code_23": {
+    "sharegpt_code:azure_code_23+azure_chat_23:azure_chat_23": {
       "window": "t1200:1800",
       "load_scale": 1.0,
-      "n_devices": [8,6,4,2]
+      "n_devices": [8,6,4,3,2,1],
+      "slo_tpot": [0.025]
+    },
+    "reasoning:azure_chat_23": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [8,6,4,2,1],
+      "slo_tpot": [0.025]
+    },
+    "sharegpt_chat:azure_chat_23": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [8,6,4,2,1],
+      "extra_args": "--enable_session_replay --session_pause_s 5",
+      "slo_tpot": [0.025],
+      "extra_policies": ["round_robin_session:atfc", "round_robin_session:qlm"]
     }
   }
 }

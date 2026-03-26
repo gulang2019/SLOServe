@@ -114,6 +114,48 @@ def _parse_positive_int(
     return value
 
 
+def _resolve_trace_tensor_parallel_size(
+    args: list[str],
+    *,
+    field_name: str,
+    findings: list[Finding],
+    trace: str,
+    required: bool,
+) -> int | None:
+    try:
+        tp_raw, tp_occurrences = _extract_last_flag_value(
+            args,
+            "--tensor_parallel_size",
+        )
+    except ValueError as exc:
+        _append_finding(findings, "error", f"trace {trace}: {field_name}: {exc}")
+        return None
+
+    if tp_occurrences > 1:
+        _append_finding(
+            findings,
+            "warning",
+            f"trace {trace}: {field_name} sets --tensor_parallel_size multiple times; the last value wins",
+        )
+
+    if tp_raw is None:
+        if not required:
+            return None
+        _append_finding(
+            findings,
+            "error",
+            f"trace {trace}: {field_name} does not set --tensor_parallel_size",
+        )
+        return None
+
+    return _parse_positive_int(
+        tp_raw,
+        field_name=f"{field_name} tensor_parallel_size",
+        findings=findings,
+        trace=trace,
+    )
+
+
 def build_config_sanity_report(config_path: str | Path) -> ConfigSanityReport:
     config_name = Path(config_path).name
     findings: list[Finding] = []
@@ -186,30 +228,6 @@ def build_config_sanity_report(config_path: str | Path) -> ConfigSanityReport:
             + ", ".join(trace_model_names),
         )
 
-    server_extra_args = _split_shell_args(normalized.get("extra_server_args"))
-    try:
-        server_tp_raw, server_tp_occurrences = _extract_last_flag_value(
-            server_extra_args, "--tensor_parallel_size"
-        )
-    except ValueError as exc:
-        _append_finding(findings, "error", f"extra_server_args: {exc}")
-        server_tp_raw = None
-        server_tp_occurrences = 0
-
-    server_tp: int | None = 1
-    if server_tp_raw is not None:
-        server_tp = _parse_positive_int(
-            server_tp_raw,
-            field_name="extra_server_args tensor_parallel_size",
-            findings=findings,
-        )
-    if server_tp_occurrences > 1:
-        _append_finding(
-            findings,
-            "warning",
-            "extra_server_args sets --tensor_parallel_size multiple times; the last value wins",
-        )
-
     for trace, spec in trace_specs.items():
         window_hours = parse_window_seconds(spec["window"]) / 3600.0
         if window_hours <= 0.0:
@@ -263,31 +281,16 @@ def build_config_sanity_report(config_path: str | Path) -> ConfigSanityReport:
         if declared_tp is None:
             continue
 
-        try:
-            trace_extra_tp_raw, trace_extra_tp_occurrences = _extract_last_flag_value(
-                _split_shell_args(spec.get("extra_args")),
-                "--tensor_parallel_size",
-            )
-        except ValueError as exc:
-            _append_finding(findings, "error", f"trace {trace}: extra_args: {exc}")
-            continue
-
         effective_bench_tp = declared_tp
-        if trace_extra_tp_occurrences > 1:
-            _append_finding(
-                findings,
-                "warning",
-                f"trace {trace}: extra_args sets --tensor_parallel_size multiple times; the last value wins",
-            )
-        if trace_extra_tp_raw is not None:
-            parsed_trace_extra_tp = _parse_positive_int(
-                trace_extra_tp_raw,
-                field_name="extra_args tensor_parallel_size",
-                findings=findings,
-                trace=trace,
-            )
-            if parsed_trace_extra_tp is None:
-                continue
+        trace_extra_args = _split_shell_args(spec.get("extra_args"))
+        parsed_trace_extra_tp = _resolve_trace_tensor_parallel_size(
+            trace_extra_args,
+            field_name="extra_args",
+            findings=findings,
+            trace=trace,
+            required=False,
+        ) if trace_extra_args else None
+        if parsed_trace_extra_tp is not None:
             effective_bench_tp = parsed_trace_extra_tp
             if parsed_trace_extra_tp != declared_tp:
                 _append_finding(
@@ -296,6 +299,18 @@ def build_config_sanity_report(config_path: str | Path) -> ConfigSanityReport:
                     f"trace {trace}: extra_args overrides tensor_parallel_size from "
                     f"{declared_tp} to {parsed_trace_extra_tp}",
                 )
+
+        trace_server_args_map = normalized.get("trace_server_args", {})
+        trace_server_args = _split_shell_args(trace_server_args_map.get(trace))
+        server_tp = _resolve_trace_tensor_parallel_size(
+            trace_server_args,
+            field_name="trace_server_args",
+            findings=findings,
+            trace=trace,
+            required=True,
+        )
+        if server_tp is None:
+            continue
 
         if server_tp is not None and server_tp != effective_bench_tp:
             _append_finding(

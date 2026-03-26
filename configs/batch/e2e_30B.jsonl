@@ -1,5 +1,5 @@
 {
-  "experiment_name": "e2e",
+  "experiment_name": "e2e_30B_TP2",
   "model_name": "Qwen/Qwen3-30B-A3B",
   "tensor_parallel_size": 2,
   "extends": [
@@ -13,25 +13,46 @@
     "slosserve_planner_oracle_mem:atfc"
   ],
   "traces": [
-    "azure_code_23:azure_code_23",
+    "sharegpt_code:azure_code_23",
     "azure_chat_23:azure_chat_23",
-    "sharegpt_code:azure_code_23"
+    "sharegpt_code:azure_code_23+azure_chat_23:azure_chat_23",
+    "sharegpt_chat:azure_chat_23",
+    "reasoning:azure_chat_23"
   ],
   "configs": {
-    "azure_code_23:azure_code_23": {
+    "sharegpt_code:azure_code_23": {
       "window": "t1200:1800",
       "load_scale": 1.0,
-      "n_devices": [8,6,4,2,1]
+      "n_devices": [8,6,4,2,1],
+      "slo_tpot": [0.025],
+      "extra_policies": ["slosserve_planner_ablation-no_local:atfc",
+    "slosserve_planner_ablation-no_global:atfc"]
     },
     "azure_chat_23:azure_chat_23": {
       "window": "t1200:1800",
       "load_scale": 1.0,
-      "n_devices": [8,6,4,2,1]
+      "n_devices": [8,6,4,2,1],
+      "slo_tpot": [0.025]
     },
-    "sharegpt_code:azure_code_23": {
+    "sharegpt_code:azure_code_23+azure_chat_23:azure_chat_23": {
       "window": "t1200:1800",
       "load_scale": 1.0,
-      "n_devices": [8,6,4,2,1]
+      "n_devices": [8,6,4,2,1],
+      "slo_tpot": [0.025]
+    },
+    "reasoning:azure_chat_23": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [8,6,4,2,1],
+      "slo_tpot": [0.025]
+    },
+    "sharegpt_chat:azure_chat_23": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [8,6,4,2,1],
+      "extra_args": "--enable_session_replay --session_pause_s 5",
+      "slo_tpot": [0.025],
+      "extra_policies": ["round_robin_session:atfc", "round_robin_session:qlm"]
     }
   },
   "extra_server_args": "--ray_address 10.202.0.8:6379 --worker_env NCCL_IB_DISABLE=1,NCCL_NET=Socket,LD_LIBRARY_PATH=/home/siyuanc_google_com/workspace/SLOsServe/.venv/lib/python3.10/site-packages/cv2"

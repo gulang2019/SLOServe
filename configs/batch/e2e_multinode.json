@@ -1,5 +1,5 @@
 {
-  "experiment_name": "e2e_multinode",
+  "experiment_name": "e2e_multinode_newer",
   "server_clients": "0-15",
   "extends": [
     "base.json"
@@ -13,10 +13,11 @@
   ],
   "traces": [
     "azure_chat:azure_chat",
-    "azure_code:azure_code"
+    "sharegpt_code:azure_code",
+    "sharegpt_chat:azure_chat"
   ],
   "configs": {
-    "azure_code:azure_code": {
+    "sharegpt_code:azure_code": {
       "window": "t1200:1800",
       "load_scale": 1.0,
       "n_devices": [16,12,8,4]
@@ -25,6 +26,13 @@
       "window": "t1200:1800",
       "load_scale": 1.0,
       "n_devices": [16,12,8,4]
+    },
+    "sharegpt_chat:azure_chat": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [16,12,8,4],
+      "extra_args": "--enable_session_replay --session_pause_s 5",
+      "extra_policies": ["round_robin_session:atfc", "round_robin_session:qlm"]
     }
   },
   "extra_server_args": "--ray_address 10.202.0.4:6379"

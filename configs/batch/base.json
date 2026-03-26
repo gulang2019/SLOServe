@@ -7,7 +7,7 @@
     "slo_routing_overhead": 0.05,
     "scheduling_overhead": 0.003,
     "routing_overhead": -1.0,
-    "routing_fallback_policy": "reject",
+    "routing_fallback_policy": "asap",
     "tensor_parallel_size": 1,
     "load_scales": [1.0],
     "ttft_slo_scales": [5.0],
