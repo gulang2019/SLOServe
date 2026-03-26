@@ -3357,11 +3357,11 @@ def run(
         ncols = min(3, n_groups)
         nrows = math.ceil(n_groups / ncols)
         for xlabel, ylabel in [
-            (xlabel, 'energy_est'),
-            (xlabel, 'slo_violation_rate'),
-            (xlabel, 'energy_consumption'),
-            (xlabel, 'energy_consumption_active'),
-            (xlabel, 'energy_consumption_non_idle'),
+            (feature, 'energy_est'),
+            (feature, 'slo_violation_rate'),
+            (feature, 'energy_consumption'),
+            (feature, 'energy_consumption_active'),
+            (feature, 'energy_consumption_non_idle'),
             ('slo_violation_rate', 'energy_consumption')
         ]:
             if ylabel not in df.columns:
