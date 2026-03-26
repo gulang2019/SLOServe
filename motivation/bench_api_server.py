@@ -2,6 +2,7 @@ import tqdm
 import time
 import asyncio
 import os
+import copy
 from typing import Tuple, List, Dict, Any
 import subprocess
 from dataclasses import dataclass, field, asdict
@@ -277,7 +278,7 @@ def _log_perf_model_errors_from_batch_events(
     old_hardware_params = list(
         PerfModel.get_perf_model(
             problem.model_name,
-            problem.length_pattern,
+            problem.perf_model_task,
         ).hardware_params
     )
     fit_result = fit_linear_perf_model(batch_times)
@@ -297,6 +298,7 @@ def _log_perf_model_errors_from_batch_events(
     summary = {
         "model_name": problem.model_name,
         "length_pattern": problem.length_pattern,
+        "perf_model_task": problem.perf_model_task,
         "store_prefix": problem.store_prefix,
         "event_file": event_file,
         "perf_model_err": float(problem.perf_model_err),
@@ -332,7 +334,7 @@ def _log_perf_model_errors_from_batch_events(
             estimated_times,
             measured_times,
             figure_path or Path(output_path).with_suffix(".png"),
-            title=f"{get_easy_name(problem.model_name)} [{problem.length_pattern}]",
+            title=f"{get_easy_name(problem.model_name)} [{problem.perf_model_task}]",
         )
         if plotted_figure_path is not None:
             summary["estimated_vs_measured_figure_path"] = str(plotted_figure_path)
@@ -364,6 +366,8 @@ class Problem:
     model_name: str = 'Qwen/Qwen2.5-7B-Instruct'
     arrival_pattern: str = 'azure_code_23'
     length_pattern: str = 'azure_code_23'
+    trace_spec: str = 'azure_code_23'
+    perf_model_task: str = 'azure_code_23'
     window: str = '0:10'
     perf_model_err: float = 1.0 # the factor between used performance model and real performance model.
     
@@ -423,6 +427,129 @@ def compute_ttft_slo(
         + float(slo_ttft_per_token) * new_tokens
         + float(slo_routing_overhead)
     )
+
+
+def _split_trace_components(trace_spec: str) -> list[str]:
+    trace_spec = str(trace_spec).strip()
+    if not trace_spec:
+        raise ValueError("trace spec must be non-empty")
+
+    if "+" in trace_spec:
+        components = [component.strip() for component in trace_spec.split("+")]
+        components = [component for component in components if component]
+        if not components:
+            raise ValueError(f"invalid mixed trace spec: {trace_spec}")
+        return components
+
+    if trace_spec.count(":") <= 1:
+        return [trace_spec]
+
+    if "-" in trace_spec:
+        components = [component.strip() for component in trace_spec.split("-")]
+        if components and all(component and component.count(":") <= 1 for component in components):
+            return components
+        raise ValueError(
+            "ambiguous mixed trace spec using '-'. "
+            "Use '+' between components when dataset names contain '-': "
+            f"{trace_spec}"
+        )
+
+    raise ValueError(
+        "invalid mixed trace spec. Expected TRACE or TRACE+TRACE where each TRACE is "
+        "LENGTH[:ARRIVAL]. "
+        f"Got: {trace_spec}"
+    )
+
+
+def _parse_trace_spec(trace_spec: str) -> list[tuple[str, str]]:
+    components: list[tuple[str, str]] = []
+    for component in _split_trace_components(trace_spec):
+        if ":" in component:
+            length_pattern, arrival_pattern = component.split(":", 1)
+        else:
+            length_pattern = arrival_pattern = component
+        length_pattern = length_pattern.strip()
+        arrival_pattern = arrival_pattern.strip()
+        if not length_pattern or not arrival_pattern:
+            raise ValueError(f"invalid trace component: {component}")
+        components.append((length_pattern, arrival_pattern))
+    return components
+
+
+def _perf_model_task_for_trace_spec(trace_spec: str) -> str:
+    components = _parse_trace_spec(trace_spec)
+    unique_length_patterns = {length_pattern for length_pattern, _ in components}
+    if len(unique_length_patterns) == 1:
+        return components[0][0]
+    return "default"
+
+
+def _load_trace_inputs(
+    trace_spec: str,
+    *,
+    model_name: str,
+    load_scale: float,
+    window: str,
+) -> tuple[list[Request], list[float], list[tuple[str, str]]]:
+    components = _parse_trace_spec(trace_spec)
+    window_start, window_end = window.split(":")
+    max_tokens = get_model_max_tokens(model_name)
+
+    if len(components) == 1:
+        length_pattern, arrival_pattern = components[0]
+        arrival_times = ArrivalTimes.load(
+            arrival_pattern,
+            load_scale,
+            window_start=window_start,
+            window_end=window_end,
+        ).arrival_times
+        requests = Requests.load(
+            length_pattern,
+            window_start=0,
+            window_end=len(arrival_times),
+            max_tokens=max_tokens,
+        ).requests
+        n_items = min(len(requests), len(arrival_times))
+        requests = [copy.deepcopy(request) for request in requests[:n_items]]
+        arrival_times = list(arrival_times[:n_items])
+        return requests, arrival_times, components
+
+    merged_pairs: list[tuple[float, int, Request]] = []
+    for source_idx, (length_pattern, arrival_pattern) in enumerate(components):
+        component_arrivals = ArrivalTimes.load(
+            arrival_pattern,
+            load_scale,
+            window_start=window_start,
+            window_end=window_end,
+        ).arrival_times
+        component_requests = Requests.load(
+            length_pattern,
+            window_start=0,
+            window_end=len(component_arrivals),
+            max_tokens=max_tokens,
+        ).requests
+        n_items = min(len(component_requests), len(component_arrivals))
+        component_arrivals = list(component_arrivals[:n_items])
+        component_requests = [copy.deepcopy(request) for request in component_requests[:n_items]]
+        for request in component_requests:
+            if request.session_id is not None:
+                request.session_id = f"mix{source_idx}:{request.session_id}"
+        logger.info(
+            "Mixed trace component %d: lengths=%s arrivals=%s kept=%d",
+            source_idx,
+            length_pattern,
+            arrival_pattern,
+            n_items,
+        )
+        merged_pairs.extend(
+            (float(arrival_time), source_idx, request)
+            for arrival_time, request in zip(component_arrivals, component_requests)
+        )
+
+    merged_pairs.sort(key=lambda item: (item[0], item[1]))
+    merged_arrival_times = [arrival_time for arrival_time, _, _ in merged_pairs]
+    merged_requests = [request for _, _, request in merged_pairs]
+    return merged_requests, merged_arrival_times, components
 
 
 def _build_request_payload(
@@ -572,13 +699,13 @@ def _make_overload_run_result(
     requested_n_devices: int,
     error: Exception,
 ) -> TerminalRunResult:
-    window_start, window_end = problem.window.split(':')
-    arrival_times = ArrivalTimes.load(
-        problem.arrival_pattern,
-        problem.load_scale,
-        window_start=window_start,
-        window_end=window_end,
-    ).arrival_times
+    trace_spec = problem.trace_spec or problem.length_pattern
+    _, arrival_times, _ = _load_trace_inputs(
+        trace_spec,
+        model_name=problem.model_name,
+        load_scale=problem.load_scale,
+        window=problem.window,
+    )
     if len(arrival_times) > 1 and arrival_times[-1] > arrival_times[0]:
         rps = len(arrival_times) / (arrival_times[-1] - arrival_times[0])
     else:
@@ -1700,19 +1827,16 @@ async def main(
     *,
     update_clients: bool = True,
 ):
-    window_start, window_end = problem.window.split(':')
-    arrival_times = ArrivalTimes.load(problem.arrival_pattern, 
-                                      problem.load_scale, 
-                                      window_start = window_start, 
-                                      window_end = window_end)
-    print('arrival_times:', arrival_times.arrival_times[0], '->', arrival_times.arrival_times[-1])
-    requests = Requests.load(problem.length_pattern, 
-                            window_start = 0,
-                            window_end = len(arrival_times.arrival_times),
-                            max_tokens = get_model_max_tokens(problem.model_name))
-
-    requests = requests.requests
-    arrival_times = arrival_times.arrival_times
+    trace_spec = problem.trace_spec or problem.length_pattern
+    requests, arrival_times, trace_components = _load_trace_inputs(
+        trace_spec,
+        model_name=problem.model_name,
+        load_scale=problem.load_scale,
+        window=problem.window,
+    )
+    if trace_components:
+        print(f"trace_components: {trace_components}")
+    print('arrival_times:', arrival_times[0], '->', arrival_times[-1])
     arrival_base_time = arrival_times[0]
     requested_n_devices = problem.n_devices
     original_request_count = len(requests)
@@ -1762,7 +1886,7 @@ async def main(
     rps = len(trace_request_indices) / (arrival_times[-1] - arrival_times[0])
     
     from SLOsServe.perf_model import PerfModel
-    perf_model = PerfModel.get_perf_model(problem.model_name, problem.length_pattern)
+    perf_model = PerfModel.get_perf_model(problem.model_name, problem.perf_model_task)
     
     prepare_request_prompts(
         requests,
@@ -2149,7 +2273,7 @@ async def main(
     events, reqs = analyze_events(filename, verbose = True)
     results = analyze_slo_violation(reqs, events, 
                                     model_name = problem.model_name, 
-                                    length_pattern = problem.length_pattern,
+                                    length_pattern = problem.perf_model_task,
                                     ttft_slo_scale = problem.ttft_slo_scale, 
                                     slo_tpot = problem.slo_tpot, 
                                     slo_ttft_overhead = problem.slo_routing_overhead,
@@ -2440,20 +2564,16 @@ def build_problems(
         f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
         f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
         f'{session_replay_suffix}{baseline_cap_suffix}')
-    
-    if ":" in trace: 
-        requests_trace, arrival_times_trace = trace.split(":")
-    else:
-        requests_trace = trace
-        arrival_times_trace = trace
-    
-    window_start, window_end = window.split(':')
-    arrival_times = ArrivalTimes.load(arrival_times_trace, 
-                                      load_scale, 
-                                      window_start = window_start, 
-                                      window_end = window_end)
-    requests = Requests.load(requests_trace, window_start = 0, window_end = len(arrival_times.arrival_times), 
-                            max_tokens = get_model_max_tokens(model_name)).requests
+    requests_trace = trace
+    arrival_times_trace = trace
+    perf_model_task = _perf_model_task_for_trace_spec(trace)
+    requests, arrival_times, trace_components = _load_trace_inputs(
+        trace,
+        model_name=model_name,
+        load_scale=load_scale,
+        window=window,
+    )
+    print(f'trace_components: {trace_components}')
     
     input_lengths = np.fromiter((request.input_length for request in requests), dtype=np.float64, count=len(requests))
     output_lengths = np.fromiter((request.output_length for request in requests), dtype=np.float64, count=len(requests))
@@ -2484,7 +2604,7 @@ def build_problems(
     )
     print(f'max_output_length: {max_output_length}')
     from SLOsServe.perf_model import PerfModel
-    perf_model = PerfModel.get_perf_model(model_name, requests_trace)
+    perf_model = PerfModel.get_perf_model(model_name, perf_model_task)
     max_decode_batch_size = perf_model.get_max_decode_batch_size(slo_tpot, average_input_length)
     decode_zero_load = perf_model.get_batch_time([(0, 1)])
     
@@ -2859,6 +2979,8 @@ def build_problems(
         model_name = model_name,
         arrival_pattern = arrival_times_trace,
         length_pattern = requests_trace,
+        trace_spec = trace,
+        perf_model_task = perf_model_task,
         window = window,
         load_scale = load_scale,
         n_devices = n_device,
@@ -3286,7 +3408,7 @@ python motivation/bench_api_server.py \
     --model_name Qwen/Qwen2.5-7B-Instruct \
     --slo strict \
     --profit constant \
-    --trace azure_code_23 \
+    --trace azure_code_23+azure_chat_23 \
     --window 0:10 \
     --load_scale 1.0 \
     --n_devices 2 4 8
@@ -3303,7 +3425,18 @@ if __name__ == '__main__':
     parser.add_argument('--ttft_slo_scales', type=float, default=[2.0], nargs='+', help = 'list of relative ttft slo (defined as slowdown to zero-load ttft)')
     parser.add_argument('--slo_tpots', type=float, default=[2.0], nargs='+', help = 'list of relative tpot slo (defined as absolute tpot per token in seconds)')
     parser.add_argument('--profit', type=str, default='constant', choices=['constant', 'weighted'])
-    parser.add_argument('--trace', type=str, nargs = '+', default=['azure_code_23'], help = 'list of traces to run LENGTH:ARRIVAL [ARRIVAL:LENGTH ...]')
+    parser.add_argument(
+        '--trace',
+        type=str,
+        nargs='+',
+        default=['azure_code_23'],
+        help=(
+            "list of trace specs to run. Each spec is TRACE or LENGTH:ARRIVAL. "
+            "Use '+' to mix multiple sources in one run, for example "
+            "'azure_chat_23:azure_chat_23+azure_code_23:azure_code_23'. "
+            "A legacy '-' separator is accepted only when dataset names are unambiguous."
+        ),
+    )
     parser.add_argument('--window', type=str, default='0:1000', help = 'window of trace to run (inclusive)')
     parser.add_argument('--n_devices', type=int, default=[1,2,4,8], nargs='+', help = 'list of logical replicas to run')
     parser.add_argument('--tensor_parallel_size', type=int, default=1, help='number of GPUs per logical replica')

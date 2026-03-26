@@ -94,10 +94,24 @@ class BatchPlanner:
     _max_time: int = 5
     _cpp_adm_ctrl_iterations: int = 0
     _cpp_schedule_iterations: int = 0
+    _fast_sched_perf_mode: str = "full"
+    _apply_perf_model_headroom: bool = True
     
     
     def __post_init__(self):
-        self._perf_model.hardware_params[4] += PERF_MODEL_HEADROOM
+        if self._apply_perf_model_headroom:
+            self._perf_model.hardware_params[4] += PERF_MODEL_HEADROOM
+        fast_sched_perf_mode = os.getenv(
+            "SLOSERVE_PY_FAST_SCHED_PERF_MODE",
+            "full",
+        ).strip().lower()
+        if fast_sched_perf_mode not in {"full", "ignore_req", "ignore_past", "tokens_only"}:
+            logger.warning(
+                "[BatchPlanner] Unknown SLOSERVE_PY_FAST_SCHED_PERF_MODE=%r; falling back to 'full'",
+                fast_sched_perf_mode,
+            )
+            fast_sched_perf_mode = "full"
+        self._fast_sched_perf_mode = fast_sched_perf_mode
         # Initialize C++ admission controller; TPOT is set lazily per request mix.
         self._adm_ctrler = SLOsServe_C.AdmCtrlScheduler("edf_sim", self._block_size, False, False)
         self._adm_ctrler_tpot = None
@@ -111,6 +125,75 @@ class BatchPlanner:
 
     def _get_batch_time(self, batch: Batch):
         return self._perf_model.get_batch_time([(self._requests[req_id].num_computed_tokens, v) for req_id, v in batch.n_scheduled_tokens.items()])
+
+    def _fast_sched_perf_terms(
+        self,
+        *,
+        num_reqs: int,
+        num_past_tokens: int,
+    ) -> tuple[int, int]:
+        if self._fast_sched_perf_mode == "ignore_req":
+            return 0, num_past_tokens
+        if self._fast_sched_perf_mode == "ignore_past":
+            return num_reqs, 0
+        if self._fast_sched_perf_mode == "tokens_only":
+            return 0, 0
+        return num_reqs, num_past_tokens
+
+    def _fast_sched_get_batch_time(self, batch: list[tuple[int, int]]) -> float:
+        if self._fast_sched_perf_mode == "full":
+            return self._perf_model.get_batch_time(batch)
+        hardware_params = self._perf_model.hardware_params
+        num_reqs = len(batch)
+        num_tot_tokens = sum(n_tokens for _n_past, n_tokens in batch)
+        num_past_tokens = sum(n_past for n_past, _n_tokens in batch)
+        num_decode_steps = 1
+        num_reqs, num_past_tokens = self._fast_sched_perf_terms(
+            num_reqs=num_reqs,
+            num_past_tokens=num_past_tokens,
+        )
+        online_spike_slack = getattr(self._perf_model, "_online_spike_slack", 0.0)
+        return (
+            hardware_params[0] * num_tot_tokens
+            + hardware_params[1] * num_reqs
+            + hardware_params[2] * num_past_tokens
+            + hardware_params[3] * num_decode_steps
+            + hardware_params[4]
+            + online_spike_slack
+        )
+
+    def _fast_sched_get_bs(
+        self,
+        t: float,
+        *,
+        num_reqs: int,
+        num_past_tokens: int = 0,
+        num_decode_steps: int = 1,
+    ) -> int:
+        if self._fast_sched_perf_mode == "full":
+            return self._perf_model.get_bs(
+                t,
+                num_reqs=num_reqs,
+                num_past_tokens=num_past_tokens,
+                num_decode_steps=num_decode_steps,
+            )
+        hardware_params = self._perf_model.hardware_params
+        num_reqs, num_past_tokens = self._fast_sched_perf_terms(
+            num_reqs=num_reqs,
+            num_past_tokens=num_past_tokens,
+        )
+        online_spike_slack = getattr(self._perf_model, "_online_spike_slack", 0.0)
+        return int(
+            (
+                t
+                - hardware_params[4]
+                - online_spike_slack
+                - hardware_params[3] * num_decode_steps
+                - hardware_params[2] * num_past_tokens
+                - hardware_params[1] * num_reqs
+            )
+            / hardware_params[0]
+        )
 
     def _get_num_blocks(self, n_tokens: int) -> int:
         if n_tokens <= 0:
@@ -435,14 +518,18 @@ class BatchPlanner:
             self._requests.pop(req_id) 
         
         self._num_free_blocks = num_free_blocks 
-        self._next_batch_time = max(self._next_batch_time or 0, self._now())
+        # After the batch actually commits, use the real completion time as the
+        # next scheduling baseline. Keeping a later predicted end here shrinks
+        # slack for subsequent admission/scheduling decisions even though the
+        # engine is already idle.
+        self._next_batch_time = self._now()
         # is_feasible, self._batch_plan, reason = self._refresh_c()
         # if not is_feasible:
             # logger.info(f'[BatchPlanner]: Infeasibility detected. {reason=}')
 
     def _refresh_fast(self) -> tuple[bool, list[Batch], str | None]:
         now = max(self._next_batch_time or 0, self._now())
-        baseline_batch_time = self._perf_model.get_batch_time([(0, 256)])
+        baseline_batch_time = self._fast_sched_get_batch_time([(0, 256)])
         load_ddls = sorted(
             [
                 (req_id, req.get_next_ddl() - now, req.get_next_load())
@@ -454,7 +541,6 @@ class BatchPlanner:
         if not load_ddls:
             return True, [], "|"
 
-        cutoff = baseline_batch_time
         regular_load_ddls = [
             x for x in load_ddls
             if self._requests[x[0]].service_tier != "best_effort"
@@ -463,39 +549,42 @@ class BatchPlanner:
             x for x in load_ddls
             if self._requests[x[0]].service_tier == "best_effort"
         ]
-        feasible_load_ddls = [x for x in regular_load_ddls if x[1] >= cutoff]
-        overdue_load_ddls = [x for x in regular_load_ddls if x[1] < cutoff]
+        recovery_cutoff = 0.0
+        recovering_overdue_regular = bool(
+            regular_load_ddls and regular_load_ddls[0][1] < recovery_cutoff
+        )
 
-        if feasible_load_ddls:
-            batch_time_budget = feasible_load_ddls[0][1]
+        if regular_load_ddls and not recovering_overdue_regular:
+            # Keep all regular requests in one EDF queue. The old baseline-time
+            # cutoff moved near-deadline regular work behind "feasible" work,
+            # which broke admission/scheduler parity.
+            batch_time_budget = max(regular_load_ddls[0][1], baseline_batch_time)
             batch_size = self._cap_batch_size(
-                self._perf_model.get_bs(batch_time_budget, num_reqs=1))
+                self._fast_sched_get_bs(batch_time_budget, num_reqs=1))
         elif regular_load_ddls:
-            # Recover overdue work aggressively without exceeding the engine
-            # token budget.
+            # If the earliest regular request is already overdue, recover
+            # aggressively without exceeding the engine token budget.
             batch_size = self._cap_batch_size(16384)
-            batch_time_budget = self._perf_model.get_batch_time([(0, batch_size)])
+            batch_time_budget = self._fast_sched_get_batch_time([(0, batch_size)])
         else:
             # If only downgraded work remains, let it use the leftover engine
             # capacity while still respecting the batch-size limit.
             batch_size = self._cap_batch_size(16384)
-            batch_time_budget = self._perf_model.get_batch_time([(0, batch_size)])
+            batch_time_budget = self._fast_sched_get_batch_time([(0, batch_size)])
 
         b = Batch(start_time=now, unscheduled_tokens=batch_size)
         total_scheduled_tokens = 0
         total_past_tokens = 0
         num_scheduled_reqs = 0
-        # Give missed deadlines only whatever capacity remains after EDF-feasible
-        # work, then let downgraded best-effort requests consume whatever is left.
-        for req_id, _next_ddl, next_load in (
-            feasible_load_ddls + overdue_load_ddls + best_effort_load_ddls
-        ):
+        # Schedule regular traffic in pure EDF order, then let downgraded
+        # best-effort requests consume any leftover capacity.
+        for req_id, _next_ddl, next_load in regular_load_ddls + best_effort_load_ddls:
             if b.unscheduled_tokens <= 0:
                 break
             req = self._requests[req_id]
             composition_limited_bs = max(
                 0,
-                self._perf_model.get_bs(
+                self._fast_sched_get_bs(
                     batch_time_budget,
                     num_reqs=num_scheduled_reqs + 1,
                     num_past_tokens=total_past_tokens + req.num_computed_tokens,
@@ -521,7 +610,10 @@ class BatchPlanner:
                     'load_ddls': load_ddls,
                     'sch': b.n_scheduled_tokens,
                     'unsched_tokens': b.unscheduled_tokens,
-                    'cutoff': cutoff,
+                    'cutoff': baseline_batch_time,
+                    'recovery_cutoff': recovery_cutoff,
+                    'recovering_overdue_regular': recovering_overdue_regular,
+                    'fast_sched_perf_mode': self._fast_sched_perf_mode,
                     'total_past_tokens': total_past_tokens,
                     'total_scheduled_tokens': total_scheduled_tokens,
                     'num_scheduled_reqs': num_scheduled_reqs

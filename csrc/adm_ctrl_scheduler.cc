@@ -1288,8 +1288,6 @@ std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::_admission_co
     auto feasibility_check = [&](const std::vector<Request>& reqs) -> std::pair<bool, std::string> {
         std::vector<std::tuple<double, std::string, Request> > events;
         double tpot = planner->tpots[0];
-        double decode_bs = planner->time_to_batch(tpot);
-        double decode_time = planner->batch_to_time(decode_bs);
         for (auto& req: reqs) {
             auto next_token_ddl = get_next_ddl(req);
             if (req.arrival_time >= next_token_ddl) {
@@ -1321,13 +1319,22 @@ std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::_admission_co
         remained_tks.push_back(0);
         int remained_mem = int_remained_mem;
         size_t n_decode = 0;
+        int active_decode_past_tokens = 0;
+        std::unordered_map<std::string, int> decode_past_tokens_by_req;
         for (auto& e: events) {
             auto [t, type, req] = e;
             if (t < now) 
                 return {false, "CMP"};
-            if (n_decode > decode_bs) 
-                return {false, "CMP"};
             if (n_decode > 0) {
+                size_t decode_n_reqs = std::max<size_t>(1, n_decode);
+                size_t decode_n_past_tokens =
+                    static_cast<size_t>(std::max(0, active_decode_past_tokens));
+                int decode_bs = planner->time_to_batch(
+                    tpot, decode_n_reqs, decode_n_past_tokens, 1);
+                double decode_time = planner->batch_to_time(
+                    decode_bs, decode_n_reqs, decode_n_past_tokens, 1);
+                if (n_decode > static_cast<size_t>(decode_bs))
+                    return {false, "CMP"};
                 double elapsed = t - now;
                 size_t n_batch = std::floor(elapsed / decode_time);
                 remained_mem -= n_batch * n_decode;
@@ -1348,13 +1355,19 @@ std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::_admission_co
                     remained_tk += remained_tks[idx];
                 }
                 if (remained_tk < next_load) {
-                    auto extra_bgt = planner->time_to_batch(t - now);
+                    size_t extra_n_reqs = std::max<size_t>(1, n_decode + 1);
+                    size_t extra_n_past_tokens = static_cast<size_t>(std::max(
+                        0,
+                        active_decode_past_tokens + req.n_computed_tokens));
+                    auto extra_bgt = planner->time_to_batch(
+                        t - now, extra_n_reqs, extra_n_past_tokens, 1);
                     if ((extra_bgt + remained_tk) < next_load) {
                         return {false, "CMP"};
                     }
                     remained_tks.back() += extra_bgt;
                     remained_tk += extra_bgt; 
-                    now += planner->batch_to_time(extra_bgt);
+                    now += planner->batch_to_time(
+                        extra_bgt, extra_n_reqs, extra_n_past_tokens, 1);
                 }
                 assert (remained_tk >= next_load);
                 for (size_t idx = req_remained_tk_idx[req.id]; 
@@ -1366,11 +1379,28 @@ std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::_admission_co
                 assert (next_load == 0);
                 if (req.max_tokens > 1) {
                     n_decode += 1;
+                    int decode_req_past_tokens = std::max(
+                        req.n_computed_tokens + get_next_load(req),
+                        req.input_length);
+                    auto [it, inserted] = decode_past_tokens_by_req.emplace(
+                        req.id, decode_req_past_tokens);
+                    if (inserted) {
+                        active_decode_past_tokens += decode_req_past_tokens;
+                    } else {
+                        active_decode_past_tokens +=
+                            decode_req_past_tokens - it->second;
+                        it->second = decode_req_past_tokens;
+                    }
                 }
             }
             else if (type == "finish") {
                 n_decode -= 1;
                 remained_mem += req.input_length + req.max_tokens;
+                auto it = decode_past_tokens_by_req.find(req.id);
+                if (it != decode_past_tokens_by_req.end()) {
+                    active_decode_past_tokens -= it->second;
+                    decode_past_tokens_by_req.erase(it);
+                }
             }
             else if (type == "arrival") {
                 req_remained_tk_idx[req.id] = remained_tks.size();

@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from motivation.events_analysis import (
+    _compute_active_device_series,
     _compute_measured_power_series,
     analyze_events,
     build_active_requests_step,
@@ -182,6 +183,7 @@ def summarize_trace(
     end_time: float,
     window_size: float,
     *,
+    time_offset: float = 0.0,
     recover_idle_gaps: bool = False,
     idle_power_per_device: float = 70.0,
 ) -> dict:
@@ -190,6 +192,13 @@ def summarize_trace(
         events, start_time, end_time, window_size
     )
     typed_events, _ = analyze_events(path)
+    _, active_servers, _, _ = _compute_active_device_series(
+        typed_events,
+        window_size=window_size,
+        start_time=start_time,
+        end_time=end_time,
+        n_device=8,
+    )
     power_summary = _compute_measured_power_series(
         typed_events,
         n_device=8,
@@ -216,9 +225,10 @@ def summarize_trace(
     return {
         "path": path,
         "events": events,
-        "time": req_time,
+        "time": req_time + time_offset,
         "active_reqs": active_reqs,
-        "power_time": power_time,
+        "active_servers": np.asarray(active_servers, dtype=int),
+        "power_time": power_time + time_offset,
         "energy_bins": energy_bins,
         "power_bins": power_bins,
         "energy_bins_by_device": energy_bins_by_device,
@@ -245,6 +255,32 @@ def compute_common_window(
     end_time = min(max(left_energy_times), max(right_energy_times))
     if end_time <= start_time:
         raise ValueError("The traces do not overlap in time.")
+    return start_time, end_time
+
+
+def resolve_view_window(
+    common_start_time: float,
+    common_end_time: float,
+    *,
+    view_start: float | None,
+    view_end: float | None,
+) -> tuple[float, float]:
+    start_time = common_start_time
+    end_time = common_end_time
+    if view_start is not None:
+        start_time = common_start_time + float(view_start)
+    if view_end is not None:
+        end_time = common_start_time + float(view_end)
+    if end_time <= start_time:
+        raise ValueError(
+            f"Invalid view window: start={start_time:.3f}, end={end_time:.3f}"
+        )
+    start_time = max(common_start_time, start_time)
+    end_time = min(common_end_time, end_time)
+    if end_time <= start_time:
+        raise ValueError(
+            f"View window [{view_start}, {view_end}] is outside the common window."
+        )
     return start_time, end_time
 
 
@@ -399,6 +435,129 @@ def plot_power_vs_active_requests(
     plt.close(fig)
 
 
+def plot_active_server_distribution(
+    rr: dict,
+    planner: dict,
+    window_size: float,
+    output_prefix: str,
+) -> None:
+    rr_counts = (
+        np.bincount(rr["active_servers"])
+        if len(rr["active_servers"]) else np.array([0], dtype=float)
+    )
+    planner_counts = (
+        np.bincount(planner["active_servers"])
+        if len(planner["active_servers"]) else np.array([0], dtype=float)
+    )
+    max_len = max(len(rr_counts), len(planner_counts))
+    rr_counts = np.pad(rr_counts, (0, max_len - len(rr_counts)))
+    planner_counts = np.pad(planner_counts, (0, max_len - len(planner_counts)))
+    xs = np.arange(max_len)
+    width = 0.42
+
+    total_rr_time = max(float(np.sum(rr_counts) * window_size), 1e-12)
+    total_planner_time = max(float(np.sum(planner_counts) * window_size), 1e-12)
+    rr_pct = rr_counts * window_size * 100.0 / total_rr_time
+    planner_pct = planner_counts * window_size * 100.0 / total_planner_time
+
+    fig, ax = plt.subplots(figsize=(10, 5), tight_layout=True)
+    ax.bar(
+        xs - width / 2,
+        rr_pct,
+        width=width,
+        label="Round Robin",
+        color="#c73e1d",
+        alpha=0.75,
+    )
+    ax.bar(
+        xs + width / 2,
+        planner_pct,
+        width=width,
+        label="Packer",
+        color="#1f78b4",
+        alpha=0.75,
+    )
+    ax.set_title("Active-Machine Distribution")
+    ax.set_xlabel("Active Machines")
+    ax.set_ylabel("Window Time (%)")
+    ax.set_xticks(xs)
+    ax.legend()
+
+    fig.savefig(f"{output_prefix}.png", dpi=250, bbox_inches="tight")
+    fig.savefig(f"{output_prefix}.pdf", dpi=250, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_active_machines_and_power_over_time(
+    rr: dict,
+    planner: dict,
+    window_size: float,
+    output_prefix: str,
+) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), tight_layout=True, sharex=True)
+
+    ax = axes[0]
+    rr_avg_active = float(np.mean(rr["active_servers"])) if len(rr["active_servers"]) else 0.0
+    planner_avg_active = (
+        float(np.mean(planner["active_servers"])) if len(planner["active_servers"]) else 0.0
+    )
+    ax.step(
+        rr["time"],
+        rr["active_servers"],
+        where="post",
+        label="Round Robin",
+        color="#c73e1d",
+    )
+    ax.step(
+        planner["time"],
+        planner["active_servers"],
+        where="post",
+        label="Packer",
+        color="#1f78b4",
+    )
+    ax.axhline(
+        rr_avg_active,
+        color="#c73e1d",
+        linestyle=":",
+        linewidth=2.0,
+        label=f"Round Robin Avg = {rr_avg_active:.2f}",
+    )
+    ax.axhline(
+        planner_avg_active,
+        color="#1f78b4",
+        linestyle=":",
+        linewidth=2.0,
+        label=f"Packer Avg = {planner_avg_active:.2f}",
+    )
+    ax.set_title(f"Active Machines Over Time ({window_size:.1f}s bins)")
+    ax.set_ylabel("Active Machines")
+    ax.legend()
+
+    ax = axes[1]
+    ax.step(
+        rr["power_time"],
+        rr["power_bins"],
+        where="post",
+        label="Round Robin",
+        color="#c73e1d",
+    )
+    ax.step(
+        planner["power_time"],
+        planner["power_bins"],
+        where="post",
+        label="Packer",
+        color="#1f78b4",
+    )
+    ax.set_title(f"Total Power Over Time ({window_size:.1f}s bins)")
+    ax.set_xlabel("Time Since Common Window Start (s)")
+    ax.set_ylabel("Power (W)")
+    ax.legend()
+
+    fig.savefig(f"{output_prefix}.png", dpi=250, bbox_inches="tight")
+    fig.savefig(f"{output_prefix}.pdf", dpi=250, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_power_vs_active_requests_per_server(
     rr: dict,
     planner: dict,
@@ -500,6 +659,75 @@ def plot_power_vs_active_requests_per_server(
     plt.close(fig)
 
 
+def plot_per_server_power_over_time(
+    rr: dict,
+    planner: dict,
+    window_size: float,
+    output_prefix: str,
+) -> None:
+    device_ids = sorted(
+        set(rr["power_bins_by_device"]).union(set(planner["power_bins_by_device"]))
+    )
+    if not device_ids:
+        return
+
+    ncols = 2
+    nrows = int(math.ceil(len(device_ids) / ncols))
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(16, 4.5 * nrows),
+        tight_layout=True,
+        sharex=True,
+    )
+    axes = np.atleast_1d(axes).reshape(nrows, ncols)
+
+    for ax, device_id in zip(axes.flat, device_ids):
+        rr_power = rr["power_bins_by_device"].get(
+            device_id, np.zeros_like(rr["power_bins"], dtype=float)
+        )
+        planner_power = planner["power_bins_by_device"].get(
+            device_id, np.zeros_like(planner["power_bins"], dtype=float)
+        )
+        ax.step(
+            rr["power_time"],
+            rr_power,
+            where="post",
+            color="#c73e1d",
+            label="Round Robin",
+        )
+        ax.step(
+            planner["power_time"],
+            planner_power,
+            where="post",
+            color="#1f78b4",
+            label="Packer",
+        )
+        ax.set_title(f"Server {device_id}")
+        ax.set_xlabel("Time Since Common Window Start (s)")
+        ax.set_ylabel("Server Power (W)")
+
+    for ax in axes.flat[len(device_ids):]:
+        ax.axis("off")
+
+    fig.legend(
+        [
+            plt.Line2D([0], [0], color="#c73e1d", lw=2),
+            plt.Line2D([0], [0], color="#1f78b4", lw=2),
+        ],
+        ["Round Robin", "Packer"],
+        loc="upper center",
+        ncol=2,
+    )
+    fig.suptitle(
+        f"Per-Server Power Over Time ({window_size:.1f}s bins)",
+        y=1.02,
+    )
+    fig.savefig(f"{output_prefix}.png", dpi=250, bbox_inches="tight")
+    fig.savefig(f"{output_prefix}.pdf", dpi=250, bbox_inches="tight")
+    plt.close(fig)
+
+
 def print_summary(rr: dict, planner: dict, start_time: float, end_time: float, window_size: float) -> None:
     print(f"Common window: [{start_time:.3f}, {end_time:.3f}] ({end_time - start_time:.3f} s)")
     print(f"Window size: {window_size:.3f} s")
@@ -521,6 +749,18 @@ def main() -> None:
     parser.add_argument("--rr", required=True, help="Round-robin events trace")
     parser.add_argument("--packer", required=True, help="Packed planner events trace")
     parser.add_argument("--window-size", type=float, default=1.0)
+    parser.add_argument(
+        "--view-start",
+        type=float,
+        default=None,
+        help="Optional zoom start in seconds since the common window start.",
+    )
+    parser.add_argument(
+        "--view-end",
+        type=float,
+        default=None,
+        help="Optional zoom end in seconds since the common window start.",
+    )
     parser.add_argument("--recover-idle-gaps", action="store_true")
     parser.add_argument("--idle-power-per-device", type=float, default=70.0)
     parser.add_argument(
@@ -532,13 +772,20 @@ def main() -> None:
 
     rr_events = load_events(args.rr)
     planner_events = load_events(args.packer)
-    start_time, end_time = compute_common_window(rr_events, planner_events)
+    common_start_time, common_end_time = compute_common_window(rr_events, planner_events)
+    start_time, end_time = resolve_view_window(
+        common_start_time,
+        common_end_time,
+        view_start=args.view_start,
+        view_end=args.view_end,
+    )
 
     rr = summarize_trace(
         args.rr,
         start_time,
         end_time,
         args.window_size,
+        time_offset=start_time - common_start_time,
         recover_idle_gaps=args.recover_idle_gaps,
         idle_power_per_device=args.idle_power_per_device,
     )
@@ -547,23 +794,48 @@ def main() -> None:
         start_time,
         end_time,
         args.window_size,
+        time_offset=start_time - common_start_time,
         recover_idle_gaps=args.recover_idle_gaps,
         idle_power_per_device=args.idle_power_per_device,
     )
 
     output_prefix = str(Path(args.output_prefix))
     plot_comparison(rr, planner, args.window_size, output_prefix)
+    plot_active_server_distribution(
+        rr,
+        planner,
+        args.window_size,
+        f"{output_prefix}.active_machine_distribution",
+    )
+    plot_active_machines_and_power_over_time(
+        rr,
+        planner,
+        args.window_size,
+        f"{output_prefix}.active_machine_and_power_over_time",
+    )
     plot_power_vs_active_requests(rr, planner, f"{output_prefix}.power_vs_active_reqs")
     plot_power_vs_active_requests_per_server(
         rr, planner, f"{output_prefix}.power_vs_active_reqs_per_server"
     )
+    plot_per_server_power_over_time(
+        rr,
+        planner,
+        args.window_size,
+        f"{output_prefix}.power_over_time_per_server",
+    )
     print_summary(rr, planner, start_time, end_time, args.window_size)
     print(f"Saved {output_prefix}.png")
     print(f"Saved {output_prefix}.pdf")
+    print(f"Saved {output_prefix}.active_machine_distribution.png")
+    print(f"Saved {output_prefix}.active_machine_distribution.pdf")
+    print(f"Saved {output_prefix}.active_machine_and_power_over_time.png")
+    print(f"Saved {output_prefix}.active_machine_and_power_over_time.pdf")
     print(f"Saved {output_prefix}.power_vs_active_reqs.png")
     print(f"Saved {output_prefix}.power_vs_active_reqs.pdf")
     print(f"Saved {output_prefix}.power_vs_active_reqs_per_server.png")
     print(f"Saved {output_prefix}.power_vs_active_reqs_per_server.pdf")
+    print(f"Saved {output_prefix}.power_over_time_per_server.png")
+    print(f"Saved {output_prefix}.power_over_time_per_server.pdf")
 
 
 if __name__ == "__main__":
