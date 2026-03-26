@@ -44,9 +44,8 @@ DEFAULT_SLO_TPOTS=("0.05")
 DEFAULT_PERF_MODEL_ERRS=("1.0")
 
 load_config() {
-  local length_trace="$1"
-  local arrival_trace="$2"
-  local key="${length_trace}:${arrival_trace}"
+  local trace="$1"
+  local key="$trace"
   local cfg
   local -a cfg_parts=()
 
@@ -130,11 +129,17 @@ load_config() {
 }
 
 make_run_key() {
-  local length_trace="$1"
-  local arrival_trace="$2"
-  local policy="$3"
-  shift 3
+  local trace="$1"
+  local policy="$2"
+  shift 2
   local devices=("$@")
+  local length_trace="$trace"
+  local arrival_trace="$trace"
+
+  if [[ "$trace" == *:* && "${trace#*:}" != *:* ]]; then
+    length_trace="${trace%%:*}"
+    arrival_trace="${trace#*:}"
+  fi
 
   printf '%s|%s|%s|%s|%s|%s\n' \
     "$EXPERIMENT_NAME" \
@@ -286,8 +291,6 @@ start_server() {
 
 run_suite() {
   local trace
-  local length_trace
-  local arrival_trace
   local policy
   local run_key
   local server_pid=""
@@ -306,14 +309,11 @@ run_suite() {
   trap 'cleanup_server "$server_pid"' EXIT
 
   for trace in "${TRACES[@]}"; do
-    length_trace="${trace%%:*}"
-    arrival_trace="${trace##*:}"
-
-    load_config "$length_trace" "$arrival_trace"
+    load_config "$trace"
     next_server_signature="$(compute_server_signature)"
     if [[ -z "$server_pid" || "$next_server_signature" != "$current_server_signature" ]]; then
       if [[ -n "$server_pid" ]]; then
-        echo "RESTARTING SERVER for ${length_trace}:${arrival_trace}"
+        echo "RESTARTING SERVER for ${trace}"
         cleanup_server "$server_pid"
         server_pid=""
       fi
@@ -326,7 +326,7 @@ run_suite() {
       if ! policy_supports_partial_rr "$policy"; then
         mapfile -t run_devices < <(filter_compatible_devices "$available_clients" "${n_devices[@]}")
         if ((${#run_devices[@]} == 0)); then
-          run_key="$(make_run_key "$length_trace" "$arrival_trace" "$policy" "${n_devices[@]}")"
+          run_key="$(make_run_key "$trace" "$policy" "${n_devices[@]}")"
           echo "SKIP (no compatible client counts for non-RR policy): $run_key"
           echo "  available_clients=$available_clients"
           echo "  requested_n_devices=${n_devices[*]}"
@@ -335,7 +335,7 @@ run_suite() {
         fi
       fi
 
-      run_key="$(make_run_key "$length_trace" "$arrival_trace" "$policy" "${run_devices[@]}")"
+      run_key="$(make_run_key "$trace" "$policy" "${run_devices[@]}")"
 
       if already_succeeded "$run_key"; then
         echo "SKIP (already succeeded): $run_key"
@@ -343,7 +343,7 @@ run_suite() {
         continue
       fi
 
-      echo "RUNNING: ${length_trace}:${arrival_trace}"
+      echo "RUNNING: ${trace}"
       echo "  policy=$policy"
       echo "  window=$window"
       echo "  load_scales=${load_scales[*]}"
@@ -378,7 +378,7 @@ run_suite() {
         --ttft_slo_scales "${ttft_slo_scales[@]}"
         --perf_model_err "${perf_model_errs[@]}"
         --window "$window"
-        --trace "${length_trace}:${arrival_trace}"
+        --trace "$trace"
         --profit "$profit"
         --admission_mode "$admission_mode"
         --slo_routing_overhead "$slo_routing_overhead"
@@ -456,16 +456,18 @@ declare -A configs=(
   ["reasoning:azure_chat_23"]="t1200:1800 1.0 4 8 12 16 32"
 )
 
-if [[ -n "$BATCH_CONFIG_PATH" ]]; then
-  if [[ ! -f "$BATCH_CONFIG_PATH" ]]; then
-    echo "ERROR: Missing batch config at $BATCH_CONFIG_PATH" >&2
-    exit 1
+if [[ "${RUN_BATCH_SOURCE_ONLY:-0}" != "1" ]]; then
+  if [[ -n "$BATCH_CONFIG_PATH" ]]; then
+    if [[ ! -f "$BATCH_CONFIG_PATH" ]]; then
+      echo "ERROR: Missing batch config at $BATCH_CONFIG_PATH" >&2
+      exit 1
+    fi
+
+    echo "Loading batch config: $BATCH_CONFIG_PATH"
+    eval "$(
+      python -m SLOsServe.batch_config --shell "$BATCH_CONFIG_PATH"
+    )"
   fi
 
-  echo "Loading batch config: $BATCH_CONFIG_PATH"
-  eval "$(
-    python -m SLOsServe.batch_config --shell "$BATCH_CONFIG_PATH"
-  )"
+  run_suite
 fi
-
-run_suite
