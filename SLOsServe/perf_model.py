@@ -520,6 +520,7 @@ def fit_batch_perf_trace(
         ),
         "sample_summary": _summarize_rows(rows),
     }
+    persisted_hardware_params: list[float] | dict[str, Any] = fit_result["hardware_params"]
 
     if viz:
         resolved_plot_path = _derive_plot_path(
@@ -616,12 +617,21 @@ def fit_batch_perf_trace(
             breakpoints=piecewise_current_token_breakpoints,
             min_abs_num_reqs_coef=min_abs_num_reqs_coef,
         )
+        piecewise_hardware_params = build_piecewise_current_token_hardware_params(
+            {
+                segment_key: segment_report["hardware_params"]
+                for segment_key, segment_report in piecewise_fit["segments"].items()
+            },
+            breakpoints=piecewise_fit["breakpoints"],
+        )
         report["piecewise_current_token_fit"] = {
             "breakpoints": piecewise_fit["breakpoints"],
             "segment_order": piecewise_fit["segment_order"],
             "aggregate_stats": piecewise_fit["aggregate_stats"],
             "segments": piecewise_fit["segments"],
+            "hardware_params": piecewise_hardware_params,
         }
+        persisted_hardware_params = piecewise_hardware_params
         if viz:
             report["piecewise_current_token_fit"]["plot_path"] = str(
                 save_prediction_scatter_by_category(
@@ -639,7 +649,7 @@ def fit_batch_perf_trace(
 
     if model_name is not None:
         resolved_tag = tag or safe_name
-        upsert_hardware_params(model_name, resolved_tag, fit_result["hardware_params"])
+        upsert_hardware_params(model_name, resolved_tag, persisted_hardware_params)
         report["persisted_model_name"] = model_name
         report["persisted_tag"] = resolved_tag
         report["persisted_registry_path"] = str(PERF_MODEL_PATH)

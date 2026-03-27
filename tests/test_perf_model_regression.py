@@ -659,3 +659,39 @@ def test_fit_batch_perf_trace_piecewise_current_tokens_recovers_segment_models(t
         assert segment_report["hardware_params"] == pytest.approx(
             PIECEWISE_TRUE_HW_PARAMS[segment_key]
         )
+
+
+def test_fit_batch_perf_trace_piecewise_current_tokens_persists_piecewise_payload(
+    tmp_path,
+    monkeypatch,
+):
+    perf_model_path = tmp_path / "assets" / "perf_model.json"
+    monkeypatch.setattr(perf_model, "PERF_MODEL_PATH", perf_model_path)
+
+    _, events = _make_piecewise_batch_events()
+    trace_path = tmp_path / "batches.jsonl"
+    trace_path.write_text(json.dumps(events), encoding="utf-8")
+
+    report = perf_model.fit_batch_perf_trace(
+        trace_path,
+        model_name="unit/model",
+        tag="piecewise_trace",
+        fit_piecewise_current_tokens=True,
+    )
+
+    expected_piecewise_params = perf_model.build_piecewise_current_token_hardware_params(
+        PIECEWISE_TRUE_HW_PARAMS,
+        breakpoints=[512, 2048],
+    )
+
+    persisted_params = report["piecewise_current_token_fit"]["hardware_params"]
+    assert persisted_params["type"] == expected_piecewise_params["type"]
+    assert persisted_params["breakpoints"] == expected_piecewise_params["breakpoints"]
+    for segment_key, expected_segment in expected_piecewise_params["segment_params"].items():
+        assert persisted_params["segment_params"][segment_key] == pytest.approx(expected_segment)
+
+    stored_params = perf_model.get_hardware_params("unit/model", "piecewise_trace")
+    assert stored_params["type"] == expected_piecewise_params["type"]
+    assert stored_params["breakpoints"] == expected_piecewise_params["breakpoints"]
+    for segment_key, expected_segment in expected_piecewise_params["segment_params"].items():
+        assert stored_params["segment_params"][segment_key] == pytest.approx(expected_segment)
