@@ -111,7 +111,7 @@ def test_build_config_sanity_report_warns_when_non_partial_policies_skip_devices
     )
 
 
-def test_build_config_sanity_report_errors_on_tensor_parallel_mismatch(tmp_path):
+def test_build_config_sanity_report_allows_canonicalized_tensor_parallel_override(tmp_path):
     config_path = tmp_path / "tp.json"
     config_path.write_text(
         json.dumps(
@@ -131,12 +131,9 @@ def test_build_config_sanity_report_errors_on_tensor_parallel_mismatch(tmp_path)
     )
 
     report = build_config_sanity_report(config_path)
-    assert report.status == "ERROR"
-    assert any(
-        "bench tensor_parallel_size resolves to 2, but api_server_ray will launch with 1"
-        in finding.message
-        for finding in report.findings
-    )
+    assert report.status == "OK"
+    assert report.error_count == 0
+    assert report.warning_count == 0
 
 
 def test_build_directory_sanity_report_supports_jsonl_and_skips_base(tmp_path):

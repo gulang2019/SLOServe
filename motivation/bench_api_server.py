@@ -104,6 +104,14 @@ def _extract_batch_perf_sample(
         estimated_time = float(event.get("estimated_time", 0.0))
     except (TypeError, ValueError):
         estimated_time = 0.0
+    control_estimated_time_raw = event.get("control_estimated_time")
+    try:
+        control_estimated_time = (
+            float(control_estimated_time_raw)
+            if control_estimated_time_raw is not None else None
+        )
+    except (TypeError, ValueError):
+        control_estimated_time = None
 
     try:
         device_id = int(event.get("device_id", 0))
@@ -118,7 +126,7 @@ def _extract_batch_perf_sample(
     except (TypeError, ValueError):
         timestamp = 0.0
 
-    return {
+    row = {
         "device_id": device_id,
         "batch_id": batch_id,
         "timestamp": timestamp,
@@ -129,7 +137,17 @@ def _extract_batch_perf_sample(
         "measured_time": max(0.0, elapsed - scheduling_overhead),
         "elapsed_time": max(0.0, elapsed),
         "scheduling_overhead": max(0.0, scheduling_overhead),
-    }, [
+        "estimated_full_time": max(
+            0.0,
+            control_estimated_time
+            if control_estimated_time is not None
+            else estimated_time + scheduling_overhead,
+        ),
+    }
+    if control_estimated_time is not None:
+        row["control_estimated_time"] = max(0.0, control_estimated_time)
+
+    return row, [
         (int(item["past_tokens"]), int(item["scheduled_tokens"]))
         for item in batch
     ]
@@ -182,9 +200,55 @@ def _collect_batch_perf_error_rows(events: List[Dict[str, Any]]) -> List[Dict[st
             "abs_relative_error": abs_relative_error,
             "estimated_over_measured": estimated_over_measured,
         })
+        full_error_s = float(row["estimated_full_time"] - row["elapsed_time"])
+        abs_full_error_s = float(abs(full_error_s))
+        elapsed_time = float(row["elapsed_time"])
+        full_relative_error = None
+        abs_full_relative_error = None
+        estimated_full_over_elapsed = None
+        if elapsed_time > 0.0:
+            full_relative_error = float(full_error_s / elapsed_time)
+            abs_full_relative_error = float(abs_full_error_s / elapsed_time)
+            estimated_full_over_elapsed = float(
+                row["estimated_full_time"] / elapsed_time
+            )
+        row.update({
+            "full_error_s": full_error_s,
+            "abs_full_error_s": abs_full_error_s,
+            "full_relative_error": full_relative_error,
+            "abs_full_relative_error": abs_full_relative_error,
+            "estimated_full_over_elapsed": estimated_full_over_elapsed,
+        })
         error_rows.append(row)
 
     return error_rows
+
+
+def _summarize_batch_scheduling_overhead_rows(
+    error_rows: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    if not error_rows:
+        return None
+
+    summary = {
+        "overhead_s": _summarize_distribution([
+            float(row["scheduling_overhead"]) for row in error_rows
+        ]),
+        "relative_to_measured_time": _summarize_distribution([
+            float(row["scheduling_overhead"] / row["measured_time"])
+            for row in error_rows
+            if float(row["measured_time"]) > 0.0
+        ]),
+    }
+    return summary
+
+
+def _summarize_batch_scheduling_overhead(
+    events: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    return _summarize_batch_scheduling_overhead_rows(
+        _collect_batch_perf_error_rows(events)
+    )
 
 
 def _summarize_distribution(values: List[float]) -> Dict[str, Any]:
@@ -230,6 +294,8 @@ def _save_estimated_vs_measured_figure(
     path: str | Path,
     *,
     title: str,
+    x_label: str = "Measured Time (s)",
+    y_label: str = "Estimated Time (s)",
 ) -> Path | None:
     if not estimated_times or not measured_times:
         return None
@@ -248,8 +314,8 @@ def _save_estimated_vs_measured_figure(
         ax.plot([lo, hi], [lo, hi], "--r", linewidth=1)
         ax.set_xlim(lo, hi)
         ax.set_ylim(lo, hi)
-    ax.set_xlabel("Measured Time (s)")
-    ax.set_ylabel("Estimated Time (s)")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
     ax.set_title(title)
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
@@ -265,6 +331,8 @@ def _log_perf_model_errors_from_batch_events(
     include_time_lists: bool = False,
     draw_figure: bool = True,
     figure_path: str | Path | None = None,
+    regression_figure_path: str | Path | None = None,
+    full_elapsed_figure_path: str | Path | None = None,
 ) -> Dict[str, Any] | None:
     error_rows = _collect_batch_perf_error_rows(events)
     if not error_rows:
@@ -292,8 +360,15 @@ def _log_perf_model_errors_from_batch_events(
             regressed_hardware_params,
         )
     ]
+    empirical_scheduling_overhead = _summarize_batch_scheduling_overhead_rows(
+        error_rows
+    )
     estimated_times = [float(row["estimated_time"]) for row in error_rows]
     measured_times = [float(row["measured_time"]) for row in error_rows]
+    estimated_full_times = [
+        float(row["estimated_full_time"]) for row in error_rows
+    ]
+    elapsed_times = [float(row["elapsed_time"]) for row in error_rows]
 
     summary = {
         "model_name": problem.model_name,
@@ -302,6 +377,7 @@ def _log_perf_model_errors_from_batch_events(
         "store_prefix": problem.store_prefix,
         "event_file": event_file,
         "perf_model_err": float(problem.perf_model_err),
+        "configured_scheduling_overhead_s": float(problem.scheduling_overhead),
         "old_hardware_params": [float(param) for param in old_hardware_params],
         "regressed_hardware_params": regressed_hardware_params,
         "regressed_hardware_params_delta": regressed_hardware_params_delta,
@@ -323,7 +399,29 @@ def _log_perf_model_errors_from_batch_events(
             for row in error_rows
             if row["abs_relative_error"] is not None
         ]),
+        "estimated_with_overhead_minus_elapsed_s": _summarize_distribution(
+            [float(row["full_error_s"]) for row in error_rows]
+        ),
+        "abs_estimated_with_overhead_minus_elapsed_s": _summarize_distribution(
+            [float(row["abs_full_error_s"]) for row in error_rows]
+        ),
+        "estimated_with_overhead_minus_elapsed_relative": (
+            _summarize_distribution([
+                float(row["full_relative_error"])
+                for row in error_rows
+                if row["full_relative_error"] is not None
+            ])
+        ),
+        "abs_estimated_with_overhead_minus_elapsed_relative": (
+            _summarize_distribution([
+                float(row["abs_full_relative_error"])
+                for row in error_rows
+                if row["abs_full_relative_error"] is not None
+            ])
+        ),
     }
+    if empirical_scheduling_overhead is not None:
+        summary["empirical_scheduling_overhead"] = empirical_scheduling_overhead
     if include_time_lists:
         summary["estimated_time_list"] = estimated_times
         summary["measured_time_list"] = measured_times
@@ -338,6 +436,45 @@ def _log_perf_model_errors_from_batch_events(
         )
         if plotted_figure_path is not None:
             summary["estimated_vs_measured_figure_path"] = str(plotted_figure_path)
+
+    full_elapsed_plot_path = None
+    if draw_figure:
+        full_elapsed_plot_path = _save_estimated_vs_measured_figure(
+            estimated_full_times,
+            elapsed_times,
+            full_elapsed_figure_path
+            or Path(output_path).with_name(
+                f"{Path(output_path).stem}.elapsed.png"
+            ),
+            title=(
+                f"{get_easy_name(problem.model_name)} "
+                f"[{problem.perf_model_task}] + Overhead"
+            ),
+            x_label="Elapsed Time (s)",
+            y_label="Estimated + Overhead (s)",
+        )
+        if full_elapsed_plot_path is not None:
+            summary["estimated_with_overhead_vs_elapsed_figure_path"] = str(
+                full_elapsed_plot_path
+            )
+
+    regression_plot_path = None
+    if draw_figure:
+        regression_plot_path = _save_estimated_vs_measured_figure(
+            fit_result["predicted_times"],
+            fit_result["measured_times"],
+            regression_figure_path
+            or Path(output_path).with_name(
+                f"{Path(output_path).stem}.regression.png"
+            ),
+            title=(
+                f"{get_easy_name(problem.model_name)} "
+                f"[{problem.perf_model_task}] Regression"
+            ),
+            y_label="Regressed Time (s)",
+        )
+        if regression_plot_path is not None:
+            summary["regression_figure_path"] = str(regression_plot_path)
 
     rows = [{
         "record_type": "summary",
@@ -356,6 +493,14 @@ def _log_perf_model_errors_from_batch_events(
             str(plotted_figure_path)
             if plotted_figure_path is not None else None
         ),
+        "full_elapsed_figure_path": (
+            str(full_elapsed_plot_path)
+            if full_elapsed_plot_path is not None else None
+        ),
+        "regression_figure_path": (
+            str(regression_plot_path)
+            if regression_plot_path is not None else None
+        ),
     }
 
 
@@ -370,6 +515,7 @@ class Problem:
     perf_model_task: str = 'azure_code_23'
     window: str = '0:10'
     perf_model_err: float = 1.0 # the factor between used performance model and real performance model.
+    scheduling_overhead: float = 0.0
     
     # runtime config
     load_scale: float = 1.0 
@@ -2201,16 +2347,28 @@ async def main(
                 event['accepted_ids'] = [backend_id_2_id(req_id) for req_id in event['accepted_ids']]
                 for batch in event['batch_schedule']:
                     batch['id'] = backend_id_2_id(batch['id'])
-        estimated_batch_times = {}
+        control_estimated_batch_times = {}
         for event in events:
             if event['event_type'] == 'schedule_problem':
-                estimated_batch_times[(event.get('device_id', 0), event['batch_id'])] = event['estimated_time']
+                control_estimated_batch_times[
+                    (event.get('device_id', 0), event['batch_id'])
+                ] = event.get('estimated_time')
         for event in events:
             if event['event_type'] == 'batch':
-                event['estimated_time'] = estimated_batch_times.get(
-                    (event.get('device_id', 0), event['batch_id']),
-                    event.get('estimated_time', 0),
+                batch_key = (event.get('device_id', 0), event['batch_id'])
+                control_estimated_time = control_estimated_batch_times.get(
+                    batch_key
                 )
+                if control_estimated_time is not None:
+                    event['control_estimated_time'] = control_estimated_time
+                if (
+                    'estimated_time' not in event
+                    or event.get('estimated_time') is None
+                ):
+                    event['estimated_time'] = (
+                        control_estimated_time
+                        if control_estimated_time is not None else 0
+                    )
         with open(filename, 'w') as f:
             json.dump(events, f, indent=4)
     
@@ -2238,6 +2396,12 @@ async def main(
     perf_model_error_figure_filename = (
         f'{problem.store_prefix}.{i}.perf_model_estimated_vs_measured.png'
     )
+    perf_model_full_elapsed_figure_filename = (
+        f'{problem.store_prefix}.{i}.perf_model_estimated_with_overhead_vs_elapsed.png'
+    )
+    perf_model_regression_figure_filename = (
+        f'{problem.store_prefix}.{i}.perf_model_regression.png'
+    )
     perf_model_error_artifacts = None
     if problem.log_perf_model_errors:
         perf_model_error_artifacts = _log_perf_model_errors_from_batch_events(
@@ -2248,6 +2412,8 @@ async def main(
             include_time_lists=problem.include_perf_model_time_lists,
             draw_figure=problem.draw_perf_model_error_figure,
             figure_path=perf_model_error_figure_filename,
+            regression_figure_path=perf_model_regression_figure_filename,
+            full_elapsed_figure_path=perf_model_full_elapsed_figure_filename,
         )
         if perf_model_error_artifacts is not None:
             print(
@@ -2255,6 +2421,9 @@ async def main(
                 f"{perf_model_error_artifacts['path']}"
             )
             error_summary = perf_model_error_artifacts["summary"]
+            empirical_scheduling_overhead = error_summary.get(
+                "empirical_scheduling_overhead", {}
+            ).get("overhead_s", {})
             print(
                 "Perf-model error summary:",
                 f"old_params={error_summary['old_hardware_params']}",
@@ -2262,14 +2431,29 @@ async def main(
                 f"signed_mean={error_summary['estimated_minus_measured_s'].get('mean')}",
                 f"abs_mean={error_summary['abs_estimated_minus_measured_s'].get('mean')}",
                 f"relative_p50={error_summary['estimated_minus_measured_relative'].get('p50')}",
+                f"scheduling_overhead_mean={empirical_scheduling_overhead.get('mean')}",
+                f"scheduling_overhead_p95={empirical_scheduling_overhead.get('p95')}",
             )
             if perf_model_error_artifacts.get("figure_path"):
                 print(
-                    "Saved perf-model estimated-vs-measured figure to "
+                    "Saved perf-model estimated-vs-pure-execution figure to "
                     f"{perf_model_error_artifacts['figure_path']}"
+                )
+            if perf_model_error_artifacts.get("full_elapsed_figure_path"):
+                print(
+                    "Saved perf-model estimated-with-overhead-vs-elapsed figure to "
+                    f"{perf_model_error_artifacts['full_elapsed_figure_path']}"
+                )
+            if perf_model_error_artifacts.get("regression_figure_path"):
+                print(
+                    "Saved perf-model regression figure to "
+                    f"{perf_model_error_artifacts['regression_figure_path']}"
                 )
 
     # TODO(Yi): add oom fail rate analysis here.
+    empirical_scheduling_overhead_summary = _summarize_batch_scheduling_overhead(
+        events
+    )
     events, reqs = analyze_events(filename, verbose = True)
     results = analyze_slo_violation(reqs, events, 
                                     model_name = problem.model_name, 
@@ -2292,6 +2476,13 @@ async def main(
     results['rr_slice_total_request_count'] = original_request_count
     results['run_status'] = 'completed'
     results['overloaded'] = False
+    results['configured_scheduling_overhead_s'] = float(
+        problem.scheduling_overhead
+    )
+    if empirical_scheduling_overhead_summary is not None:
+        results['empirical_scheduling_overhead_summary'] = (
+            empirical_scheduling_overhead_summary
+        )
     extra_metrics = results.setdefault('extra_metrics', {})
     extra_metrics.update(_summarize_per_server_energy_metrics(
         events,
@@ -2328,6 +2519,12 @@ async def main(
         if perf_model_error_artifacts.get("figure_path") is not None:
             results['perf_model_error_figure'] = perf_model_error_artifacts[
                 "figure_path"]
+        if perf_model_error_artifacts.get("full_elapsed_figure_path") is not None:
+            results['perf_model_full_elapsed_figure'] = (
+                perf_model_error_artifacts["full_elapsed_figure_path"])
+        if perf_model_error_artifacts.get("regression_figure_path") is not None:
+            results['perf_model_regression_figure'] = (
+                perf_model_error_artifacts["regression_figure_path"])
         results['perf_model_old_hardware_params'] = perf_model_error_artifacts[
             "summary"]["old_hardware_params"]
         results['perf_model_regressed_hardware_params'] = (
@@ -2396,12 +2593,9 @@ async def main(
         energy_consumption=energy_consumption,
         per_gpu_energy_consumption=per_gpu_energy_consumption,
     )
-    with open(f'{problem.store_prefix}.execution_results.jsonl', 'w') as f:
-        json.dump([asdict(execution_result) for execution_result in execution_results], f, indent=4)
     reqs = sorted(list(reqs.values()), key=lambda x: _request_id_sort_key(x.req_id))
     with open(f'{problem.store_prefix}.reqs.jsonl', 'w') as f:
         json.dump([asdict(req) for req in reqs], f, indent=4)
-    print(f'Saved {problem.store_prefix}.{i}.execution_results.jsonl')
     print(f'Saved {problem.store_prefix}.{i}.reqs.jsonl')
     return results
 
@@ -3000,6 +3194,7 @@ def build_problems(
         store_prefix = store_prefix,
         admission_mode = admission_mode,
         perf_model_err = perf_model_err,
+        scheduling_overhead = scheduling_overhead,
         routing_overhead = routing_overhead,
         routing_fallback_policy = routing_fallback_policy,
         enable_session_replay = enable_session_replay,
@@ -3234,7 +3429,7 @@ def run(
             'event_file': f'{problems[0].store_prefix}.events.jsonl',
             'energy_consumption': best_result.energy_consumption,
             'per_gpu_energy_consumption': best_result.per_gpu_energy_consumption,
-            'scheduling_overhead': slo_routing_overhead,
+            'scheduling_overhead': scheduling_overhead,
             'burstiness_level': burstiness_level,
             'run_status': best_result.results.get('run_status', 'completed'),
             'overloaded': bool(best_result.results.get('overloaded', False)),
@@ -3279,6 +3474,13 @@ def run(
         if 'perf_model_error_figure' in best_result.results:
             result['perf_model_error_figure'] = (
                 f'{problems[0].store_prefix}.perf_model_estimated_vs_measured.png')
+        if 'perf_model_full_elapsed_figure' in best_result.results:
+            result['perf_model_full_elapsed_figure'] = (
+                f'{problems[0].store_prefix}.'
+                'perf_model_estimated_with_overhead_vs_elapsed.png')
+        if 'perf_model_regression_figure' in best_result.results:
+            result['perf_model_regression_figure'] = (
+                f'{problems[0].store_prefix}.perf_model_regression.png')
         if 'perf_model_old_hardware_params' in best_result.results:
             result['perf_model_old_hardware_params'] = best_result.results[
                 'perf_model_old_hardware_params']
@@ -3298,6 +3500,12 @@ def run(
         if 'perf_model_measured_time_list' in best_result.results:
             result['perf_model_measured_time_list'] = best_result.results[
                 'perf_model_measured_time_list']
+        if 'configured_scheduling_overhead_s' in best_result.results:
+            result['configured_scheduling_overhead_s'] = best_result.results[
+                'configured_scheduling_overhead_s']
+        if 'empirical_scheduling_overhead_summary' in best_result.results:
+            result['empirical_scheduling_overhead_summary'] = (
+                best_result.results['empirical_scheduling_overhead_summary'])
         print('--Result--')
         pprint.pprint(result)
         print('--End of Result--')
@@ -3309,7 +3517,6 @@ def run(
         for surfix in [
             'events',
             'reqs',
-            'execution_results',
             'admission_history',
             'perf_model_errors',
         ]:
@@ -3319,6 +3526,20 @@ def run(
                 os.system(f'cp {src} {dst}')
         src = f'{best_result.event_file}.perf_model_estimated_vs_measured.png'
         dst = f'{problems[0].store_prefix}.perf_model_estimated_vs_measured.png'
+        if os.path.exists(src):
+            os.system(f'cp {src} {dst}')
+        src = (
+            f'{best_result.event_file}.'
+            'perf_model_estimated_with_overhead_vs_elapsed.png'
+        )
+        dst = (
+            f'{problems[0].store_prefix}.'
+            'perf_model_estimated_with_overhead_vs_elapsed.png'
+        )
+        if os.path.exists(src):
+            os.system(f'cp {src} {dst}')
+        src = f'{best_result.event_file}.perf_model_regression.png'
+        dst = f'{problems[0].store_prefix}.perf_model_regression.png'
         if os.path.exists(src):
             os.system(f'cp {src} {dst}')
         for figure_suffix in [

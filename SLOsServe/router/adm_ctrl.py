@@ -9,7 +9,7 @@ import SLOsServe_C
 
 from SLOsServe.perf_model import PerfModel
 from SLOsServe.router.execplan_bus import ExecPlan
-from SLOsServe.router.macro import PERF_MODEL_HEADROOM, DUMP_SCHS, DUMP_ADM
+from SLOsServe.router.macro import DUMP_SCHS, DUMP_ADM
 
 import logging 
 
@@ -95,12 +95,9 @@ class BatchPlanner:
     _cpp_adm_ctrl_iterations: int = 0
     _cpp_schedule_iterations: int = 0
     _fast_sched_perf_mode: str = "full"
-    _apply_perf_model_headroom: bool = True
     
     
     def __post_init__(self):
-        if self._apply_perf_model_headroom:
-            self._perf_model.hardware_params[4] += PERF_MODEL_HEADROOM
         fast_sched_perf_mode = os.getenv(
             "SLOSERVE_PY_FAST_SCHED_PERF_MODE",
             "full",

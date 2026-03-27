@@ -292,7 +292,7 @@ def test_slosserve_router_applies_perf_model_err_to_control_model(monkeypatch):
         2.4,
         3.6,
         4.8,
-        6.0 + 0.3 + api_server_ray.PERF_MODEL_HEADROOM,
+        6.0 + 0.3,
     ]
 
     assert router.hardware_params == pytest.approx(expected_params)

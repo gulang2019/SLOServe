@@ -173,18 +173,17 @@ def test_extract_batch_perf_error_row_derives_compact_batch_fields():
 
     row = bench_api_server._extract_batch_perf_error_row(event)
 
-    assert row == {
-        "device_id": 2,
-        "batch_id": 7,
-        "timestamp": 3.5,
-        "batch_size": 2,
-        "total_current_tokens": 5,
-        "total_past_tokens": 30,
-        "estimated_time": 1.4,
-        "measured_time": 1.1,
-        "elapsed_time": 1.25,
-        "scheduling_overhead": 0.15,
-    }
+    assert row["device_id"] == 2
+    assert row["batch_id"] == 7
+    assert row["timestamp"] == pytest.approx(3.5)
+    assert row["batch_size"] == 2
+    assert row["total_current_tokens"] == 5
+    assert row["total_past_tokens"] == 30
+    assert row["estimated_time"] == pytest.approx(1.4)
+    assert row["estimated_full_time"] == pytest.approx(1.55)
+    assert row["measured_time"] == pytest.approx(1.1)
+    assert row["elapsed_time"] == pytest.approx(1.25)
+    assert row["scheduling_overhead"] == pytest.approx(0.15)
 
 
 def test_collect_batch_perf_error_rows_computes_signed_and_relative_errors():
@@ -202,6 +201,11 @@ def test_collect_batch_perf_error_rows_computes_signed_and_relative_errors():
         assert row["relative_error"] == pytest.approx(0.1)
         assert row["abs_relative_error"] == pytest.approx(0.1)
         assert row["estimated_over_measured"] == pytest.approx(1.1)
+        assert row["estimated_full_time"] == pytest.approx(measured_time * 1.1 + 0.05)
+        assert row["full_error_s"] == pytest.approx(expected_error)
+        assert row["full_relative_error"] == pytest.approx(
+            expected_error / (measured_time + 0.05)
+        )
         assert "batch" not in row
 
 
@@ -225,6 +229,10 @@ def test_collect_batch_perf_error_rows_handles_zero_measured_time():
     assert rows[0]["relative_error"] is None
     assert rows[0]["abs_relative_error"] is None
     assert rows[0]["estimated_over_measured"] is None
+    assert rows[0]["estimated_full_time"] == pytest.approx(0.5)
+    assert rows[0]["full_error_s"] == pytest.approx(0.3)
+    assert rows[0]["full_relative_error"] == pytest.approx(1.5)
+    assert rows[0]["estimated_full_over_elapsed"] == pytest.approx(2.5)
 
 
 def test_log_perf_model_errors_from_batch_events_writes_jsonl_summary_and_rows(tmp_path):
@@ -234,6 +242,7 @@ def test_log_perf_model_errors_from_batch_events_writes_jsonl_summary_and_rows(t
         length_pattern="unit_task",
         store_prefix=str(tmp_path / "runs" / "case_a"),
         perf_model_err=1.25,
+        scheduling_overhead=0.05,
     )
     output_path = tmp_path / "case_a.perf_model_errors.jsonl"
 
@@ -247,6 +256,9 @@ def test_log_perf_model_errors_from_batch_events_writes_jsonl_summary_and_rows(t
     assert artifacts is not None
     assert Path(artifacts["path"]) == output_path
     assert output_path.exists()
+    assert Path(artifacts["figure_path"]).exists()
+    assert Path(artifacts["full_elapsed_figure_path"]).exists()
+    assert Path(artifacts["regression_figure_path"]).exists()
 
     rows = [
         json.loads(line)
@@ -264,6 +276,7 @@ def test_log_perf_model_errors_from_batch_events_writes_jsonl_summary_and_rows(t
     assert summary["length_pattern"] == problem.length_pattern
     assert summary["event_file"] == "case_a.0.events.jsonl"
     assert summary["perf_model_err"] == pytest.approx(1.25)
+    assert summary["configured_scheduling_overhead_s"] == pytest.approx(0.05)
     assert summary["relative_error_denominator"] == "measured_time"
     assert summary["estimated_minus_measured_s"]["count"] == len(events)
     assert summary["estimated_minus_measured_s"]["mean"] == pytest.approx(
@@ -272,6 +285,15 @@ def test_log_perf_model_errors_from_batch_events_writes_jsonl_summary_and_rows(t
     assert summary["estimated_minus_measured_relative"]["mean"] == pytest.approx(0.1)
     assert summary["estimated_minus_measured_relative"]["p50"] == pytest.approx(0.1)
     assert summary["abs_estimated_minus_measured_relative"]["p95"] == pytest.approx(0.1)
+    assert summary["estimated_with_overhead_minus_elapsed_s"]["mean"] == pytest.approx(
+        sum(expected_signed_errors) / len(expected_signed_errors)
+    )
+    assert summary["empirical_scheduling_overhead"]["overhead_s"]["mean"] == pytest.approx(0.05)
+    assert summary["empirical_scheduling_overhead"]["overhead_s"]["p50"] == pytest.approx(0.05)
+    assert summary["empirical_scheduling_overhead"]["relative_to_measured_time"]["count"] == len(events)
+    assert Path(summary["estimated_vs_measured_figure_path"]).exists()
+    assert Path(summary["estimated_with_overhead_vs_elapsed_figure_path"]).exists()
+    assert Path(summary["regression_figure_path"]).exists()
 
     assert all(row["record_type"] == "batch_error" for row in batch_rows)
     assert [row["batch_id"] for row in batch_rows] == list(range(1, len(events) + 1))

@@ -1,3 +1,6 @@
+import json
+from types import SimpleNamespace
+
 from Dataset.dataset import Request
 from motivation import bench_api_server
 
@@ -69,3 +72,37 @@ def test_split_ready_request_indices_is_noop_when_replay_disabled():
 
     assert ready == [0, 1]
     assert blocked == []
+
+
+def test_make_overload_run_result_records_terminal_overload(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        bench_api_server.ArrivalTimes,
+        "load",
+        lambda *args, **kwargs: SimpleNamespace(arrival_times=[0.0, 2.0, 4.0]),
+    )
+
+    problem = bench_api_server.Problem(
+        arrival_pattern="arrival-trace",
+        length_pattern="length-trace",
+        window="0:3",
+        n_devices=2,
+        store_prefix=str(tmp_path / "bench"),
+    )
+
+    result = bench_api_server._make_overload_run_result(
+        problem,
+        requested_n_devices=4,
+        error=RuntimeError("engine died"),
+    )
+
+    assert result.results["run_status"] == "overloaded"
+    assert result.results["overloaded"] is True
+    assert result.results["requested_n_device"] == 4
+    assert result.results["effective_n_device"] == 2
+    assert result.results["rr_sliced"] is True
+    assert result.results["rps"] == 0.75
+
+    event_path = tmp_path / "bench.overloaded.events.jsonl"
+    assert event_path.exists()
+    payload = json.loads(event_path.read_text())
+    assert payload[0]["status"] == "overloaded"

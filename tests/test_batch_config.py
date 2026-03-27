@@ -154,6 +154,39 @@ def test_normalize_batch_config_supports_extra_args_string_alias():
     ]
 
 
+def test_normalize_batch_config_appends_trace_extra_args_and_extra_policies():
+    normalized = normalize_batch_config(
+        {
+            "policies": ["round_robin:atfc", "slosserve_planner:atfc"],
+            "extra_args": "--enable_prefix_cache",
+            "configs": {
+                "azure_chat:azure_chat": {
+                    "window": "t10:20",
+                    "n_devices": [2],
+                    "extra_args": "--enable_session_replay --session_pause_s 5.0",
+                    "extra_policies": [
+                        "round_robin_session:atfc",
+                        "round_robin:atfc",
+                    ],
+                }
+            },
+        }
+    )
+
+    spec = normalized["trace_specs"]["azure_chat:azure_chat"]
+    assert spec["extra_args"] == [
+        "--enable_prefix_cache",
+        "--enable_session_replay",
+        "--session_pause_s",
+        "5.0",
+    ]
+    assert spec["policies"] == [
+        "round_robin:atfc",
+        "slosserve_planner:atfc",
+        "round_robin_session:atfc",
+    ]
+
+
 def test_normalize_batch_config_extracts_server_launch_overrides():
     normalized = normalize_batch_config(
         {
@@ -202,21 +235,30 @@ def test_normalize_batch_config_extracts_server_launch_overrides():
     }
 
 
-def test_normalize_batch_config_rejects_conflicting_reserved_server_args():
-    with pytest.raises(ValueError):
-        normalize_batch_config(
-            {
-                "tensor_parallel_size": 1,
-                "extra_server_args": "--tensor_parallel_size 2",
-                "policies": ["round_robin:atfc"],
-                "configs": {
-                    "azure_chat:azure_chat": {
-                        "window": "t10:20",
-                        "n_devices": [2],
-                    }
-                },
-            }
-        )
+def test_normalize_batch_config_promotes_reserved_server_args_into_trace_defaults():
+    normalized = normalize_batch_config(
+        {
+            "tensor_parallel_size": 1,
+            "extra_server_args": "--tensor_parallel_size 2",
+            "policies": ["round_robin:atfc"],
+            "configs": {
+                "azure_chat:azure_chat": {
+                    "window": "t10:20",
+                    "n_devices": [2],
+                }
+            },
+        }
+    )
+
+    spec = normalized["trace_specs"]["azure_chat:azure_chat"]
+    assert spec["tensor_parallel_size"] == "2"
+    assert "extra_server_args" not in normalized
+    assert normalized["trace_server_args"]["azure_chat:azure_chat"] == [
+        "--model_name",
+        "Qwen/Qwen2.5-7B-Instruct",
+        "--tensor_parallel_size",
+        "2",
+    ]
 
 
 def test_normalize_batch_config_rejects_missing_required_fields():

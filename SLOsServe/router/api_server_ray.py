@@ -40,7 +40,7 @@ from SLOsServe.router.execplan_bus import (ExecPlanBus, ExecPlan,
                                            extract_load_statistics)
 from SLOsServe.router.adm_ctrl import Request as BatchPlannerRequest
 from SLOsServe.router.engine_shutdown import shutdown_engine_instance
-from SLOsServe.router.macro import PERF_MODEL_HEADROOM, DUMP_SCHS, DUMP_ADM
+from SLOsServe.router.macro import DUMP_SCHS, DUMP_ADM
 from SLOsServe.router.sem_util import MaxCapSemaphore
 from motivation.energy_measure import EnergyMeter, EnergyHistoryRecorder
 
@@ -1726,8 +1726,7 @@ class SLOsServeRouter(Router):
         perf_model = PerfModel.get_perf_model(self.model_name)
         perf_model = perf_model.copy_with_adjustments(
             scale=self.perf_model_err,
-            constant_offset=router_kwargs['scheduling_overhead']
-            + PERF_MODEL_HEADROOM,
+            constant_offset=router_kwargs['scheduling_overhead'],
         )
         self.hardware_params = perf_model.hardware_params
         self.tpot = router_kwargs['tpot']
