@@ -1728,7 +1728,8 @@ class SLOsServeRouter(Router):
             scale=self.perf_model_err,
             constant_offset=router_kwargs['scheduling_overhead'],
         )
-        self.hardware_params = perf_model.hardware_params
+        self.perf_model = perf_model
+        self.hardware_params = perf_model.describe_hardware_params()
         self.tpot = router_kwargs['tpot']
         self.n_block = router_kwargs['device_mem']
         # self.device_mems = [router_kwargs['device_mem'] for _ in range(n_devices)]
@@ -1765,10 +1766,10 @@ class SLOsServeRouter(Router):
             False, # fairness 
             False, # continuous
         )
-        self.pre_adm_ctrler.set_ar_planner(
-            tpots = [self.tpot],
-            hardware_params = self.hardware_params,
-            fixed_bs = False 
+        self.perf_model.configure_cpp_ar_planner(
+            self.pre_adm_ctrler,
+            tpots=[self.tpot],
+            fixed_bs=False,
         )
         self.is_oracle = self.oracle_mem
         
@@ -1778,10 +1779,10 @@ class SLOsServeRouter(Router):
             False, # fairness 
             False, # continuous
         )
-        self.adm_planner.set_ar_planner(
-            tpots = [self.tpot],
-            hardware_params = self.hardware_params,
-            fixed_bs = False
+        self.perf_model.configure_cpp_ar_planner(
+            self.adm_planner,
+            tpots=[self.tpot],
+            fixed_bs=False,
         )
         self.kv_xfer_delay = router_kwargs.get('kv_xfer_delay', 0.05)
         self.pre_adm_schedule_dump_threshold_s = router_kwargs.get("pre_adm_schedule_dump_threshold_s", 0.05)
@@ -2031,8 +2032,17 @@ class SLOsServeRouter(Router):
                 f.write("planner_fixed_bs 0\n")
                 f.write("planner_max_bs 16384\n")
                 f.write(f"tpots {1} {self.tpot}\n")
-                f.write(f"hardware_params {len(self.hardware_params)}")
-                for x in self.hardware_params:
+                planner_config = self.perf_model.get_cpp_planner_config()
+                if planner_config["type"] == "piecewise_current_tokens":
+                    hardware_params = [
+                        value
+                        for segment_params in planner_config["segment_hardware_params"]
+                        for value in segment_params
+                    ]
+                else:
+                    hardware_params = planner_config["hardware_params"]
+                f.write(f"hardware_params {len(hardware_params)}")
+                for x in hardware_params:
                     f.write(f" {x}")
                 f.write("\n")
                 f.write(f"M {num_free_blocks}\n")
@@ -2163,7 +2173,13 @@ class SLOsServeRouter(Router):
                     if home_prefill_device is not None:
                         did = home_prefill_device
                     else:
-                        did = self.group_idx * self.group_size
+                        did = (
+                            self.group_idx * self.group_size
+                            + self.lb_indices_per_group[self.group_idx]
+                        )
+                        self.lb_indices_per_group[self.group_idx] = (
+                            self.lb_indices_per_group[self.group_idx] + 1
+                        ) % self.n_lb
                         self.group_idx = (self.group_idx + 1) % self.n_group
                 elif (req.prefill_device_id + 1) % self.group_size: 
                     did = req.prefill_device_id + 1

@@ -337,6 +337,129 @@ class RequestInstance:
     def max_tpot_laxity(self):
         return max(self.tpot_laxities, default=0)
 
+
+TTFT_LAXITY_REPORT_PERCENTILES = (20, 50, 80, 90, 95, 99)
+TPOT_SLO_SWEEP_DELTAS = (
+    ("minus_0p010", -0.010),
+    ("minus_0p005", -0.005),
+    ("configured", 0.0),
+    ("plus_0p005", 0.005),
+    ("plus_0p010", 0.010),
+)
+
+
+def _summarize_selected_percentiles(
+    values,
+    percentiles: Tuple[int, ...] = TTFT_LAXITY_REPORT_PERCENTILES,
+) -> Dict[str, float | int | None]:
+    finite_values = [
+        float(value)
+        for value in values
+        if value is not None and np.isfinite(value)
+    ]
+    summary: Dict[str, float | int | None] = {
+        "count": int(len(finite_values)),
+    }
+    for percentile in percentiles:
+        summary[f"p{percentile}"] = None
+    summary["max"] = None
+    if not finite_values:
+        return summary
+
+    data = np.asarray(finite_values, dtype=np.float64)
+    for percentile in percentiles:
+        summary[f"p{percentile}"] = float(np.percentile(data, percentile))
+    summary["max"] = float(np.max(data))
+    return summary
+
+
+def _has_ttft_observation(req: RequestInstance) -> bool:
+    required_prefill_tokens = max(int(req.prompt_tokens) - int(req.num_cached_tokens), 0)
+    if required_prefill_tokens == 0:
+        return True
+    served_tokens = 0
+    for schedule in req.schedules:
+        served_tokens += max(int(schedule.num_scheduled_tokens), 0)
+        if served_tokens >= required_prefill_tokens:
+            return True
+    return False
+
+
+def _compute_ttft_laxity_percentiles(
+    reqs: Dict[str, RequestInstance],
+) -> Dict[str, float | int | None]:
+    ttft_laxities = [
+        float(req.ttft_normalized_laxity)
+        for req in reqs.values()
+        if _has_ttft_observation(req)
+    ]
+    return _summarize_selected_percentiles(ttft_laxities)
+
+
+def _compute_tpot_slo_violation_rate_sweep(
+    reqs: Dict[str, RequestInstance],
+    configured_slo_tpot: float,
+) -> Dict[str, Dict[str, float]]:
+    configured_slo_tpot = float(configured_slo_tpot)
+    total_reqs = len(reqs)
+    sweep: Dict[str, Dict[str, float]] = {}
+    seen_candidates: set[float] = set()
+
+    for label, delta in TPOT_SLO_SWEEP_DELTAS:
+        candidate_tpot = round(configured_slo_tpot + float(delta), 12)
+        if candidate_tpot <= 0.0:
+            continue
+        if candidate_tpot in seen_candidates:
+            continue
+        seen_candidates.add(candidate_tpot)
+
+        n_violations = 0
+        for req in reqs.values():
+            # Requests that never complete cannot satisfy any TPOT contract.
+            if not req.is_finished:
+                n_violations += 1
+                continue
+            if not req.tpot_laxities:
+                continue
+
+            token_indices = np.arange(1, len(req.tpot_laxities) + 1, dtype=np.float64)
+            adjusted_laxities = (
+                np.asarray(req.tpot_laxities, dtype=np.float64)
+                - token_indices * (candidate_tpot - configured_slo_tpot)
+            )
+            if float(np.percentile(adjusted_laxities, 90)) > 0.0:
+                n_violations += 1
+
+        sweep[label] = {
+            "delta": float(candidate_tpot - configured_slo_tpot),
+            "slo_tpot": float(candidate_tpot),
+            "violation_rate": (
+                float(n_violations / total_reqs) if total_reqs else 0.0
+            ),
+        }
+    return sweep
+
+
+def _flatten_ttft_laxity_percentiles(
+    ttft_laxity_percentiles: Dict[str, float | int | None],
+) -> Dict[str, float | int | None]:
+    flat: Dict[str, float | int | None] = {
+        "ttft_laxity_count": ttft_laxity_percentiles.get("count"),
+    }
+    for key in ("p20", "p50", "p80", "p90", "p95", "p99", "max"):
+        flat[f"ttft_laxity_{key}"] = ttft_laxity_percentiles.get(key)
+    return flat
+
+
+def _flatten_tpot_slo_violation_rate_sweep(
+    tpot_slo_violation_rate_sweep: Dict[str, Dict[str, float]],
+) -> Dict[str, float]:
+    flat: Dict[str, float] = {}
+    for label, summary in tpot_slo_violation_rate_sweep.items():
+        flat[f"tpot_slo_{label}"] = float(summary["slo_tpot"])
+        flat[f"tpot_slo_violation_rate_{label}"] = float(summary["violation_rate"])
+    return flat
+
 def _ls_fit(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     # Ordinary least squares with small Tikhonov for numerical stability
     # Solves min ||X w - y||_2
@@ -2091,6 +2214,25 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
     print('attainment rate', attainment_rate)
     print('violations', violations)
     print('rejection rate', rejection_rate)
+
+    ttft_laxity_percentiles = _compute_ttft_laxity_percentiles(reqs)
+    tpot_slo_violation_rate_sweep = _compute_tpot_slo_violation_rate_sweep(
+        reqs,
+        slo_tpot,
+    )
+    ttft_parts = [
+        f"{key}={ttft_laxity_percentiles[key]:.6f}"
+        for key in ("p20", "p50", "p80", "p90", "p95", "p99", "max")
+        if ttft_laxity_percentiles.get(key) is not None
+    ]
+    if ttft_parts:
+        print('ttft laxity percentiles', ', '.join(ttft_parts))
+    tpot_parts = [
+        f"{label}({summary['slo_tpot']:.3f})={summary['violation_rate']:.6f}"
+        for label, summary in tpot_slo_violation_rate_sweep.items()
+    ]
+    if tpot_parts:
+        print('tpot slo violation sweep', ', '.join(tpot_parts))
         
     profit = sum(req.profit for req in reqs.values() if not req.is_violate_slo) / len(reqs)
 
@@ -2265,33 +2407,45 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
         prefix=prefix,
         draw=draw,
     )
+
+    max_tpot_laxity = float(np.percentile(
+        [req.max_tpot_laxity for req in reqs.values()],
+        99,
+    ))
+    ttft_laxity_p99 = ttft_laxity_percentiles.get('p99')
+    base_extra_metrics = {
+        'average_effective_tokens_ratio': float(calc_num_effective_tokens(all_events, reqs, window_size = 1.0)),
+        'average_n_active_servers': average_n_active_servers,
+        'max_num_reqs': float(np.max(num_reqs_series)),
+        'max_num_reqs_under_slo': float(np.max(num_reqs_series - num_violations)),
+        'rejection_rate': rejection_rate,
+        'device_stats': device_stats,
+        'energy_est': estimated_power_summary['total_energy_joules'],
+        'energy_measured': power_summary['total_energy_joules'],
+        'power_source': power_summary['source'],
+        'energy_est_source': estimated_power_summary['source'],
+        'finish_reasons': dict(Counter(finish_reasons)),
+        'cross_node_admission': cross_node_admission,
+        'ttft_laxity_percentiles': ttft_laxity_percentiles,
+        'tpot_slo_violation_rate_sweep': tpot_slo_violation_rate_sweep,
+        **_flatten_ttft_laxity_percentiles(ttft_laxity_percentiles),
+        **_flatten_tpot_slo_violation_rate_sweep(tpot_slo_violation_rate_sweep),
+        **breakdown
+    }
+    base_results = {
+        'slo_attainment_rate': attainment_rate,
+        'violations': violations,
+        'average_cache_hit_rate': average_cache_hit_rate,
+        'ttft_laxity_percentiles': ttft_laxity_percentiles,
+        'tpot_slo_violation_rate_sweep': tpot_slo_violation_rate_sweep,
+        'max_ttft_laxity': float(ttft_laxity_p99) if ttft_laxity_p99 is not None else 0.0,
+        'max_tpot_laxity': max_tpot_laxity,
+        'profit': profit,
+        'extra_metrics': base_extra_metrics,
+    }
     
     if not draw:
-        
-        return {
-            'slo_attainment_rate': attainment_rate,
-            'violations': violations,
-            'average_cache_hit_rate': average_cache_hit_rate,
-            'max_ttft_laxity': np.percentile([req.ttft_normalized_laxity for req in reqs.values()], 99),
-            'max_tpot_laxity': np.percentile([req.max_tpot_laxity for req in reqs.values()], 99),
-            'profit': profit,
-            
-            'extra_metrics': {
-                'average_effective_tokens_ratio': float(calc_num_effective_tokens(all_events, reqs, window_size = 1.0)),
-                'average_n_active_servers': average_n_active_servers,
-                'max_num_reqs': float(np.max(num_reqs_series)),
-                'max_num_reqs_under_slo': float(np.max(num_reqs_series - num_violations)),
-                'rejection_rate': rejection_rate,
-                'device_stats': device_stats,
-                'energy_est': estimated_power_summary['total_energy_joules'],
-                'energy_measured': power_summary['total_energy_joules'],
-                'power_source': power_summary['source'],
-                'energy_est_source': estimated_power_summary['source'],
-                'finish_reasons': dict(Counter(finish_reasons)),
-                'cross_node_admission': cross_node_admission,
-                **breakdown
-            }
-        }
+        return base_results
 
 
     # Create figure and axes
@@ -2473,31 +2627,14 @@ def analyze_slo_violation(reqs: Dict[str, RequestInstance],
     fig.savefig(f'{prefix}.png', dpi=300, bbox_inches='tight')
     print(f'Saved {prefix}.png')
     
+    draw_extra_metrics = dict(base_extra_metrics)
+    draw_extra_metrics.pop('max_num_reqs', None)
+    draw_extra_metrics.pop('max_num_reqs_under_slo', None)
     return {
-        'slo_attainment_rate': attainment_rate,
-        'violations': violations,
-        'average_cache_hit_rate': average_cache_hit_rate,
-            'figure': f'{prefix}.png',
-        'max_ttft_laxity': np.percentile([req.ttft_normalized_laxity for req in reqs.values()], 99),
-            'max_tpot_laxity': np.percentile([req.max_tpot_laxity for req in reqs.values()], 99),
-        'profit': profit,
+        **base_results,
+        'figure': f'{prefix}.png',
         'subplot_stats': subplot_stats,
-        'extra_metrics': {
-                'average_effective_tokens_ratio': float(calc_num_effective_tokens(all_events, reqs, window_size = 1.0)),
-                'average_n_active_servers': average_n_active_servers,
-                # 'max_num_reqs': float(np.max(num_reqs_series)),
-                # 'max_num_reqs_under_slo': float(np.max(num_reqs_series - num_violations)),
-                'rejection_rate': rejection_rate,
-                'device_stats': device_stats,
-                'energy_est': estimated_power_summary['total_energy_joules'],
-                'energy_measured': power_summary['total_energy_joules'],
-                'power_source': power_summary['source'],
-                'energy_est_source': estimated_power_summary['source'],
-                'finish_reasons': dict(Counter(finish_reasons)),
-                'cross_node_admission': cross_node_admission,
-                **breakdown
-            }
-        
+        'extra_metrics': draw_extra_metrics,
     }
 
 def analyze_overprovisioning(filepath, loads):

@@ -140,7 +140,6 @@ class BatchPlanner:
     def _fast_sched_get_batch_time(self, batch: list[tuple[int, int]]) -> float:
         if self._fast_sched_perf_mode == "full":
             return self._perf_model.get_batch_time(batch)
-        hardware_params = self._perf_model.hardware_params
         num_reqs = len(batch)
         num_tot_tokens = sum(n_tokens for _n_past, n_tokens in batch)
         num_past_tokens = sum(n_past for n_past, _n_tokens in batch)
@@ -149,14 +148,11 @@ class BatchPlanner:
             num_reqs=num_reqs,
             num_past_tokens=num_past_tokens,
         )
-        online_spike_slack = getattr(self._perf_model, "_online_spike_slack", 0.0)
-        return (
-            hardware_params[0] * num_tot_tokens
-            + hardware_params[1] * num_reqs
-            + hardware_params[2] * num_past_tokens
-            + hardware_params[3] * num_decode_steps
-            + hardware_params[4]
-            + online_spike_slack
+        return self._perf_model.get_batch_time_from_terms(
+            num_tot_tokens,
+            num_reqs=num_reqs,
+            num_past_tokens=num_past_tokens,
+            num_decode_steps=num_decode_steps,
         )
 
     def _fast_sched_get_bs(
@@ -174,22 +170,15 @@ class BatchPlanner:
                 num_past_tokens=num_past_tokens,
                 num_decode_steps=num_decode_steps,
             )
-        hardware_params = self._perf_model.hardware_params
         num_reqs, num_past_tokens = self._fast_sched_perf_terms(
             num_reqs=num_reqs,
             num_past_tokens=num_past_tokens,
         )
-        online_spike_slack = getattr(self._perf_model, "_online_spike_slack", 0.0)
-        return int(
-            (
-                t
-                - hardware_params[4]
-                - online_spike_slack
-                - hardware_params[3] * num_decode_steps
-                - hardware_params[2] * num_past_tokens
-                - hardware_params[1] * num_reqs
-            )
-            / hardware_params[0]
+        return self._perf_model.get_bs(
+            t,
+            num_reqs=num_reqs,
+            num_past_tokens=num_past_tokens,
+            num_decode_steps=num_decode_steps,
         )
 
     def _get_num_blocks(self, n_tokens: int) -> int:
@@ -251,9 +240,11 @@ class BatchPlanner:
     def _ensure_cpp_planner(self, tpot: float):
         if self._adm_ctrler_tpot is not None and abs(self._adm_ctrler_tpot - tpot) < 1e-9:
             return
-        tpots = [tpot]
-        hw = list(self._perf_model.hardware_params)
-        self._adm_ctrler.set_ar_planner(tpots=tpots, hardware_params=hw, fixed_bs=False)
+        self._perf_model.configure_cpp_ar_planner(
+            self._adm_ctrler,
+            tpots=[tpot],
+            fixed_bs=False,
+        )
         self._adm_ctrler_tpot = tpot
 
     def _dump_schedule_inputs(
@@ -290,7 +281,15 @@ class BatchPlanner:
                 f.write(f"planner_max_bs {planner_max_bs}\n")
                 tpot = self._adm_ctrler_tpot if self._adm_ctrler_tpot is not None else 0.0
                 f.write(f"tpots 1 {tpot}\n")
-                hardware_params = self._perf_model.hardware_params
+                planner_config = self._perf_model.get_cpp_planner_config()
+                if planner_config["type"] == "piecewise_current_tokens":
+                    hardware_params = [
+                        value
+                        for segment_params in planner_config["segment_hardware_params"]
+                        for value in segment_params
+                    ]
+                else:
+                    hardware_params = planner_config["hardware_params"]
                 f.write(f"hardware_params {len(hardware_params)}")
                 for x in hardware_params:
                     f.write(f" {x}")

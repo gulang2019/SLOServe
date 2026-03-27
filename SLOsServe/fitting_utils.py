@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.optimize import nnls
 
 
 BatchTimingSample = tuple[list[tuple[int, int]], float]
@@ -104,7 +105,7 @@ def fit_linear_perf_model(
 
     x_data = np.asarray(xs, dtype=float)
     y_data = np.asarray(ys, dtype=float)
-    params, *_ = np.linalg.lstsq(x_data, y_data, rcond=None)
+    params, _ = nnls(x_data, y_data)
 
     adjusted_params = np.asarray(params, dtype=float).copy()
     raw_num_reqs_coef = float(adjusted_params[1])
@@ -145,6 +146,8 @@ def fit_linear_perf_model(
             "mae": mae,
             "rmse": rmse,
             "r2": float(r2),
+            "fit_method": "nnls",
+            "non_negative_constraints_applied": True,
             "raw_num_reqs_coef": raw_num_reqs_coef,
             "min_abs_num_reqs_coef": min_abs_num_reqs_coef,
             "num_reqs_coef_was_clamped": clamped_num_reqs_coef,

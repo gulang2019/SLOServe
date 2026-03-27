@@ -55,5 +55,6 @@
       "extra_policies": ["round_robin_session:atfc", "round_robin_session:qlm"]
     }
   },
-  "extra_server_args": "--ray_address 10.202.0.8:6379 --worker_env NCCL_IB_DISABLE=1,NCCL_NET=Socket,LD_LIBRARY_PATH=/home/siyuanc_google_com/workspace/SLOsServe/.venv/lib/python3.10/site-packages/cv2"
+  "extra_server_args": "--ray_address 10.202.0.8:6379 --worker_env NCCL_IB_DISABLE=1,NCCL_NET=Socket,LD_LIBRARY_PATH=/home/siyuanc_google_com/workspace/SLOsServe/.venv/lib/python3.10/site-packages/cv2",
+  "extra_args": "--piecewise_perf_model_breakpoints 512 2048"
 }

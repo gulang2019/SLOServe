@@ -99,6 +99,9 @@ PYBIND11_MODULE(SLOsServe_C, m) {
         .def(py::init<std::string, int, bool, bool>(), py::arg("mode"), py::arg("block_size"), py::arg("fifo_fair"), py::arg("continuous"))
         .def("set_ar_planner", &AdmCtrlScheduler::set_ar_planner,
             py::arg("tpots"), py::arg("hardware_params"), py::arg("fixed_bs"), py::arg("max_bs") = 16384)
+        .def("set_ar_piecewise_planner", &AdmCtrlScheduler::set_ar_piecewise_planner,
+            py::arg("tpots"), py::arg("current_token_breakpoints"), py::arg("segment_hardware_params"),
+            py::arg("fixed_bs"), py::arg("max_bs") = 16384)
         .def("set_sd_planner", &AdmCtrlScheduler::set_sd_planner,
             py::arg("tpots"), py::arg("hardware_params"), py::arg("fixed_bs"), 
             py::arg("alpha"), py::arg("max_sd_size"), py::arg("fixed_spec"), py::arg("max_bs") = 16384)

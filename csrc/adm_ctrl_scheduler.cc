@@ -5,6 +5,7 @@
 #include "adm_ctrl.h"
 #include "timer.h"
 #include <math.h>
+#include <cmath>
 #include <assert.h>
 #include <stdio.h>
 #include <cstdlib>
@@ -28,6 +29,53 @@
 const double INFINITE_TIME = 0.5;
 
 namespace {
+
+double eval_linear_profile(
+    const std::vector<double>& params,
+    int n_tokens,
+    size_t n_reqs,
+    size_t n_past_tokens,
+    size_t decode_steps
+) {
+    assert(params.size() == 5);
+    return params[0] * n_tokens
+        + params[1] * static_cast<double>(n_reqs)
+        + params[2] * static_cast<double>(n_past_tokens)
+        + params[3] * static_cast<double>(decode_steps)
+        + params[4];
+}
+
+std::vector<double> flatten_piecewise_segment_params(
+    const std::vector<std::vector<double> >& segment_hardware_params
+) {
+    std::vector<double> flattened;
+    flattened.reserve(segment_hardware_params.size() * 5);
+    for (const auto& segment_params : segment_hardware_params) {
+        assert(segment_params.size() == 5);
+        flattened.insert(
+            flattened.end(),
+            segment_params.begin(),
+            segment_params.end()
+        );
+    }
+    return flattened;
+}
+
+int piece_segment_min(size_t segment_idx, const std::vector<int>& breakpoints) {
+    if (segment_idx == 0) {
+        return 0;
+    }
+    return breakpoints[segment_idx - 1] + 1;
+}
+
+bool has_piece_segment_max(size_t segment_idx, const std::vector<int>& breakpoints) {
+    return segment_idx < breakpoints.size();
+}
+
+int piece_segment_max(size_t segment_idx, const std::vector<int>& breakpoints) {
+    assert(has_piece_segment_max(segment_idx, breakpoints));
+    return breakpoints[segment_idx];
+}
 
 std::string dump_batch_impl_failure(
     const std::vector<Request>& reqs,
@@ -358,22 +406,20 @@ BatchPlanner::BatchPlanner(
     std::cout << ")" << std::endl;
     for (size_t i = 0; i < tpots.size()-1; ++i) 
     assert(tpots[i] <= tpots[i+1]);
-    max_bs = fixed_bs? time_to_batch(tpots[0]):max_bs;
-    std::cout << "max BS: " << max_bs << std::endl;
-    std::cout << "fixed BS: " << fixed_bs << std::endl;
-    std::cout << "continuous: " << continuous << std::endl;
 }
 
 double BatchPlanner::batch_to_time(int n_tokens, size_t n_reqs, size_t n_past_tokens, size_t decode_steps) {
     assert(n_tokens >= 0);
     double t = 0;
     for (int i = 0; i < hardware_params.size(); i += 5){
-        double k1 = hardware_params[i];
-        double k2 = hardware_params[i+1];
-        double k3 = hardware_params[i+2];
-        double k4 = hardware_params[i+3];
-        double b = hardware_params[i+4];
-        t = std::max(k1 * n_tokens + k2 * n_reqs + k3 * n_past_tokens + k4 * decode_steps + b, t);
+        t = std::max(
+            hardware_params[i] * n_tokens
+                + hardware_params[i + 1] * n_reqs
+                + hardware_params[i + 2] * n_past_tokens
+                + hardware_params[i + 3] * decode_steps
+                + hardware_params[i + 4],
+            t
+        );
     }
     return t;
 }
@@ -392,6 +438,146 @@ int BatchPlanner::time_to_batch(double t, size_t n_reqs, size_t n_past_tokens, s
     // std::cout << "time2batch, t:" << t << ", decode_steps:" << decode_steps << std::endl;
     assert(bs > 0);
     return int(bs);
+}
+
+void BatchPlanner::finalize_max_bs() {
+    if (fixed_bs) {
+        max_bs = time_to_batch(tpots[0]);
+    }
+    std::cout << "max BS: " << max_bs << std::endl;
+    std::cout << "fixed BS: " << fixed_bs << std::endl;
+    std::cout << "continuous: " << continuous << std::endl;
+}
+
+PiecewiseARBatchPlanner::PiecewiseARBatchPlanner(
+    const std::vector<double>& tpots,
+    const std::vector<int>& current_token_breakpoints,
+    const std::vector<std::vector<double> >& segment_hardware_params,
+    bool fixed_bs,
+    size_t max_bs,
+    bool continuous
+): ARBatchPlanner(
+        tpots,
+        flatten_piecewise_segment_params(segment_hardware_params),
+        fixed_bs,
+        max_bs,
+        continuous
+    ),
+    current_token_breakpoints(current_token_breakpoints),
+    segment_hardware_params(segment_hardware_params) {
+    assert(this->segment_hardware_params.size() == this->current_token_breakpoints.size() + 1);
+    for (size_t idx = 0; idx < this->segment_hardware_params.size(); ++idx) {
+        assert(this->segment_hardware_params[idx].size() == 5);
+    }
+    for (size_t idx = 1; idx < this->current_token_breakpoints.size(); ++idx) {
+        assert(this->current_token_breakpoints[idx - 1] <= this->current_token_breakpoints[idx]);
+    }
+    std::cout << "Piecewise current-token segments:" << std::endl;
+    for (size_t idx = 0; idx < this->segment_hardware_params.size(); ++idx) {
+        std::cout << "  ["
+                  << piece_segment_min(idx, this->current_token_breakpoints)
+                  << ", ";
+        if (has_piece_segment_max(idx, this->current_token_breakpoints)) {
+            std::cout << piece_segment_max(idx, this->current_token_breakpoints);
+        } else {
+            std::cout << "inf";
+        }
+        std::cout << "] => ";
+        const auto& params = this->segment_hardware_params[idx];
+        std::cout << params[0] << " * n_tokens"
+                  << " + " << params[1] << " * n_reqs"
+                  << " + " << params[2] << " * n_past_tokens"
+                  << " + " << params[3] << " * decode_steps"
+                  << " + " << params[4]
+                  << std::endl;
+    }
+}
+
+double PiecewiseARBatchPlanner::batch_to_time(
+    int n_tokens,
+    size_t n_reqs,
+    size_t n_past_tokens,
+    size_t decode_steps
+) {
+    assert(n_tokens >= 0);
+    size_t segment_idx = 0;
+    while (segment_idx < current_token_breakpoints.size()
+        && n_tokens > current_token_breakpoints[segment_idx]) {
+        ++segment_idx;
+    }
+    assert(segment_idx < segment_hardware_params.size());
+    return eval_linear_profile(
+        segment_hardware_params[segment_idx],
+        n_tokens,
+        n_reqs,
+        n_past_tokens,
+        decode_steps
+    );
+}
+
+int PiecewiseARBatchPlanner::time_to_batch(
+    double t,
+    size_t n_reqs,
+    size_t n_past_tokens,
+    size_t decode_steps
+) {
+    if (batch_to_time(0, n_reqs, n_past_tokens, decode_steps) > t) {
+        return 0;
+    }
+
+    int best_bs = 0;
+    for (size_t segment_idx = 0; segment_idx < segment_hardware_params.size(); ++segment_idx) {
+        const auto& params = segment_hardware_params[segment_idx];
+        const int segment_lo = piece_segment_min(segment_idx, current_token_breakpoints);
+        const bool bounded_above = has_piece_segment_max(segment_idx, current_token_breakpoints);
+        const int segment_hi = bounded_above
+            ? piece_segment_max(segment_idx, current_token_breakpoints)
+            : std::numeric_limits<int>::max();
+
+        int candidate = segment_hi;
+        const double k1 = params[0];
+        const double residual_budget = t
+            - params[4]
+            - params[1] * static_cast<double>(n_reqs)
+            - params[2] * static_cast<double>(n_past_tokens)
+            - params[3] * static_cast<double>(decode_steps);
+
+        if (k1 > 0.0) {
+            if (!std::isfinite(residual_budget)) {
+                continue;
+            }
+            const double raw_candidate = std::floor(residual_budget / k1);
+            if (raw_candidate < static_cast<double>(segment_lo)) {
+                continue;
+            }
+            if (bounded_above) {
+                candidate = std::min(
+                    segment_hi,
+                    static_cast<int>(raw_candidate)
+                );
+            } else if (raw_candidate < static_cast<double>(std::numeric_limits<int>::max())) {
+                candidate = static_cast<int>(raw_candidate);
+            } else {
+                candidate = std::numeric_limits<int>::max();
+            }
+        } else if (residual_budget < 0.0) {
+            continue;
+        } else if (!bounded_above) {
+            candidate = segment_lo;
+        }
+
+        if (candidate < segment_lo) {
+            continue;
+        }
+        while (candidate >= segment_lo
+               && batch_to_time(candidate, n_reqs, n_past_tokens, decode_steps) > t) {
+            --candidate;
+        }
+        if (candidate >= segment_lo) {
+            best_bs = std::max(best_bs, candidate);
+        }
+    }
+    return best_bs;
 }
 
 std::tuple<int, double, std::vector<Batch> > 

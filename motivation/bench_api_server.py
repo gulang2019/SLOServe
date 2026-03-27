@@ -45,7 +45,15 @@ BENCHMARK_METRIC_WINDOW_S = 1.0
 BENCHMARK_IDLE_POWER_PER_GPU_W = 70.0
 BENCHMARK_BATCH_POWER_MATCH_TOLERANCE_S = 0.2
 
-from SLOsServe.perf_model import get_model_max_tokens, get_easy_name
+from SLOsServe.perf_model import (
+    PerfModel,
+    build_piecewise_current_token_hardware_params,
+    extract_batch_perf_sample as extract_perf_model_batch_sample,
+    fit_piecewise_current_token_model,
+    get_easy_name,
+    get_model_max_tokens,
+    iter_current_token_piece_segments,
+)
 
 
 class BenchmarkOverloadedError(RuntimeError):
@@ -322,6 +330,98 @@ def _save_estimated_vs_measured_figure(
     return output_path
 
 
+def _compute_regressed_hardware_params_delta(
+    old_hardware_params: Any,
+    regressed_hardware_params: Any,
+) -> Any:
+    if isinstance(old_hardware_params, list) and isinstance(regressed_hardware_params, list):
+        return [
+            float(new_param - old_param)
+            for old_param, new_param in zip(
+                old_hardware_params,
+                regressed_hardware_params,
+            )
+        ]
+
+    if not isinstance(old_hardware_params, dict) or not isinstance(regressed_hardware_params, dict):
+        return None
+    if (
+        old_hardware_params.get("type") != "piecewise_current_tokens"
+        or regressed_hardware_params.get("type") != "piecewise_current_tokens"
+    ):
+        return None
+    if old_hardware_params.get("breakpoints") != regressed_hardware_params.get("breakpoints"):
+        return None
+
+    old_segments = old_hardware_params.get("segment_params", {})
+    new_segments = regressed_hardware_params.get("segment_params", {})
+    if not isinstance(old_segments, dict) or not isinstance(new_segments, dict):
+        return None
+
+    delta_segments: dict[str, list[float]] = {}
+    for segment_key, old_segment_params in old_segments.items():
+        new_segment_params = new_segments.get(segment_key)
+        if not isinstance(old_segment_params, list) or not isinstance(new_segment_params, list):
+            return None
+        delta_segments[segment_key] = [
+            float(new_param - old_param)
+            for old_param, new_param in zip(old_segment_params, new_segment_params)
+        ]
+
+    return build_piecewise_current_token_hardware_params(
+        delta_segments,
+        breakpoints=old_hardware_params["breakpoints"],
+    )
+
+
+def _piecewise_perf_model_breakpoints(
+    problem: "Problem",
+) -> list[int] | None:
+    if problem.perf_model_piecewise_breakpoints:
+        return [int(point) for point in problem.perf_model_piecewise_breakpoints]
+    if problem.enable_piecewise_perf_model_regression:
+        return [512, 2048]
+    return None
+
+
+def _materialize_piecewise_regressed_hardware_params(
+    old_perf_model: PerfModel,
+    piecewise_fit_result: Dict[str, Any],
+) -> tuple[Dict[str, Any], list[str], list[str]]:
+    breakpoints = piecewise_fit_result["breakpoints"]
+    segment_params: dict[str, list[float]] = {}
+    regressed_segment_keys: list[str] = []
+    fallback_segment_keys: list[str] = []
+
+    for descriptor in iter_current_token_piece_segments(breakpoints):
+        segment_key = descriptor["segment_key"]
+        segment_report = piecewise_fit_result["segments"].get(segment_key)
+        if segment_report is not None:
+            segment_params[segment_key] = [
+                float(param)
+                for param in segment_report["hardware_params"]
+            ]
+            regressed_segment_keys.append(segment_key)
+            continue
+
+        if descriptor["max_current_tokens"] is None:
+            fallback_hint = descriptor["min_current_tokens"]
+        else:
+            fallback_hint = descriptor["max_current_tokens"]
+        segment_params[segment_key] = old_perf_model.get_active_hardware_params(
+            int(fallback_hint)
+        )
+        fallback_segment_keys.append(segment_key)
+
+    piecewise_hardware_params = build_piecewise_current_token_hardware_params(
+        segment_params,
+        breakpoints=breakpoints,
+    )
+    piecewise_hardware_params["fitted_segments"] = list(regressed_segment_keys)
+    piecewise_hardware_params["fallback_segments"] = list(fallback_segment_keys)
+    return piecewise_hardware_params, regressed_segment_keys, fallback_segment_keys
+
+
 def _log_perf_model_errors_from_batch_events(
     problem: "Problem",
     events: List[Dict[str, Any]],
@@ -340,26 +440,76 @@ def _log_perf_model_errors_from_batch_events(
     batch_times = _collect_batch_fit_samples(events)
     if not batch_times:
         return None
-
-    from SLOsServe.perf_model import PerfModel
-
-    old_hardware_params = list(
-        PerfModel.get_perf_model(
-            problem.model_name,
-            problem.perf_model_task,
-        ).hardware_params
-    )
-    fit_result = fit_linear_perf_model(batch_times)
-    regressed_hardware_params = [
-        float(param) for param in fit_result["hardware_params"]
-    ]
-    regressed_hardware_params_delta = [
-        float(new_param - old_param)
-        for old_param, new_param in zip(
-            old_hardware_params,
-            regressed_hardware_params,
+    regression_rows = []
+    for event in events:
+        sample = extract_perf_model_batch_sample(
+            event,
+            subtract_scheduling_overhead=True,
         )
-    ]
+        if sample is not None:
+            regression_rows.append(sample)
+    if not regression_rows:
+        return None
+
+    old_perf_model = PerfModel.get_perf_model(
+        problem.model_name,
+        problem.perf_model_task,
+    )
+    old_hardware_params = old_perf_model.describe_hardware_params()
+    piecewise_breakpoints = _piecewise_perf_model_breakpoints(problem)
+
+    if piecewise_breakpoints is not None:
+        fit_result = fit_piecewise_current_token_model(
+            regression_rows,
+            breakpoints=piecewise_breakpoints,
+        )
+        (
+            regressed_hardware_params,
+            regressed_segment_keys,
+            fallback_segment_keys,
+        ) = _materialize_piecewise_regressed_hardware_params(
+            old_perf_model,
+            fit_result,
+        )
+        regression_model_type = "piecewise_current_tokens"
+        regression_stats = {
+            "aggregate": fit_result["aggregate_stats"],
+            "segments": {
+                segment_key: {
+                    "label": segment_report["label"],
+                    "used_sample_count": segment_report["used_sample_count"],
+                    "hardware_params": segment_report["hardware_params"],
+                    "fit_stats": segment_report["fit_stats"],
+                    "fitted_estimator_stats": (
+                        segment_report["fitted_estimator_stats"]
+                    ),
+                    "existing_estimator_stats": (
+                        segment_report["existing_estimator_stats"]
+                    ),
+                }
+                for segment_key, segment_report in fit_result["segments"].items()
+            },
+        }
+        regression_predicted_times = fit_result["predicted_times"]
+        regression_measured_times = [
+            float(row["measured_time"]) for row in regression_rows
+        ]
+    else:
+        fit_result = fit_linear_perf_model(batch_times)
+        regressed_hardware_params = [
+            float(param) for param in fit_result["hardware_params"]
+        ]
+        regressed_segment_keys = []
+        fallback_segment_keys = []
+        regression_model_type = "linear"
+        regression_stats = fit_result["stats"]
+        regression_predicted_times = fit_result["predicted_times"]
+        regression_measured_times = fit_result["measured_times"]
+
+    regressed_hardware_params_delta = _compute_regressed_hardware_params_delta(
+        old_hardware_params,
+        regressed_hardware_params,
+    )
     empirical_scheduling_overhead = _summarize_batch_scheduling_overhead_rows(
         error_rows
     )
@@ -378,10 +528,11 @@ def _log_perf_model_errors_from_batch_events(
         "event_file": event_file,
         "perf_model_err": float(problem.perf_model_err),
         "configured_scheduling_overhead_s": float(problem.scheduling_overhead),
-        "old_hardware_params": [float(param) for param in old_hardware_params],
+        "old_hardware_params": old_hardware_params,
+        "regression_model_type": regression_model_type,
         "regressed_hardware_params": regressed_hardware_params,
         "regressed_hardware_params_delta": regressed_hardware_params_delta,
-        "regression_stats": fit_result["stats"],
+        "regression_stats": regression_stats,
         "relative_error_denominator": "measured_time",
         "estimated_minus_measured_s": _summarize_distribution(
             [float(row["error_s"]) for row in error_rows]
@@ -420,6 +571,10 @@ def _log_perf_model_errors_from_batch_events(
             ])
         ),
     }
+    if piecewise_breakpoints is not None:
+        summary["regression_breakpoints"] = list(piecewise_breakpoints)
+        summary["regressed_hardware_params_fitted_segments"] = regressed_segment_keys
+        summary["regressed_hardware_params_fallback_segments"] = fallback_segment_keys
     if empirical_scheduling_overhead is not None:
         summary["empirical_scheduling_overhead"] = empirical_scheduling_overhead
     if include_time_lists:
@@ -461,15 +616,16 @@ def _log_perf_model_errors_from_batch_events(
     regression_plot_path = None
     if draw_figure:
         regression_plot_path = _save_estimated_vs_measured_figure(
-            fit_result["predicted_times"],
-            fit_result["measured_times"],
+            regression_predicted_times,
+            regression_measured_times,
             regression_figure_path
             or Path(output_path).with_name(
                 f"{Path(output_path).stem}.regression.png"
             ),
             title=(
                 f"{get_easy_name(problem.model_name)} "
-                f"[{problem.perf_model_task}] Regression"
+                f"[{problem.perf_model_task}] "
+                f"{'Piecewise Regression' if piecewise_breakpoints is not None else 'Regression'}"
             ),
             y_label="Regressed Time (s)",
         )
@@ -554,6 +710,8 @@ class Problem:
     log_perf_model_errors: bool = True
     include_perf_model_time_lists: bool = False
     draw_perf_model_error_figure: bool = True
+    enable_piecewise_perf_model_regression: bool = False
+    perf_model_piecewise_breakpoints: list[int] | None = None
 
     def get_expected_profit(self, input_length: int):
         return float(self.profit_per_input_token * input_length + self.profit_per_output_token * average_output_length + self.profit_base)
@@ -573,6 +731,18 @@ def compute_ttft_slo(
         + float(slo_ttft_per_token) * new_tokens
         + float(slo_routing_overhead)
     )
+
+
+def _perf_model_regression_suffix(
+    enable_piecewise_perf_model_regression: bool,
+    perf_model_piecewise_breakpoints: list[int] | None,
+) -> str:
+    if perf_model_piecewise_breakpoints:
+        normalized = "-".join(str(int(point)) for point in perf_model_piecewise_breakpoints)
+        return f"_pmreg_piecewise_{normalized}"
+    if enable_piecewise_perf_model_regression:
+        return "_pmreg_piecewise_default"
+    return ""
 
 
 def _split_trace_components(trace_spec: str) -> list[str]:
@@ -2468,6 +2638,24 @@ async def main(
                                     n_device = problem.n_devices,
                                     group_size = problem.routing_kwargs.get('group_size'),
                                     draw = True)
+    ttft_laxity_percentiles = results.get('ttft_laxity_percentiles', {})
+    ttft_parts = [
+        f"{key}={ttft_laxity_percentiles[key]:.6f}"
+        for key in ('p20', 'p50', 'p80', 'p90', 'p95', 'p99', 'max')
+        if ttft_laxity_percentiles.get(key) is not None
+    ]
+    if ttft_parts:
+        print('Benchmark TTFT laxity percentiles:', ', '.join(ttft_parts))
+    tpot_slo_violation_rate_sweep = results.get(
+        'tpot_slo_violation_rate_sweep',
+        {},
+    )
+    tpot_parts = [
+        f"{label}({summary['slo_tpot']:.3f})={summary['violation_rate']:.6f}"
+        for label, summary in tpot_slo_violation_rate_sweep.items()
+    ]
+    if tpot_parts:
+        print('Benchmark TPOT SLO violation sweep:', ', '.join(tpot_parts))
     results['rps'] = rps
     results['requested_n_device'] = requested_n_devices
     results['effective_n_device'] = problem.n_devices
@@ -2746,6 +2934,8 @@ def build_problems(
     log_perf_model_errors: bool = True,
     include_perf_model_time_lists: bool = False,
     draw_perf_model_error_figure: bool = True,
+    enable_piecewise_perf_model_regression: bool = False,
+    perf_model_piecewise_breakpoints: list[int] | None = None,
     baseline_decode_cap: int | None = None,
 ):
     session_replay_suffix = _session_replay_suffix(
@@ -2753,11 +2943,16 @@ def build_problems(
         session_pause_s,
     )
     baseline_cap_suffix = _baseline_cap_suffix(baseline_decode_cap)
+    perf_model_regression_suffix = _perf_model_regression_suffix(
+        enable_piecewise_perf_model_regression,
+        perf_model_piecewise_breakpoints,
+    )
     store_prefix = (
         f'{experiment_dir}/{scheduling_policy}_{routing_policy}_{load_scale}_'
         f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
         f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
-        f'{session_replay_suffix}{baseline_cap_suffix}')
+        f'{session_replay_suffix}{baseline_cap_suffix}'
+        f'{perf_model_regression_suffix}')
     requests_trace = trace
     arrival_times_trace = trace
     perf_model_task = _perf_model_task_for_trace_spec(trace)
@@ -2806,8 +3001,9 @@ def build_problems(
     
     print(f'max_decode_batch_size: {max_decode_batch_size}')
     
-    slo_ttft_per_token = perf_model.hardware_params[0] * ttft_slo_scale
-    slo_ttft_constant = (perf_model.hardware_params[4] + perf_model.hardware_params[1]) * ttft_slo_scale
+    slo_ttft_per_token, slo_ttft_constant = perf_model.get_zero_load_prefill_affine_params()
+    slo_ttft_per_token *= ttft_slo_scale
+    slo_ttft_constant *= ttft_slo_scale
     assert slo_tpot >= decode_zero_load
     
     average_prefill_time = perf_model.get_batch_time([(0, average_input_length)])
@@ -3094,6 +3290,7 @@ def build_problems(
 
         group_size = n_device
         n_lb = 1
+        explicit_n_lb = False
         extra_kwargs = {}
         use_planner = False
         if 'planner' in _args:
@@ -3110,6 +3307,7 @@ def build_problems(
                 group_size = int(numeric_prefix[0])
             if len(numeric_prefix) >= 2:
                 n_lb = int(numeric_prefix[1])
+                explicit_n_lb = True
             if len(numeric_prefix) > 2:
                 raise ValueError(
                     f"Too many numeric fields before disagg in routing policy: {routing_policy}"
@@ -3137,10 +3335,18 @@ def build_problems(
                 group_size = int(numeric_fields[0])
             if len(numeric_fields) >= 2:
                 n_lb = int(numeric_fields[1])
+                explicit_n_lb = True
             if len(numeric_fields) > 2:
                 raise ValueError(
                     f"Too many numeric fields in slosserve routing policy: {routing_policy}"
                 )
+
+        # The planner path expects ingress requests to be striped across the
+        # front of each group. When no explicit planner fan-in is requested,
+        # use every slot in the group so slosserve_planner exercises the full
+        # machine instead of seeding only the first server.
+        if use_planner and not explicit_n_lb:
+            n_lb = group_size
 
         routing_kwargss.append({
             "max_decode_length": max_output_length,
@@ -3202,6 +3408,13 @@ def build_problems(
         log_perf_model_errors = log_perf_model_errors,
         include_perf_model_time_lists = include_perf_model_time_lists,
         draw_perf_model_error_figure = draw_perf_model_error_figure,
+        enable_piecewise_perf_model_regression = (
+            enable_piecewise_perf_model_regression
+        ),
+        perf_model_piecewise_breakpoints = (
+            None if perf_model_piecewise_breakpoints is None
+            else [int(point) for point in perf_model_piecewise_breakpoints]
+        ),
     ) for (scheduling_kwargs, routing_kwargs) in product(
         scheduling_kwargss, routing_kwargss)]
 
@@ -3237,6 +3450,8 @@ def run(
     log_perf_model_errors: bool,
     include_perf_model_time_lists: bool,
     draw_perf_model_error_figure: bool,
+    enable_piecewise_perf_model_regression: bool,
+    perf_model_piecewise_breakpoints: list[int] | None,
     baseline_decode_cap: int | None,
     update_clients: bool = True,
 ):
@@ -3279,6 +3494,14 @@ def run(
     print(f'log_perf_model_errors: {log_perf_model_errors}')
     print(f'include_perf_model_time_lists: {include_perf_model_time_lists}')
     print(f'draw_perf_model_error_figure: {draw_perf_model_error_figure}')
+    print(
+        'enable_piecewise_perf_model_regression: '
+        f'{enable_piecewise_perf_model_regression}'
+    )
+    print(
+        'perf_model_piecewise_breakpoints: '
+        f'{perf_model_piecewise_breakpoints}'
+    )
     print(f'baseline_decode_cap: {baseline_decode_cap}')
     print('--End of Problem Grid--')
     results = {}
@@ -3298,6 +3521,8 @@ def run(
                     r['slo_tpot'],
                     r['perf_model_err'],
                     r.get('baseline_decode_cap'),
+                    r.get('enable_piecewise_perf_model_regression', False),
+                    tuple(r.get('perf_model_piecewise_breakpoints') or ()),
                     r.get('enable_session_replay', False),
                     r.get('session_pause_s', 0.0),
                 ): r for r in results
@@ -3332,6 +3557,8 @@ def run(
             slo_tpot,
             perf_model_err,
             baseline_decode_cap,
+            enable_piecewise_perf_model_regression,
+            tuple(perf_model_piecewise_breakpoints or ()),
             enable_session_replay,
             session_pause_s,
         )
@@ -3363,6 +3590,10 @@ def run(
             log_perf_model_errors=log_perf_model_errors,
             include_perf_model_time_lists=include_perf_model_time_lists,
             draw_perf_model_error_figure=draw_perf_model_error_figure,
+            enable_piecewise_perf_model_regression=(
+                enable_piecewise_perf_model_regression
+            ),
+            perf_model_piecewise_breakpoints=perf_model_piecewise_breakpoints,
             baseline_decode_cap=baseline_decode_cap,
         )
         if not len(problems):
@@ -3422,6 +3653,13 @@ def run(
             'slo_tpot': slo_tpot,
             'slo_violation_rate': 1 - best_result.results['slo_attainment_rate'],
             'perf_model_err': perf_model_err,
+            'enable_piecewise_perf_model_regression': (
+                enable_piecewise_perf_model_regression
+            ),
+            'perf_model_piecewise_breakpoints': (
+                None if perf_model_piecewise_breakpoints is None
+                else [int(point) for point in perf_model_piecewise_breakpoints]
+            ),
             'baseline_decode_cap': baseline_decode_cap,
             'enable_session_replay': enable_session_replay,
             'session_pause_s': session_pause_s,
@@ -3690,6 +3928,27 @@ if __name__ == '__main__':
     parser.add_argument('--disable_perf_model_error_figure', action='store_true',
                         help='disable the default estimated-vs-measured perf-model figure')
     parser.add_argument(
+        '--piecewise_perf_model_breakpoints',
+        type=int,
+        nargs='+',
+        default=None,
+        help=(
+            'enable piecewise perf-model regression for the post-run error log '
+            'and use these current-token separation points, for example '
+            '--piecewise_perf_model_breakpoints 512 2048'
+        ),
+    )
+    parser.add_argument(
+        '--enable_piecewise_perf_model_regression',
+        action='store_true',
+        default=False,
+        help=(
+            'enable piecewise perf-model regression for the post-run error log '
+            'using the default breakpoints 512 2048 unless '
+            '--piecewise_perf_model_breakpoints is provided'
+        ),
+    )
+    parser.add_argument(
         '--baseline_decode_cap',
         '--sarathi_max_decode_batch_size',
         dest='baseline_decode_cap',
@@ -3733,6 +3992,13 @@ if __name__ == '__main__':
                 include_perf_model_time_lists = args.include_perf_model_time_lists,
                 draw_perf_model_error_figure = (
                     not args.disable_perf_model_error_figure),
+                enable_piecewise_perf_model_regression = (
+                    args.enable_piecewise_perf_model_regression
+                    or args.piecewise_perf_model_breakpoints is not None
+                ),
+                perf_model_piecewise_breakpoints = (
+                    args.piecewise_perf_model_breakpoints
+                ),
                 baseline_decode_cap = args.baseline_decode_cap,
                 update_clients = not args.skip_update_clients,
             )
@@ -3799,6 +4065,13 @@ if __name__ == '__main__':
                 'include_perf_model_time_lists': args.include_perf_model_time_lists,
                 'draw_perf_model_error_figure': (
                     not args.disable_perf_model_error_figure),
+                'enable_piecewise_perf_model_regression': (
+                    args.enable_piecewise_perf_model_regression
+                    or args.piecewise_perf_model_breakpoints is not None
+                ),
+                'perf_model_piecewise_breakpoints': (
+                    args.piecewise_perf_model_breakpoints
+                ),
                 'update_clients': not args.skip_update_clients,
             })
         p.start()
