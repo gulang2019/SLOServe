@@ -3205,9 +3205,9 @@ def build_problems(
             'scheduling_policy': 'edf',
             'enable_admission': True,
             "allow_rejection": True,
-            "scheduling_overhead": 0.005,
+            "scheduling_overhead": scheduling_overhead,
             "slosserve_token_headroom": 1,
-            "max_num_batched_tokens": 4096
+            "max_num_batched_tokens": 16384
         })
         
     elif scheduling_policy == 'atfc':
@@ -3215,8 +3215,9 @@ def build_problems(
             'scheduling_policy': 'atfc',
             'enable_admission': True,
             "allow_rejection": True,
-            "scheduling_overhead": 0.005,
-            "max_num_batched_tokens": 4096
+            "scheduling_overhead": scheduling_overhead,
+            "max_num_batched_tokens": 16384,
+            "length_pattern": perf_model_task
         })
 
     elif scheduling_policy == 'slosserve-dp':
@@ -3552,7 +3553,7 @@ def run(
         _trace_name = trace
         burstiness_level = 0.0
     experiment_dir = os.path.abspath(
-        f"{output_dir}/{model_name_easy}_{profit}_{_trace_name}_{window}_{admission_mode}_{burstiness_level}")
+        f"{output_dir}/{model_name_easy}_{profit}_{_trace_name}_{window}_{admission_mode}_{slo_routing_overhead}")
     os.makedirs(experiment_dir, exist_ok=True)
     
     print('--Problem Grid--')

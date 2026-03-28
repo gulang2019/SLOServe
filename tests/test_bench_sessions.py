@@ -74,6 +74,71 @@ def test_split_ready_request_indices_is_noop_when_replay_disabled():
     assert blocked == []
 
 
+def test_ensure_prompts_present_clears_mixed_prompt_sources():
+    requests = [
+        Request(input_length=4, output_length=2, prompt="real prompt"),
+        Request(input_length=4, output_length=2, prompt=None),
+        Request(input_length=2, output_length=1, prompt="other prompt"),
+    ]
+
+    bench_api_server.ensure_prompts_present(requests, model_name="test-model")
+
+    for request in requests:
+        assert isinstance(request.prompt, list)
+        assert len(request.prompt) == request.input_length
+        assert all(isinstance(token, int) for token in request.prompt)
+
+
+def test_ensure_prompts_present_normalizes_existing_strings_to_token_ids():
+    requests = [
+        Request(input_length=4, output_length=2, prompt="prompt a"),
+        Request(input_length=2, output_length=1, prompt="prompt b"),
+    ]
+
+    bench_api_server.ensure_prompts_present(requests, model_name="test-model")
+
+    for request in requests:
+        assert isinstance(request.prompt, list)
+        assert len(request.prompt) == request.input_length
+        assert all(isinstance(token, int) for token in request.prompt)
+
+
+def test_generate_session_replay_prompts_preserves_cached_prefix():
+    requests = [
+        Request(
+            input_length=5,
+            output_length=2,
+            cached_length=0,
+            session_id="session-1",
+            prompt="first prompt",
+        ),
+        Request(
+            input_length=8,
+            output_length=2,
+            cached_length=5,
+            session_id="session-1",
+            prompt="second prompt",
+        ),
+    ]
+
+    bench_api_server.generate_session_replay_prompts(requests, seed=123)
+
+    assert isinstance(requests[0].prompt, list)
+    assert isinstance(requests[1].prompt, list)
+    assert len(requests[0].prompt) == 5
+    assert len(requests[1].prompt) == 8
+    assert requests[1].prompt[:5] == requests[0].prompt[:5]
+
+
+def test_normalize_rejection_reason_maps_scheduler_codes():
+    assert bench_api_server._normalize_rejection_reason("CMP") == "compute"
+    assert bench_api_server._normalize_rejection_reason("MEM") == "memory"
+    assert bench_api_server._normalize_rejection_reason("OOM") == "oom"
+    assert bench_api_server._normalize_rejection_reason("router") == "router"
+    assert bench_api_server._normalize_rejection_reason("UNKNOWN") == "unknown"
+    assert bench_api_server._normalize_rejection_reason(None) is None
+
+
 def test_make_overload_run_result_records_terminal_overload(tmp_path, monkeypatch):
     monkeypatch.setattr(
         bench_api_server.ArrivalTimes,

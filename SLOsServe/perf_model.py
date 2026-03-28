@@ -373,6 +373,308 @@ def save_prediction_scatter_by_category(
     return output_path
 
 
+def _get_present_batch_categories(rows: list[dict[str, Any]]) -> list[str]:
+    present_categories = {str(row["batch_category"]) for row in rows}
+    ordered_categories = [
+        category for category in BATCH_CATEGORY_ORDER
+        if category in present_categories
+    ]
+    remaining_categories = sorted(
+        present_categories.difference(ordered_categories)
+    )
+    return ordered_categories + remaining_categories
+
+
+def _compute_padded_axis_limits(
+    values: np.ndarray,
+    *,
+    floor: float | None = None,
+) -> tuple[float, float]:
+    if values.size == 0:
+        lower = 0.0 if floor is None else float(floor)
+        return lower, lower + 1.0
+
+    lo = float(np.min(values))
+    hi = float(np.max(values))
+    if math.isclose(lo, hi):
+        pad = max(abs(lo) * 0.05, 1.0)
+    else:
+        pad = 0.05 * (hi - lo)
+    lo -= pad
+    hi += pad
+
+    if floor is not None:
+        lo = max(float(floor), lo)
+    if hi <= lo:
+        hi = lo + max(abs(lo) * 0.05, 1.0)
+    return lo, hi
+
+
+def _build_time_vs_current_tokens_legend_handles(
+    categories: list[str],
+    category_counts: dict[str, int],
+    *,
+    comparison_label: str,
+) -> list[Any]:
+    from matplotlib.lines import Line2D
+
+    handles: list[Any] = [
+        Line2D(
+            [],
+            [],
+            marker="o",
+            linestyle="",
+            color="black",
+            label="Measured",
+            markersize=6,
+        ),
+        Line2D(
+            [],
+            [],
+            marker="x",
+            linestyle="",
+            color="black",
+            label=comparison_label,
+            markersize=7,
+        ),
+    ]
+    for category in categories:
+        handles.append(Line2D(
+            [],
+            [],
+            marker="o",
+            linestyle="",
+            color=BATCH_CATEGORY_COLORS.get(category, "#333333"),
+            label=f"{category} (n={category_counts[category]})",
+            markersize=6,
+        ))
+    return handles
+
+
+def save_time_vs_current_tokens_by_category(
+    path: str | Path,
+    rows: list[dict[str, Any]],
+    comparison_times: list[float],
+    *,
+    title: str,
+    comparison_label: str,
+) -> Path:
+    import matplotlib.pyplot as plt
+
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if len(rows) != len(comparison_times):
+        raise ValueError("Rows and comparison times must align.")
+
+    current_tokens = np.asarray(
+        [int(row["total_current_tokens"]) for row in rows],
+        dtype=float,
+    )
+    measured_ms = np.asarray(
+        [float(row["measured_time"]) * 1000.0 for row in rows],
+        dtype=float,
+    )
+    comparison_ms = np.asarray(comparison_times, dtype=float) * 1000.0
+    categories = [str(row["batch_category"]) for row in rows]
+    present_categories = _get_present_batch_categories(rows)
+    category_counts = {
+        category: int(sum(category_name == category for category_name in categories))
+        for category in present_categories
+    }
+
+    fig, ax = plt.subplots(figsize=(9.0, 6.0), tight_layout=True)
+    for category in present_categories:
+        mask = np.asarray([item == category for item in categories], dtype=bool)
+        color = BATCH_CATEGORY_COLORS.get(category, "#333333")
+        ax.scatter(
+            current_tokens[mask],
+            measured_ms[mask],
+            s=20,
+            alpha=0.28,
+            color=color,
+            edgecolors="none",
+        )
+        ax.scatter(
+            current_tokens[mask],
+            comparison_ms[mask],
+            s=26,
+            alpha=0.8,
+            color=color,
+            marker="x",
+            linewidths=1.1,
+        )
+
+    ax.set_xlim(*_compute_padded_axis_limits(current_tokens, floor=0.0))
+    ax.set_ylim(
+        *_compute_padded_axis_limits(
+            np.concatenate([measured_ms, comparison_ms]),
+            floor=0.0,
+        )
+    )
+    ax.set_xlabel("Total Current Tokens")
+    ax.set_ylabel("Time (ms)")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.22)
+    ax.legend(
+        handles=_build_time_vs_current_tokens_legend_handles(
+            present_categories,
+            category_counts,
+            comparison_label=comparison_label,
+        ),
+        frameon=False,
+        ncol=2,
+    )
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    return output_path
+
+
+def _group_zoom_rows_by_category(
+    rows: list[dict[str, Any]],
+    comparison_times: list[float],
+    *,
+    max_measured_time_ms_by_category: dict[str, float] | None = None,
+) -> dict[str, dict[str, Any]]:
+    if len(rows) != len(comparison_times):
+        raise ValueError("Rows and comparison times must align.")
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for category in _get_present_batch_categories(rows):
+        category_items = [
+            (row, float(comparison_time))
+            for row, comparison_time in zip(rows, comparison_times)
+            if str(row["batch_category"]) == category
+        ]
+        filtered_items = list(category_items)
+        filtered_count = 0
+
+        if (
+            max_measured_time_ms_by_category is not None
+            and category in max_measured_time_ms_by_category
+        ):
+            threshold_ms = max(0.0, float(max_measured_time_ms_by_category[category]))
+            candidate_items = [
+                (row, comparison_time)
+                for row, comparison_time in category_items
+                if float(row["measured_time"]) * 1000.0 <= threshold_ms
+            ]
+            if candidate_items:
+                filtered_items = candidate_items
+                filtered_count = len(category_items) - len(filtered_items)
+
+        grouped[category] = {
+            "rows": [row for row, _ in filtered_items],
+            "comparison_times": [comparison_time for _, comparison_time in filtered_items],
+            "filtered_count": filtered_count,
+        }
+    return grouped
+
+
+def save_time_vs_current_tokens_zoom_by_category(
+    path: str | Path,
+    rows: list[dict[str, Any]],
+    comparison_times: list[float],
+    *,
+    title: str,
+    comparison_label: str,
+    max_measured_time_ms_by_category: dict[str, float] | None = None,
+) -> Path:
+    import matplotlib.pyplot as plt
+
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if len(rows) != len(comparison_times):
+        raise ValueError("Rows and comparison times must align.")
+
+    present_categories = _get_present_batch_categories(rows)
+    grouped_rows = _group_zoom_rows_by_category(
+        rows,
+        comparison_times,
+        max_measured_time_ms_by_category=max_measured_time_ms_by_category,
+    )
+
+    ncols = 2 if len(present_categories) > 1 else 1
+    nrows = int(math.ceil(len(present_categories) / ncols))
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(6.5 * ncols, 4.5 * nrows),
+        squeeze=False,
+    )
+
+    for ax, category in zip(axes.flat, present_categories):
+        group = grouped_rows[category]
+        subset_rows = group["rows"]
+        subset_current_tokens = np.asarray(
+            [int(row["total_current_tokens"]) for row in subset_rows],
+            dtype=float,
+        )
+        subset_measured_ms = np.asarray(
+            [float(row["measured_time"]) * 1000.0 for row in subset_rows],
+            dtype=float,
+        )
+        subset_comparison_ms = np.asarray(
+            group["comparison_times"],
+            dtype=float,
+        ) * 1000.0
+        color = BATCH_CATEGORY_COLORS.get(category, "#333333")
+
+        ax.scatter(
+            subset_current_tokens,
+            subset_measured_ms,
+            s=26,
+            alpha=0.36,
+            color=color,
+            edgecolors="none",
+        )
+        ax.scatter(
+            subset_current_tokens,
+            subset_comparison_ms,
+            s=30,
+            alpha=0.85,
+            color=color,
+            marker="x",
+            linewidths=1.15,
+        )
+        ax.set_xlim(
+            *_compute_padded_axis_limits(subset_current_tokens, floor=0.0)
+        )
+        ax.set_ylim(
+            *_compute_padded_axis_limits(
+                np.concatenate([subset_measured_ms, subset_comparison_ms]),
+                floor=0.0,
+            )
+        )
+        ax.set_title(f"{category} (n={len(subset_rows)})")
+        ax.set_xlabel("Total Current Tokens")
+        ax.set_ylabel("Time (ms)")
+        ax.grid(True, alpha=0.22)
+        for spine in ax.spines.values():
+            spine.set_edgecolor(color)
+            spine.set_linewidth(1.4)
+
+    for ax in axes.flat[len(present_categories):]:
+        ax.set_visible(False)
+
+    fig.suptitle(title)
+    fig.legend(
+        handles=_build_time_vs_current_tokens_legend_handles(
+            [],
+            {},
+            comparison_label=comparison_label,
+        )[:2],
+        loc="upper center",
+        ncol=2,
+        frameon=False,
+    )
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.94])
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    return output_path
+
+
 def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     category_counts = {
         category: int(sum(row["batch_category"] == category for row in rows))
@@ -395,6 +697,28 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             [float(row["measured_time"]) for row in rows]
         ),
     }
+
+
+def predict_linear_times_for_rows(
+    rows: list[dict[str, Any]],
+    hardware_params: list[float],
+) -> list[float]:
+    normalized_params = _normalize_hw_param_list(hardware_params)
+    if normalized_params is None:
+        raise ValueError("hardware_params must be a length-5 numeric list.")
+
+    predicted_times: list[float] = []
+    for row in rows:
+        predicted_times.append(
+            float(
+                normalized_params[0] * int(row["total_current_tokens"])
+                + normalized_params[1] * int(row["batch_size"])
+                + normalized_params[2] * int(row["total_past_tokens"])
+                + normalized_params[3] * 1.0
+                + normalized_params[4]
+            )
+        )
+    return predicted_times
 
 
 def fit_piecewise_current_token_model(
@@ -477,6 +801,7 @@ def fit_batch_perf_trace(
     subtract_scheduling_overhead: bool = True,
     min_abs_num_reqs_coef: float = 1e-9,
     fit_by_category: bool = False,
+    decode_fit_max_time_ms: float | None = None,
     fit_piecewise_current_tokens: bool = False,
     piecewise_current_token_breakpoints: tuple[int, ...] | list[int] | None = None,
     viz: bool = False,
@@ -501,6 +826,11 @@ def fit_batch_perf_trace(
     trace_name = Path(trace_path).stem
     suffix = f"_device{device_id}" if device_id is not None else ""
     safe_name = sanitize_filename(f"{trace_name}{suffix}")
+    zoom_max_measured_time_ms_by_category = (
+        {"decode": float(decode_fit_max_time_ms)}
+        if decode_fit_max_time_ms is not None
+        else None
+    )
 
     report = {
         "trace_path": sample_data["trace_path"],
@@ -548,8 +878,66 @@ def fit_batch_perf_trace(
                 title=f"{safe_name} existing estimator by category",
             )
         )
+        report["fitted_time_vs_current_tokens_plot_path"] = str(
+            save_time_vs_current_tokens_by_category(
+                _derive_plot_path(
+                    plot_path,
+                    default_name=safe_name,
+                    suffix="__fitted_vs_current_tokens_by_category",
+                ),
+                rows,
+                fit_result["predicted_times"],
+                title=f"{safe_name} fitted time vs current tokens by category",
+                comparison_label="Fitted",
+            )
+        )
+        report["fitted_time_vs_current_tokens_zoom_plot_path"] = str(
+            save_time_vs_current_tokens_zoom_by_category(
+                _derive_plot_path(
+                    plot_path,
+                    default_name=safe_name,
+                    suffix="__fitted_vs_current_tokens_by_category_zoom",
+                ),
+                rows,
+                fit_result["predicted_times"],
+                title=f"{safe_name} fitted time vs current tokens by category",
+                comparison_label="Fitted",
+                max_measured_time_ms_by_category=zoom_max_measured_time_ms_by_category,
+            )
+        )
+        report["existing_time_vs_current_tokens_plot_path"] = str(
+            save_time_vs_current_tokens_by_category(
+                _derive_plot_path(
+                    plot_path,
+                    default_name=safe_name,
+                    suffix="__existing_vs_current_tokens_by_category",
+                ),
+                rows,
+                [float(row["estimated_time"]) for row in rows],
+                title=f"{safe_name} estimated time vs current tokens by category",
+                comparison_label="Estimated",
+            )
+        )
+        report["existing_time_vs_current_tokens_zoom_plot_path"] = str(
+            save_time_vs_current_tokens_zoom_by_category(
+                _derive_plot_path(
+                    plot_path,
+                    default_name=safe_name,
+                    suffix="__existing_vs_current_tokens_by_category_zoom",
+                ),
+                rows,
+                [float(row["estimated_time"]) for row in rows],
+                title=f"{safe_name} estimated time vs current tokens by category",
+                comparison_label="Estimated",
+                max_measured_time_ms_by_category=zoom_max_measured_time_ms_by_category,
+            )
+        )
 
     if fit_by_category:
+        decode_fit_max_time_s = None
+        if decode_fit_max_time_ms is not None:
+            decode_fit_max_time_s = max(0.0, float(decode_fit_max_time_ms)) / 1000.0
+
         category_rows: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         for idx, row in enumerate(rows):
             category_rows.setdefault(str(row["batch_category"]), []).append((idx, row))
@@ -560,34 +948,76 @@ def fit_batch_perf_trace(
             items = category_rows.get(category, [])
             if not items:
                 continue
+
+            fit_items = list(items)
+            excluded_items: list[tuple[int, dict[str, Any]]] = []
+            outlier_filter_report: dict[str, Any] | None = None
+            if category == "decode" and decode_fit_max_time_s is not None:
+                fit_items = [
+                    (row_idx, row)
+                    for row_idx, row in items
+                    if float(row["measured_time"]) <= decode_fit_max_time_s
+                ]
+                excluded_items = [
+                    (row_idx, row)
+                    for row_idx, row in items
+                    if float(row["measured_time"]) > decode_fit_max_time_s
+                ]
+                outlier_filter_report = {
+                    "applied": True,
+                    "threshold_ms": float(decode_fit_max_time_ms),
+                    "excluded_sample_count": len(excluded_items),
+                    "fit_sample_count": len(fit_items),
+                }
+                if fit_items:
+                    outlier_filter_report["excluded_sample_summary"] = (
+                        _summarize_rows([row for _, row in excluded_items])
+                        if excluded_items else None
+                    )
+                else:
+                    fit_items = list(items)
+                    outlier_filter_report["applied"] = False
+                    outlier_filter_report["fallback_reason"] = (
+                        "threshold_excluded_all_decode_rows"
+                    )
+                    outlier_filter_report["fit_sample_count"] = len(fit_items)
+                    outlier_filter_report["excluded_sample_count"] = 0
+                    outlier_filter_report["excluded_sample_summary"] = None
+
             category_batch_times = [
                 (list(row["batch"]), float(row["measured_time"]))
-                for _, row in items
+                for _, row in fit_items
             ]
             category_fit_result = fit_linear_perf_model(
                 category_batch_times,
                 min_abs_num_reqs_coef=min_abs_num_reqs_coef,
             )
-            for (row_idx, _), predicted_time in zip(
-                items,
-                category_fit_result["predicted_times"],
-            ):
-                category_predicted_times[row_idx] = float(predicted_time)
             category_only_rows = [row for _, row in items]
+            category_predicted_times_all = predict_linear_times_for_rows(
+                category_only_rows,
+                category_fit_result["hardware_params"],
+            )
+            for (row_idx, _), predicted_time in zip(items, category_predicted_times_all):
+                category_predicted_times[row_idx] = float(predicted_time)
+            fit_only_rows = [row for _, row in fit_items]
             category_reports[category] = {
                 "used_sample_count": len(items),
+                "fit_sample_count": len(fit_items),
                 "hardware_params": category_fit_result["hardware_params"],
                 "fit_stats": category_fit_result["stats"],
                 "fitted_estimator_stats": _compute_prediction_stats(
-                    category_fit_result["measured_times"],
-                    category_fit_result["predicted_times"],
+                    [float(row["measured_time"]) for row in category_only_rows],
+                    category_predicted_times_all,
                 ),
                 "existing_estimator_stats": _compute_prediction_stats(
-                    category_fit_result["measured_times"],
+                    [float(row["measured_time"]) for row in category_only_rows],
                     [float(row["estimated_time"]) for row in category_only_rows],
                 ),
                 "sample_summary": _summarize_rows(category_only_rows),
+                "fit_sample_summary": _summarize_rows(fit_only_rows),
             }
+            if outlier_filter_report is not None:
+                category_reports[category]["outlier_filter"] = outlier_filter_report
 
         report["category_fit"] = {
             "aggregate_stats": _compute_prediction_stats(
@@ -596,6 +1026,10 @@ def fit_batch_perf_trace(
             ),
             "categories": category_reports,
         }
+        if decode_fit_max_time_ms is not None:
+            report["category_fit"]["decode_fit_max_time_ms"] = float(
+                decode_fit_max_time_ms
+            )
         if viz:
             report["category_fit"]["plot_path"] = str(
                 save_prediction_scatter_by_category(
@@ -608,6 +1042,33 @@ def fit_batch_perf_trace(
                     category_predicted_times,
                     [str(row["batch_category"]) for row in rows],
                     title=f"{safe_name} category fits",
+                )
+            )
+            report["category_fit"]["time_vs_current_tokens_plot_path"] = str(
+                save_time_vs_current_tokens_by_category(
+                    _derive_plot_path(
+                        plot_path,
+                        default_name=safe_name,
+                        suffix="__fit_by_category_vs_current_tokens",
+                    ),
+                    rows,
+                    category_predicted_times,
+                    title=f"{safe_name} category-fit time vs current tokens",
+                    comparison_label="Category Fit",
+                )
+            )
+            report["category_fit"]["time_vs_current_tokens_zoom_plot_path"] = str(
+                save_time_vs_current_tokens_zoom_by_category(
+                    _derive_plot_path(
+                        plot_path,
+                        default_name=safe_name,
+                        suffix="__fit_by_category_vs_current_tokens_zoom",
+                    ),
+                    rows,
+                    category_predicted_times,
+                    title=f"{safe_name} category-fit time vs current tokens",
+                    comparison_label="Category Fit",
+                    max_measured_time_ms_by_category=zoom_max_measured_time_ms_by_category,
                 )
             )
 
@@ -644,6 +1105,33 @@ def fit_batch_perf_trace(
                     piecewise_fit["predicted_times"],
                     [str(row["batch_category"]) for row in rows],
                     title=f"{safe_name} piecewise current-token fits",
+                )
+            )
+            report["piecewise_current_token_fit"]["time_vs_current_tokens_plot_path"] = str(
+                save_time_vs_current_tokens_by_category(
+                    _derive_plot_path(
+                        plot_path,
+                        default_name=safe_name,
+                        suffix="__fit_piecewise_current_tokens_vs_current_tokens",
+                    ),
+                    rows,
+                    piecewise_fit["predicted_times"],
+                    title=f"{safe_name} piecewise fit time vs current tokens",
+                    comparison_label="Piecewise Fit",
+                )
+            )
+            report["piecewise_current_token_fit"]["time_vs_current_tokens_zoom_plot_path"] = str(
+                save_time_vs_current_tokens_zoom_by_category(
+                    _derive_plot_path(
+                        plot_path,
+                        default_name=safe_name,
+                        suffix="__fit_piecewise_current_tokens_vs_current_tokens_zoom",
+                    ),
+                    rows,
+                    piecewise_fit["predicted_times"],
+                    title=f"{safe_name} piecewise fit time vs current tokens",
+                    comparison_label="Piecewise Fit",
+                    max_measured_time_ms_by_category=zoom_max_measured_time_ms_by_category,
                 )
             )
 
@@ -1283,6 +1771,17 @@ def main() -> int:
         help="Fit separate models for prefill, decode, and mixed batches.",
     )
     parser.add_argument(
+        "--decode-fit-max-time-ms",
+        type=float,
+        default=None,
+        help=(
+            "Optional decode-only outlier cutoff for category fitting. "
+            "Decode batches with measured execution time above this threshold "
+            "are excluded from fitting, and decode zoom panels omit them while "
+            "full plots and summaries still include them."
+        ),
+    )
+    parser.add_argument(
         "--fit-piecewise-current-tokens",
         action="store_true",
         help="Fit separate linear models for current-token segments.",
@@ -1304,6 +1803,7 @@ def main() -> int:
         subtract_scheduling_overhead=not args.keep_scheduling_overhead,
         min_abs_num_reqs_coef=args.min_abs_num_reqs_coef,
         fit_by_category=args.fit_by_category,
+        decode_fit_max_time_ms=args.decode_fit_max_time_ms,
         fit_piecewise_current_tokens=args.fit_piecewise_current_tokens,
         piecewise_current_token_breakpoints=args.piecewise_current_token_breakpoints,
         viz=args.viz,

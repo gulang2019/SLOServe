@@ -621,7 +621,13 @@ def test_fit_batch_perf_trace_by_category_writes_category_reports_and_plots(tmp_
     }
     assert Path(report["plot_path"]).exists()
     assert Path(report["existing_by_category_plot_path"]).exists()
+    assert Path(report["fitted_time_vs_current_tokens_plot_path"]).exists()
+    assert Path(report["fitted_time_vs_current_tokens_zoom_plot_path"]).exists()
+    assert Path(report["existing_time_vs_current_tokens_plot_path"]).exists()
+    assert Path(report["existing_time_vs_current_tokens_zoom_plot_path"]).exists()
     assert Path(report["category_fit"]["plot_path"]).exists()
+    assert Path(report["category_fit"]["time_vs_current_tokens_plot_path"]).exists()
+    assert Path(report["category_fit"]["time_vs_current_tokens_zoom_plot_path"]).exists()
     assert report["category_fit"]["aggregate_stats"]["r2"] == pytest.approx(1.0)
     assert report["category_fit"]["categories"]["decode"]["used_sample_count"] == len(
         batches["decode"]
@@ -632,6 +638,76 @@ def test_fit_batch_perf_trace_by_category_writes_category_reports_and_plots(tmp_
     assert report["category_fit"]["categories"]["mixed"]["used_sample_count"] == len(
         batches["mixed"]
     )
+
+
+def test_fit_batch_perf_trace_by_category_excludes_decode_outliers_from_fit(tmp_path):
+    batches, events = _make_multicategory_batch_events()
+    decode_outlier_measured_time = 0.65
+    decode_non_outlier_measured_times = [0.12, 0.18]
+    events[0]["elapsed"] = decode_outlier_measured_time + events[0]["scheduling_overhead"]
+    events[0]["estimated_time"] = decode_outlier_measured_time * 1.1
+    for event, measured_time in zip(events[1:3], decode_non_outlier_measured_times):
+        event["elapsed"] = measured_time + event["scheduling_overhead"]
+        event["estimated_time"] = measured_time * 1.1
+
+    trace_path = tmp_path / "batches.jsonl"
+    trace_path.write_text(json.dumps(events), encoding="utf-8")
+
+    report = perf_model.fit_batch_perf_trace(
+        trace_path,
+        fit_by_category=True,
+        decode_fit_max_time_ms=400.0,
+    )
+
+    decode_report = report["category_fit"]["categories"]["decode"]
+    assert report["category_fit"]["decode_fit_max_time_ms"] == pytest.approx(400.0)
+    assert decode_report["used_sample_count"] == len(batches["decode"])
+    assert decode_report["fit_sample_count"] == len(batches["decode"]) - 1
+    assert decode_report["outlier_filter"]["applied"] is True
+    assert decode_report["outlier_filter"]["threshold_ms"] == pytest.approx(400.0)
+    assert decode_report["outlier_filter"]["excluded_sample_count"] == 1
+    assert decode_report["outlier_filter"]["fit_sample_count"] == len(
+        batches["decode"]
+    ) - 1
+    assert decode_report["outlier_filter"]["excluded_sample_summary"] is not None
+    assert decode_report["sample_summary"]["measured_time"]["max"] == pytest.approx(
+        decode_outlier_measured_time
+    )
+    assert decode_report["fit_sample_summary"]["measured_time"]["max"] == pytest.approx(
+        max(decode_non_outlier_measured_times)
+    )
+
+
+def test_group_zoom_rows_by_category_filters_decode_outliers_for_zoom():
+    rows = [
+        {
+            "batch_category": "decode",
+            "measured_time": 0.65,
+            "total_current_tokens": 1,
+        },
+        {
+            "batch_category": "decode",
+            "measured_time": 0.18,
+            "total_current_tokens": 2,
+        },
+        {
+            "batch_category": "prefill",
+            "measured_time": 0.9,
+            "total_current_tokens": 1024,
+        },
+    ]
+    grouped = perf_model._group_zoom_rows_by_category(
+        rows,
+        [0.71, 0.19, 0.95],
+        max_measured_time_ms_by_category={"decode": 400.0},
+    )
+
+    assert len(grouped["decode"]["rows"]) == 1
+    assert grouped["decode"]["rows"][0]["measured_time"] == pytest.approx(0.18)
+    assert grouped["decode"]["comparison_times"] == pytest.approx([0.19])
+    assert grouped["decode"]["filtered_count"] == 1
+    assert len(grouped["prefill"]["rows"]) == 1
+    assert grouped["prefill"]["filtered_count"] == 0
 
 
 def test_fit_batch_perf_trace_piecewise_current_tokens_recovers_segment_models(tmp_path):
@@ -649,6 +725,12 @@ def test_fit_batch_perf_trace_piecewise_current_tokens_recovers_segment_models(t
     assert piecewise["breakpoints"] == [512, 2048]
     assert piecewise["segment_order"] == ["le_512", "513_to_2048", "gt_2048"]
     assert Path(piecewise["plot_path"]).exists()
+    assert Path(report["fitted_time_vs_current_tokens_plot_path"]).exists()
+    assert Path(report["fitted_time_vs_current_tokens_zoom_plot_path"]).exists()
+    assert Path(report["existing_time_vs_current_tokens_plot_path"]).exists()
+    assert Path(report["existing_time_vs_current_tokens_zoom_plot_path"]).exists()
+    assert Path(piecewise["time_vs_current_tokens_plot_path"]).exists()
+    assert Path(piecewise["time_vs_current_tokens_zoom_plot_path"]).exists()
     assert piecewise["aggregate_stats"]["r2"] == pytest.approx(1.0)
     assert piecewise["aggregate_stats"]["mae"] == pytest.approx(0.0)
     assert piecewise["aggregate_stats"]["mae"] < report["fitted_estimator_stats"]["mae"]
