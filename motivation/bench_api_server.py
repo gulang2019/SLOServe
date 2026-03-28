@@ -1953,22 +1953,26 @@ def _summarize_rr_disagg_power_metrics(
     }
 
 def ensure_prompts_present(requests: List[Request], model_name: str) -> None:
-    """Ensure prompts exist for all requests.
+    """Ensure prompts exist as token-id lists for all requests.
 
-    If prompt availability is mixed, clear existing prompts and synthesize
-    random token-id sequences for every request so the run uses a uniform
-    prompt representation.
+    Benchmarks in this repo operate on prompt lengths, not prompt semantics.
+    To avoid backend-side tokenization variability, normalize every request to
+    a synthetic token-id prompt unless it already has a token-id list.
     """
     if not requests:
         return
-    has_prompts = [req.prompt is not None for req in requests]
-    if all(has_prompts):
+    has_token_prompts = [
+        isinstance(req.prompt, list)
+        and len(req.prompt) == req.input_length
+        and all(isinstance(token, int) for token in req.prompt)
+        for req in requests
+    ]
+    if all(has_token_prompts):
         return
 
-    if any(has_prompts):
+    if any(req.prompt is not None for req in requests):
         logger.info(
-            "Mixed prompt availability detected; clearing prompts and "
-            "generating synthetic token prompts for all requests."
+            "Normalizing prompts to synthetic token-id lists for all requests."
         )
         for req in requests:
             req.prompt = None
@@ -3378,7 +3382,6 @@ def build_problems(
 
         group_size = n_device
         n_lb = 1
-        explicit_n_lb = False
         extra_kwargs = {}
         use_planner = False
         if 'planner' in _args:
@@ -3395,7 +3398,6 @@ def build_problems(
                 group_size = int(numeric_prefix[0])
             if len(numeric_prefix) >= 2:
                 n_lb = int(numeric_prefix[1])
-                explicit_n_lb = True
             if len(numeric_prefix) > 2:
                 raise ValueError(
                     f"Too many numeric fields before disagg in routing policy: {routing_policy}"
@@ -3423,18 +3425,10 @@ def build_problems(
                 group_size = int(numeric_fields[0])
             if len(numeric_fields) >= 2:
                 n_lb = int(numeric_fields[1])
-                explicit_n_lb = True
             if len(numeric_fields) > 2:
                 raise ValueError(
                     f"Too many numeric fields in slosserve routing policy: {routing_policy}"
                 )
-
-        # The planner path expects ingress requests to be striped across the
-        # front of each group. When no explicit planner fan-in is requested,
-        # use every slot in the group so slosserve_planner exercises the full
-        # machine instead of seeding only the first server.
-        if use_planner and not explicit_n_lb:
-            n_lb = group_size
 
         routing_kwargss.append({
             "max_decode_length": max_output_length,

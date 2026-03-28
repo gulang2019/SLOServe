@@ -1,6 +1,7 @@
 import asyncio
 # from asyncio import Queue
 import copy
+import hashlib
 import time
 import random
 import json
@@ -50,6 +51,83 @@ def _task_done(task: asyncio.Task):
 
 logger = setup_logger("SLOsServe.router.mock_engine", os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"))
 DEBUG = False
+MOCK_REJECTION_REASON = "mock_rejected"
+
+
+def _fit_mock_prompt_token_ids(
+    token_ids: list[int],
+    target_length: int,
+    *,
+    seed_key: str,
+) -> list[int]:
+    target_length = max(0, int(target_length))
+    normalized = [int(token) for token in token_ids[:target_length]]
+    if len(normalized) >= target_length:
+        return normalized
+
+    seed = hashlib.sha256(
+        f"{seed_key}:{','.join(map(str, normalized))}".encode("utf-8")
+    ).digest()
+    while len(normalized) < target_length:
+        seed = hashlib.sha256(seed).digest()
+        normalized.extend(1000 + byte for byte in seed)
+    return normalized[:target_length]
+
+
+def _mock_text_to_token_ids(
+    prompt_text: str,
+    input_length: int,
+    *,
+    seed_key: str,
+) -> list[int]:
+    base_tokens = [1000 + byte for byte in prompt_text.encode("utf-8")]
+    target_length = max(int(input_length), len(base_tokens))
+    return _fit_mock_prompt_token_ids(
+        base_tokens,
+        target_length,
+        seed_key=seed_key,
+    )
+
+
+def _normalize_mock_prompt_token_ids(
+    prompt: Any,
+    input_length: int,
+    *,
+    request_id: str,
+) -> list[int]:
+    if isinstance(prompt, dict):
+        prompt_token_ids = prompt.get("prompt_token_ids")
+        if isinstance(prompt_token_ids, list):
+            target_length = max(int(input_length), len(prompt_token_ids))
+            return _fit_mock_prompt_token_ids(
+                prompt_token_ids,
+                target_length,
+                seed_key=request_id,
+            )
+        prompt_text = prompt.get("prompt")
+        if isinstance(prompt_text, str):
+            return _mock_text_to_token_ids(
+                prompt_text,
+                input_length,
+                seed_key=request_id,
+            )
+
+    if isinstance(prompt, list):
+        target_length = max(int(input_length), len(prompt))
+        return _fit_mock_prompt_token_ids(
+            prompt,
+            target_length,
+            seed_key=request_id,
+        )
+
+    if isinstance(prompt, str):
+        return _mock_text_to_token_ids(
+            prompt,
+            input_length,
+            seed_key=request_id,
+        )
+
+    return _fit_mock_prompt_token_ids([], input_length, seed_key=request_id)
 
 
 def _get_scheduler_exec_plan_snapshot(scheduler) -> Any | None:
@@ -444,7 +522,7 @@ class MockEngineCore:
             print(f'Exception in loop: {e}')
             raise
 
-    async def add_request(self, prompt: str | list[int], 
+    async def add_request(self, prompt: str | list[int] | dict[str, Any],
                           request_id: str,
                           sampling_params: SamplingParams,):
         '''
@@ -458,12 +536,17 @@ class MockEngineCore:
         input_length = sampling_params.extra_args.get('input_length', 0)
         decode_only = sampling_params.extra_args.get('kv_transfer_params', {}).get('do_remote_prefill', False)
         prefill_only = sampling_params.extra_args.get('kv_transfer_params', {}).get('do_remote_decode', False)
+        prompt_token_ids = _normalize_mock_prompt_token_ids(
+            prompt,
+            input_length,
+            request_id=request_id,
+        )
         
         self.n_arrived_reqs += 1
         current_time = time.time()
         request = vllm.v1.request.Request(
             request_id = request_id,
-            prompt_token_ids = [random.randint(0, 1000) for _ in range(input_length)],
+            prompt_token_ids = prompt_token_ids,
             sampling_params = sampling_params,
             priority = 0,
             arrival_time = current_time,
@@ -591,18 +674,20 @@ class MockEngine:
             q.put_nowait(item)  # ✅ don’t await if you want speed
 
     async def add_request(self,
-        prompt: str | list[int],
+        prompt: str | list[int] | dict[str, Any],
         request_id: str, 
         sampling_params: SamplingParams,
-    ) -> tuple[bool, AsyncGenerator[RequestOutput, None]]: 
+    ) -> tuple[bool, AsyncGenerator[RequestOutput, None] | None, str | None]:
         _q = asyncio.Queue(maxsize = 512)
         self._local_queues[request_id] = _q
-        admitted = ray.get(self.engine_core.add_request.remote(
-            "", request_id, sampling_params
-        ))
+        admitted = await self.engine_core.add_request.remote(
+            prompt,
+            request_id,
+            sampling_params,
+        )
         if not admitted:
-            self._local_queues.pop(request_id)
-            return False, None
+            self._local_queues.pop(request_id, None)
+            return False, None, MOCK_REJECTION_REASON
         
         async def generate_stream():
             while True:
@@ -628,11 +713,11 @@ class MockEngine:
                     kv_transfer_params=chunk.get('kv_transfer_params', None)
                 )
                 if chunk.get('finish_reason') is not None: break
-            self._local_queues.pop(request_id)
-        return True, generate_stream()
+            self._local_queues.pop(request_id, None)
+        return True, generate_stream(), None
 
     def generate(self,
-        prompt: str | list[int],
+        prompt: str | list[int] | dict[str, Any],
         request_id: str, 
         sampling_params: SamplingParams,
     ) -> AsyncGenerator[RequestOutput, None]:
@@ -648,14 +733,15 @@ class MockEngine:
             print('dispatch', request_id, time.time(), 'mockengine')
             _q = asyncio.Queue(maxsize = 512)
             self._local_queues[request_id] = _q
-            # TODO: ignore the prompt for now. update later. 
             admitted = await self.engine_core.add_request.remote(
-                "", request_id, sampling_params
+                prompt,
+                request_id,
+                sampling_params,
             )
             
             # if DEBUG:
             if not admitted:
-                self._local_queues.pop(request_id)
+                self._local_queues.pop(request_id, None)
                 yield RequestOutput(
                     request_id=request_id,
                     prompt=None,
@@ -699,7 +785,7 @@ class MockEngine:
                     kv_transfer_params=chunk.get('kv_transfer_params', None)
                 )
                 if chunk.get('finish_reason') is not None: break
-            self._local_queues.pop(request_id)
+            self._local_queues.pop(request_id, None)
         return generate_stream()
 
     async def update_config(self, request_json: dict):
