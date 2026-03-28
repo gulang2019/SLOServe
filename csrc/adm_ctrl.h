@@ -126,8 +126,8 @@ protected:
     bool fixed_bs;
     bool continuous;
     
-    double batch_to_time(int n_tokens, size_t n_reqs = 1, size_t n_past_tokens = 0, size_t decode_steps = 1);
-    int time_to_batch(double t, size_t n_reqs = 1, size_t n_past_tokens = 0, size_t decode_steps = 1);
+    virtual double batch_to_time(int n_tokens, size_t n_reqs = 1, size_t n_past_tokens = 0, size_t decode_steps = 1);
+    virtual int time_to_batch(double t, size_t n_reqs = 1, size_t n_past_tokens = 0, size_t decode_steps = 1);
 
 public:
     BatchPlanner(
@@ -137,6 +137,7 @@ public:
         bool fixed_bs, size_t max_bs, bool continuous
     );
     virtual ~BatchPlanner() = default;
+    void finalize_max_bs();
 
     /**
      * @return int: the extra token batches available for prefills; <0 indicates the decode SLO cannot be satisfied
@@ -198,9 +199,7 @@ public:
         const std::vector<double>& tpots,
         const std::vector<double>&  hardware_params,
         bool fixed_bs, size_t max_bs, bool continuous):
-        BatchPlanner("ARBatchPlanner", tpots, hardware_params, fixed_bs, max_bs, continuous) {
-
-        }
+        BatchPlanner("ARBatchPlanner", tpots, hardware_params, fixed_bs, max_bs, continuous) {}
     
     std::tuple<int, double, std::vector<Batch> > plan(
         double t,
@@ -208,6 +207,25 @@ public:
         bool decode_only,
         double finish_time
     ) override;
+};
+
+class PiecewiseARBatchPlanner: public ARBatchPlanner{
+    std::vector<int> current_token_breakpoints;
+    std::vector<std::vector<double> > segment_hardware_params;
+
+public:
+    PiecewiseARBatchPlanner(
+        const std::vector<double>& tpots,
+        const std::vector<int>& current_token_breakpoints,
+        const std::vector<std::vector<double> >& segment_hardware_params,
+        bool fixed_bs,
+        size_t max_bs,
+        bool continuous
+    );
+
+protected:
+    double batch_to_time(int n_tokens, size_t n_reqs, size_t n_past_tokens, size_t decode_steps) override;
+    int time_to_batch(double t, size_t n_reqs, size_t n_past_tokens, size_t decode_steps) override;
 };
 
 class AdmCtrlScheduler {
@@ -304,6 +322,47 @@ public:
         planner = std::make_unique<ARBatchPlanner>(
             tpots, hardware_params, fixed_bs, max_bs, continuous
         );
+        planner->finalize_max_bs();
+        return *this;
+    }
+
+    AdmCtrlScheduler& set_ar_piecewise_planner(
+        std::vector<double>& tpots,
+        std::vector<int>& current_token_breakpoints,
+        std::vector<std::vector<double> >& segment_hardware_params,
+        bool fixed_bs,
+        size_t max_bs = 16384
+    ) {
+        std::cout << "[AdmCtrlScheduler] setting PiecewiseARBatchPlanner with tpots: ";
+        for (double t : tpots) {
+            std::cout << t << " ";
+        }
+        std::cout << "and current-token breakpoints: ";
+        for (int breakpoint : current_token_breakpoints) {
+            std::cout << breakpoint << " ";
+        }
+        std::cout << "segment params: ";
+        for (const auto& segment_params : segment_hardware_params) {
+            std::cout << "[";
+            for (size_t idx = 0; idx < segment_params.size(); ++idx) {
+                if (idx) {
+                    std::cout << ", ";
+                }
+                std::cout << segment_params[idx];
+            }
+            std::cout << "] ";
+        }
+        std::cout << "max BS: " << max_bs << ", fixed_bs: " << fixed_bs;
+        std::cout << std::endl;
+        planner = std::make_unique<PiecewiseARBatchPlanner>(
+            tpots,
+            current_token_breakpoints,
+            segment_hardware_params,
+            fixed_bs,
+            max_bs,
+            continuous
+        );
+        planner->finalize_max_bs();
         return *this;
     }
 
@@ -320,6 +379,7 @@ public:
             tpots, hardware_params, fixed_bs, max_bs,
             alpha, max_sd_size, fixed_spec, continuous
         );
+        planner->finalize_max_bs();
         return *this;
     }
 
@@ -372,6 +432,7 @@ public:
             planner = std::make_unique<ARBatchPlanner>(
                 std::vector<double>{tpot}, hardware_params, false, 16384, false
             );
+            planner->finalize_max_bs();
         }
     
     std::tuple<std::vector<RequestOutput>, std::vector<std::vector<Batch> > > schedule(
