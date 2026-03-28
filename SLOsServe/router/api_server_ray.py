@@ -67,6 +67,16 @@ def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
 logger = setup_logger("SLOsServe.router.api_server", os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"))
 
 
+def _build_rejection_response(
+    rejection_reason: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"finish_reason": "rejected"}
+    if rejection_reason is not None:
+        payload["stop_reason"] = rejection_reason
+        payload["rejection_reason"] = rejection_reason
+    return payload
+
+
 def _ensure_parent_dir(path: str) -> None:
     parent = os.path.dirname(path)
     if parent:
@@ -664,14 +674,14 @@ class EngineWorker:
         prompt = req_data['prompt'] if isinstance(req_data['prompt'], str) \
                  else TokensPrompt(prompt_token_ids=req_data['prompt'])
 
-        admitted, generator = await self.engine.add_request(prompt=prompt,
+        admitted, generator, rejection_reason = await self.engine.add_request(prompt=prompt,
             request_id=request_id,
             sampling_params=SamplingParams.from_optional(
                 max_tokens=1, ignore_eos=True, extra_args=extra_args
             ))
         
         if not admitted: 
-            return False, None
+            return False, None, rejection_reason
 
         async for out in generator:
             last_output = out
@@ -682,7 +692,7 @@ class EngineWorker:
             response['timestamp'] = time.time()
             if isinstance(last_output.kv_transfer_params, dict):
                 response['kv_transfer_params'] = last_output.kv_transfer_params
-        return True, response
+        return True, response, None
 
     async def decode_stream(self, req_data: dict, request_id: str):
         
@@ -696,7 +706,7 @@ class EngineWorker:
         prompt = req_data['prompt'] if isinstance(req_data['prompt'], str) \
                  else TokensPrompt(prompt_token_ids=req_data['prompt'])
         
-        admitted, generator = await self.engine.add_request(prompt=prompt,
+        admitted, generator, rejection_reason = await self.engine.add_request(prompt=prompt,
             request_id=request_id,
             sampling_params=SamplingParams.from_optional(
                 max_tokens=req_data['max_tokens'],
@@ -705,7 +715,7 @@ class EngineWorker:
             ))
         
         if not admitted:
-            return False
+            return False, rejection_reason
 
         async def _loop():
             n_tokens = 0
@@ -721,6 +731,11 @@ class EngineWorker:
                     'num_computed_tokens': completion.num_computed_tokens,
                     'timestamp': time.time(),
                 }
+                if (
+                    completion.finish_reason == 'rejected'
+                    and completion.stop_reason is not None
+                ):
+                    chunk['rejection_reason'] = completion.stop_reason
                 n_tokens = len(completion.token_ids)
                 text_len = len(completion.text)
                 await self._local_queue.put(chunk)
@@ -729,7 +744,7 @@ class EngineWorker:
             name=f"EngineWorker[{self.device_id}].decode_stream[{request_id}]",
         )
         task.add_done_callback(_task_done)
-        return True 
+        return True, None
 
     async def get_load_statistics(self, n: int = 100) -> list[dict[str, Any]]:
         return await self.engine.get_load_statistics(n)
@@ -751,10 +766,14 @@ async def send_request_to_service_engine(client_idx: int,
     assert engine_actors is not None
     actor = engine_actors[client_idx]
     # Use Ray async await on the ObjectRef
-    admitted, response = await actor.engine_actor.prefill_once.remote(req_data, request_id)
-    return admitted, response
+    admitted, response, rejection_reason = await actor.engine_actor.prefill_once.remote(req_data, request_id)
+    return admitted, response, rejection_reason
 
-async def stream_service_response_engine(client_idx, req_data: dict, request_id: str) -> tuple[bool, AsyncGenerator]:
+async def stream_service_response_engine(
+    client_idx,
+    req_data: dict,
+    request_id: str,
+) -> tuple[bool, AsyncGenerator | None, str | None]:
     """
     Decode step via EngineWorker actor; returns list of chunks and yields them here as SSE.
     """
@@ -762,11 +781,11 @@ async def stream_service_response_engine(client_idx, req_data: dict, request_id:
     actor = engine_actors[client_idx]
     
     Q = actor.local_queues[request_id] = Queue()
-    admitted = await actor.engine_actor.decode_stream.remote(req_data, request_id)
+    admitted, rejection_reason = await actor.engine_actor.decode_stream.remote(req_data, request_id)
     
     if not admitted:
         actor.local_queues.pop(request_id)
-        return False, None 
+        return False, None, rejection_reason 
     
     async def _generator():
         while True:
@@ -785,7 +804,7 @@ async def stream_service_response_engine(client_idx, req_data: dict, request_id:
             #     break
         actor.local_queues.pop(request_id)
     
-    return True, _generator()
+    return True, _generator(), None
     
         
 async def abort_request(client_idx: int, request_id: str):
@@ -840,6 +859,7 @@ class RequestInstance:
         self.decode_device_id: int = -1
         self.rejection_prob: float = 0.0
         self.admission_stat: dict[str, Any] | None = None
+        self.rejection_reason: str | None = None
 
         # runtime state
         self.state: RequestState = RequestState.WAITING
@@ -1722,14 +1742,32 @@ class SLOsServeRouter(Router):
         self.n_devices = n_devices
         from SLOsServe.perf_model import PerfModel
         self.model_name = router_kwargs['model_name']
+        self.perf_model_task = str(router_kwargs.get('perf_model_task', 'default'))
         self.perf_model_err = float(router_kwargs.get('perf_model_err', 1.0))
-        perf_model = PerfModel.get_perf_model(self.model_name)
+        perf_model = PerfModel.get_perf_model(
+            self.model_name,
+            self.perf_model_task,
+        )
         perf_model = perf_model.copy_with_adjustments(
             scale=self.perf_model_err,
             constant_offset=router_kwargs['scheduling_overhead'],
         )
         self.perf_model = perf_model
         self.hardware_params = perf_model.describe_hardware_params()
+        logger.info(
+            "Loaded router perf model: model=%s task=%s type=%s breakpoints=%s perf_model_err=%s",
+            self.model_name,
+            self.perf_model_task,
+            (
+                "piecewise_current_tokens"
+                if perf_model.is_piecewise_current_tokens else "linear"
+            ),
+            (
+                self.hardware_params.get("breakpoints")
+                if isinstance(self.hardware_params, dict) else None
+            ),
+            self.perf_model_err,
+        )
         self.tpot = router_kwargs['tpot']
         self.n_block = router_kwargs['device_mem']
         # self.device_mems = [router_kwargs['device_mem'] for _ in range(n_devices)]
@@ -2998,13 +3036,31 @@ class RequestPool:
                 'slo_ttft': 100
             }
         }
-        response = await send_request_to_service_engine(src_device_id, request_json, request_id)
+        admitted, response, rejection_reason = await send_request_to_service_engine(
+            src_device_id,
+            request_json,
+            request_id,
+        )
+        if not admitted or response is None:
+            raise RuntimeError(
+                f"Dummy prefill request rejected: {request_id} reason={rejection_reason}"
+            )
         first_token_time = time.time()
         if 'kv_transfer_params' in response:
             request_json['kv_transfer_params'] = response['kv_transfer_params']
         first_decode_response_time = None
 
-        async for data in stream_service_response_engine(dst_device_id, request_json, request_id):
+        admitted, generator, rejection_reason = await stream_service_response_engine(
+            dst_device_id,
+            request_json,
+            request_id,
+        )
+        if not admitted or generator is None:
+            raise RuntimeError(
+                f"Dummy decode request rejected: {request_id} reason={rejection_reason}"
+            )
+
+        async for data in generator:
             if first_decode_response_time is None:
                 first_decode_response_time = time.time()
 
@@ -3242,8 +3298,15 @@ class RequestPool:
                             'is_slo_violation': True,
                         })
 
-                        logger.debug(f"Request {request.request_id} not admitted due to , sending rejection")
-                        await request.response_queue.put({"finish_reason": "rejected"})
+                        request.rejection_reason = "ROUTER"
+                        logger.debug(
+                            "Request %s rejected by router fallback policy=%s",
+                            request.request_id,
+                            self.fallback_policy,
+                        )
+                        await request.response_queue.put(
+                            _build_rejection_response(request.rejection_reason)
+                        )
                         await request.response_queue.put(None)
                         continue
                     elif self.fallback_policy == 'asap': 
@@ -3345,12 +3408,15 @@ class RequestPool:
             })
             admission_history['prefill_ddl'] = admission_history.get('prefill_ddl', request.payload['vllm_xargs']['prefill_ddl'] - time.time())
 
-            admitted, generator = await stream_service_response_engine(request.prefill_device_id,
-                                                            request.payload,
-                                                            request.request_id)
+            admitted, generator, rejection_reason = await stream_service_response_engine(
+                request.prefill_device_id,
+                request.payload,
+                request.request_id,
+            )
             
             
             if not admitted:
+                request.rejection_reason = rejection_reason
                 self.load_stat.add_event({
                     'type': 'reject',
                     'timestamp': time.time(),
@@ -3373,7 +3439,9 @@ class RequestPool:
                         decode_device_id=attempted_decode_device_id,
                     )
                 else:
-                    await request.response_queue.put({'finish_reason': 'rejected'})
+                    await request.response_queue.put(
+                        _build_rejection_response(request.rejection_reason)
+                    )
                     await request.response_queue.put(None)
                     self.update_req_state(request, RequestState.DECODE_REJECTED)
                 return 
@@ -3412,13 +3480,16 @@ class RequestPool:
             logger.debug(f"Request {request.request_id} sending to prefill device {request.prefill_device_id}")
             request.payload['vllm_xargs']['prefill_ddl'] -= self.kv_xfer_delay
             request.payload['vllm_xargs']['slo_ttft'] -= self.kv_xfer_delay
-            admitted, response = await send_request_to_service_engine(request.prefill_device_id,
-                                                            request.payload,
-                                                            request.request_id)
+            admitted, response, rejection_reason = await send_request_to_service_engine(
+                request.prefill_device_id,
+                request.payload,
+                request.request_id,
+            )
             request.payload['vllm_xargs']['prefill_ddl'] += self.kv_xfer_delay
             request.payload['vllm_xargs']['slo_ttft'] += self.kv_xfer_delay
 
             if not admitted:
+                request.rejection_reason = rejection_reason
                 logger.debug(f"Request {request.request_id} was rejected at prefill stage")
                 self.load_stat.add_event({
                     'type': 'reject',
@@ -3439,7 +3510,9 @@ class RequestPool:
                         decode_device_id=attempted_decode_device_id,
                     )
                 else:
-                    await request.response_queue.put({'finish_reason': 'rejected'})
+                    await request.response_queue.put(
+                        _build_rejection_response(request.rejection_reason)
+                    )
                     await request.response_queue.put(None)
                 return
             kv_transfer_params = response.get('kv_transfer_params', {})
@@ -3499,10 +3572,13 @@ class RequestPool:
         is_rejected = False
         attempted_prefill_device_id = request.prefill_device_id
         attempted_decode_device_id = request.decode_device_id
-        admitted, generator = await stream_service_response_engine(request.decode_device_id,
-                                                        request.payload,
-                                                        request_id=request.request_id)
+        admitted, generator, rejection_reason = await stream_service_response_engine(
+            request.decode_device_id,
+            request.payload,
+            request_id=request.request_id,
+        )
         if not admitted: 
+            request.rejection_reason = rejection_reason
             logger.debug(f"Request {request.request_id} was rejected at decode stage")
             is_rejected = True
             self.load_stat.add_event({
@@ -3525,7 +3601,9 @@ class RequestPool:
                 )
                 logger.debug(f"Request {request.request_id} waiting for rescheduling")
             else:
-                await request.response_queue.put({'finish_reason': 'rejected'})
+                await request.response_queue.put(
+                    _build_rejection_response(request.rejection_reason)
+                )
                 await request.response_queue.put(None)
             return 
             

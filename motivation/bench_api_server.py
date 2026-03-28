@@ -68,6 +68,26 @@ def _request_id_sort_key(request_id: Any) -> tuple[int, int | str]:
         return (1, request_id_str)
 
 
+def _normalize_rejection_reason(reason: Any) -> str | None:
+    if reason is None:
+        return None
+    raw = str(reason).strip()
+    if not raw:
+        return None
+    normalized = raw.upper()
+    if normalized in {"CMP", "COMPUTE", "REJECTED-COMPUTE"}:
+        return "compute"
+    if normalized in {"MEM", "MEMORY", "REJECTED-MEMORY"}:
+        return "memory"
+    if normalized in {"OOM", "REJECTED-OOM", "OUT_OF_MEMORY"}:
+        return "oom"
+    if normalized in {"ROUTER", "ROUTER_REJECTION"}:
+        return "router"
+    if normalized == "UNKNOWN":
+        return "unknown"
+    return raw.lower()
+
+
 def _extract_batch_perf_sample(
     event: Dict[str, Any],
 ) -> tuple[Dict[str, Any], list[tuple[int, int]]] | None:
@@ -935,6 +955,7 @@ class ExecutionResult:
     request: Request
     timestamps: List[float]
     request_id: str
+    rejection_reason: str | None = None
     slo_result: str | None = None
     laxities: List[float] = field(default_factory=list)
     expected_finish_time: List[float] = field(default_factory=list)
@@ -1058,6 +1079,8 @@ def _make_overload_run_result(
             "slo_attainment_rate": 0.0,
             "run_status": "overloaded",
             "overloaded": True,
+            "rejection_reason_counts": {},
+            "rejected_request_reasons": {},
             "overload_reason": "server_unhealthy",
             "overload_error_type": type(error).__name__,
             "overload_error": str(error),
@@ -1090,10 +1113,11 @@ async def run_request(client: httpx.AsyncClient,
                     ttft_slo: float,
                     slo_tpot: float, 
                     expected_profit: float,
-                    real_arrival_times: dict) -> Tuple[str, List[float]]:
+                    real_arrival_times: dict) -> Tuple[bool, str | None, str, List[float]]:
         real_arrival_times[request_id] = time.time()
         timestamps = []
         response_text = ""
+        rejection_reason: str | None = None
         
         headers = {
             "Content-Type": "application/json",
@@ -1135,7 +1159,19 @@ async def run_request(client: httpx.AsyncClient,
                 try:
                     obj = json.loads(payload_text)
                     if 'finish_reason' in obj:
-                        is_rejected = obj['finish_reason'] and 'rejected' in obj['finish_reason']
+                        finish_reason = str(obj['finish_reason'] or '')
+                        finish_reason_lower = finish_reason.lower()
+                        is_rejected = 'reject' in finish_reason_lower
+                        if is_rejected:
+                            rejection_reason = _normalize_rejection_reason(
+                                obj.get('rejection_reason')
+                                or obj.get('stop_reason')
+                                or (
+                                    'ROUTER'
+                                    if finish_reason_lower == 'router_rejection'
+                                    else None
+                                )
+                            )
                         if obj['finish_reason'] == 'error':
                             raise RuntimeError(obj.get('error', 'backend error'))
                 except RuntimeError:
@@ -1156,7 +1192,7 @@ async def run_request(client: httpx.AsyncClient,
                 chunks.append(obj)
             logger.info(f"Streaming response finished: request_id={request_id}")
         # print(f'Request {request_id} finished with {len(timestamps)} timestamps IL: {input_length} OL: {output_length} .')
-        return is_rejected, response_text, timestamps
+        return is_rejected, rejection_reason, response_text, timestamps
 
 def summarize_energy_events(
     events: List[Dict[str, Any] | Any],
@@ -1919,21 +1955,24 @@ def _summarize_rr_disagg_power_metrics(
 def ensure_prompts_present(requests: List[Request], model_name: str) -> None:
     """Ensure prompts exist for all requests.
 
-    Assumes homogeneity: either all requests already have prompts or none do.
-    If none have prompts, synthesize random token-id sequences per input length
-    bucket and pass them through directly as list[int].
+    If prompt availability is mixed, clear existing prompts and synthesize
+    random token-id sequences for every request so the run uses a uniform
+    prompt representation.
     """
     if not requests:
         return
-    first_has_prompt = requests[0].prompt is not None
-    if first_has_prompt:
-        # Verify assumption: all must have prompt
-        for req in requests:
-            assert req.prompt is not None, "Mixed prompt presence encountered; expected homogeneity."
+    has_prompts = [req.prompt is not None for req in requests]
+    if all(has_prompts):
         return
-    # Verify assumption: none have prompt
-    for req in requests:
-        assert req.prompt is None, "Mixed prompt presence encountered; expected homogeneity."
+
+    if any(has_prompts):
+        logger.info(
+            "Mixed prompt availability detected; clearing prompts and "
+            "generating synthetic token prompts for all requests."
+        )
+        for req in requests:
+            req.prompt = None
+
     rng = np.random.default_rng()
     indices_by_length: Dict[int, List[int]] = {}
     for idx, req in enumerate(requests):
@@ -2287,6 +2326,8 @@ async def main(
     session_ready_at: dict[str, float] = {}
     n_rejected = 0
     n_timed_out = 0
+    rejection_reason_counts: Counter[str] = Counter()
+    rejected_request_reasons: dict[str, str] = {}
     
     try:
         async with httpx.AsyncClient(timeout=3600, base_url=endpoint) as client:
@@ -2398,12 +2439,25 @@ async def main(
 
                         # ===== task SUCCEEDED =====
                         try:
-                            is_rejected, response_text, timestamps = task.result()
+                            is_rejected, rejection_reason, response_text, timestamps = task.result()
+                            normalized_rejection_reason = (
+                                rejection_reason if is_rejected else None
+                            )
                             if is_rejected:
                                 n_rejected += 1
+                                reason_key = normalized_rejection_reason or "unknown"
+                                rejection_reason_counts[reason_key] += 1
+                                rejected_request_reasons[request_id] = reason_key
                             if not len(timestamps):
                                 timestamps = [task_start_time]
-                            execution_results.append(ExecutionResult(request, timestamps, request_id))
+                            execution_results.append(
+                                ExecutionResult(
+                                    request,
+                                    timestamps,
+                                    request_id,
+                                    rejection_reason=normalized_rejection_reason,
+                                )
+                            )
                             if timed_out_before:
                                 logger.info(f"Request {request_id} returned after timeout")
                             if problem.enable_session_replay and request.session_id:
@@ -2656,6 +2710,14 @@ async def main(
     ]
     if tpot_parts:
         print('Benchmark TPOT SLO violation sweep:', ', '.join(tpot_parts))
+    if rejection_reason_counts:
+        rejection_parts = [
+            f"{reason}={count}"
+            for reason, count in sorted(rejection_reason_counts.items())
+        ]
+        print('Benchmark rejection reasons:', ', '.join(rejection_parts))
+    else:
+        print('Benchmark rejection reasons: none')
     results['rps'] = rps
     results['requested_n_device'] = requested_n_devices
     results['effective_n_device'] = problem.n_devices
@@ -2664,6 +2726,16 @@ async def main(
     results['rr_slice_total_request_count'] = original_request_count
     results['run_status'] = 'completed'
     results['overloaded'] = False
+    results['rejection_reason_counts'] = dict(
+        sorted(rejection_reason_counts.items())
+    )
+    results['rejected_request_reasons'] = {
+        request_id: rejected_request_reasons[request_id]
+        for request_id in sorted(
+            rejected_request_reasons,
+            key=_request_id_sort_key,
+        )
+    }
     results['configured_scheduling_overhead_s'] = float(
         problem.scheduling_overhead
     )
@@ -2994,6 +3066,22 @@ def build_problems(
     print(f'max_output_length: {max_output_length}')
     from SLOsServe.perf_model import PerfModel
     perf_model = PerfModel.get_perf_model(model_name, perf_model_task)
+    loaded_perf_model_params = perf_model.describe_hardware_params()
+    loaded_perf_model_type = (
+        "piecewise_current_tokens"
+        if perf_model.is_piecewise_current_tokens else "linear"
+    )
+    loaded_perf_model_breakpoints = (
+        loaded_perf_model_params.get("breakpoints")
+        if isinstance(loaded_perf_model_params, dict) else None
+    )
+    print(
+        "loaded_perf_model:",
+        f"model={model_name}",
+        f"task={perf_model_task}",
+        f"type={loaded_perf_model_type}",
+        f"breakpoints={loaded_perf_model_breakpoints}",
+    )
     max_decode_batch_size = perf_model.get_max_decode_batch_size(slo_tpot, average_input_length)
     decode_zero_load = perf_model.get_batch_time([(0, 1)])
     
@@ -3372,6 +3460,7 @@ def build_problems(
 
     for routing_kwargs in routing_kwargss:
         if isinstance(routing_kwargs, dict):
+            routing_kwargs.setdefault("perf_model_task", perf_model_task)
             routing_kwargs.setdefault("kv_xfer_delay", kv_xfer_delay)
             routing_kwargs.setdefault("perf_model_err", perf_model_err)
     

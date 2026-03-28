@@ -437,6 +437,9 @@ class BatchPlanner:
             self._admitted_requests.append(request_id)
             self._last_infeasible_reason = None
         return must_admit or feasible
+
+    def get_last_infeasible_reason(self) -> str | None:
+        return self._last_infeasible_reason
         
     
     def get_next_batch_and_admitted_reqs(self) -> tuple[dict[str, int], set[str], ExecPlan]:
