@@ -1774,6 +1774,9 @@ class SLOsServeRouter(Router):
         self.block_size = router_kwargs['block_size']
         assert 'max_decode_length' in router_kwargs
         self.max_decode_length = int(router_kwargs['max_decode_length'])
+        self.admission_max_decode_length = int(
+            router_kwargs.get('admission_max_decode_length', self.max_decode_length)
+        )
         self.group_size = router_kwargs.get('group_size', self.n_devices)
         self.n_lb = router_kwargs.get('n_lb', 1)
         self.use_planner = router_kwargs.get('use_planner', False)
@@ -1834,15 +1837,16 @@ class SLOsServeRouter(Router):
             f'SLOServeRouter: n_group: {self.n_group}, n_lb: {self.n_lb}, '
             f'group_size: {self.group_size}, n_prefill_or_mixed: {self.n_prefill_or_mixed_per_group}, '
             f'use_planner: {self.use_planner}, ablation: {self.ablation}, oracle_mem: {self.oracle_mem}, '
+            f'max_decode_length: {self.max_decode_length}, admission_max_decode_length: {self.admission_max_decode_length}, '
             f'perf_model_err: {self.perf_model_err}, hardware_params: {self.hardware_params}, '
             f'scheduling_overhead: {router_kwargs["scheduling_overhead"]}'
         )
 
     def _get_decode_length_ub(self, request: RequestInstance) -> int:
         if not self.oracle_mem:
-            return self.max_decode_length
+            return self.admission_max_decode_length
         extra_args = request.payload.get('vllm_xargs', {})
-        return int(extra_args.get('output_length', request.payload.get('max_tokens', self.max_decode_length)))
+        return int(extra_args.get('output_length', request.payload.get('max_tokens', self.admission_max_decode_length)))
         
     def get_req_data(self, request: RequestInstance):
         extra_args = request.payload['vllm_xargs']

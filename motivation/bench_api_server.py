@@ -3,12 +3,15 @@ import time
 import asyncio
 import os
 import copy
+import contextlib
 from typing import Tuple, List, Dict, Any
 import subprocess
 from dataclasses import dataclass, field, asdict
 import numpy as np
 import pprint
 import json
+import io
+import math
 from itertools import product
 import logging
 import uuid
@@ -58,6 +61,80 @@ from SLOsServe.perf_model import (
 
 class BenchmarkOverloadedError(RuntimeError):
     """Raised when the serving stack dies mid-benchmark."""
+
+
+@contextlib.contextmanager
+def _maybe_suppress_stdout(suppress: bool):
+    if not suppress:
+        yield
+        return
+    with contextlib.redirect_stdout(io.StringIO()):
+        yield
+
+
+def _build_concise_result_row(
+    result: Dict[str, Any],
+    *,
+    trace_used: str | None = None,
+    problem: Any | None = None,
+) -> Dict[str, Any]:
+    if problem is not None and trace_used is None:
+        trace_used = (
+            getattr(problem, "trace_spec", None)
+            or getattr(problem, "length_pattern", None)
+        )
+    average_n_server = result.get("average_n_server")
+    if average_n_server is None:
+        average_n_server = result.get("average_n_active_servers")
+    cache_hit_rate = result.get("cache_hit_rate")
+    if cache_hit_rate is None:
+        cache_hit_rate = result.get("average_cache_hit_rate")
+    slo_ttft_per_token = result.get("slo_ttft_per_token")
+    if slo_ttft_per_token is None and problem is not None:
+        slo_ttft_per_token = getattr(problem, "slo_ttft_per_token", None)
+    slo_ttft_constant = result.get("slo_ttft_constant")
+    if slo_ttft_constant is None and problem is not None:
+        slo_ttft_constant = getattr(problem, "slo_ttft_constant", None)
+    slo_routing_overhead = result.get("slo_routing_overhead")
+    if slo_routing_overhead is None and problem is not None:
+        slo_routing_overhead = getattr(problem, "slo_routing_overhead", None)
+    return {
+        "average_n_server": average_n_server,
+        "cache_hit_rate": cache_hit_rate,
+        "energy_consumption": result.get("energy_consumption"),
+        "n_device": result.get("n_device", result.get("effective_n_device")),
+        "rejection_rate": result.get("rejection_rate"),
+        "routing_policy": result.get("routing_policy"),
+        "scheduling_policy": result.get("scheduling_policy"),
+        "admission_output_length_mode": result.get("admission_output_length_mode"),
+        "admission_output_length": result.get("admission_output_length"),
+        "slo_routing_overhead": slo_routing_overhead,
+        "slo_tpot": result.get("slo_tpot"),
+        "slo_ttft": {
+            "constant": slo_ttft_constant,
+            "per_token": slo_ttft_per_token,
+        },
+        "slo_violation_rate": result.get("slo_violation_rate"),
+        "trace_used": trace_used if trace_used is not None else result.get("trace_used"),
+    }
+
+
+def _print_concise_result_row(
+    result: Dict[str, Any],
+    *,
+    trace_used: str | None = None,
+    problem: Any | None = None,
+) -> None:
+    print(
+        json.dumps(
+            _build_concise_result_row(
+                result,
+                trace_used=trace_used,
+                problem=problem,
+            ),
+            sort_keys=True,
+        )
+    )
 
 
 def _request_id_sort_key(request_id: Any) -> tuple[int, int | str]:
@@ -714,6 +791,8 @@ class Problem:
     
     # scheduling mode
     admission_mode: str = 'arrival'
+    admission_output_length_mode: str = 'max'
+    admission_output_length: int | None = None
     
     # policies
     routing_policy: str = 'slo'
@@ -732,6 +811,7 @@ class Problem:
     draw_perf_model_error_figure: bool = True
     enable_piecewise_perf_model_regression: bool = False
     perf_model_piecewise_breakpoints: list[int] | None = None
+    concise_logging: bool = False
 
     def get_expected_profit(self, input_length: int):
         return float(self.profit_per_input_token * input_length + self.profit_per_output_token * average_output_length + self.profit_base)
@@ -2308,8 +2388,16 @@ async def main(
                 raise
 
     arrival_bar_desc = 'Session Arrival' if problem.enable_session_replay else 'Arrival'
-    arrival_bar = tqdm.tqdm(total = len(trace_request_indices), desc = arrival_bar_desc)
-    finished_bar = tqdm.tqdm(total = len(requests), desc = 'Finished Requests')
+    arrival_bar = tqdm.tqdm(
+        total=len(trace_request_indices),
+        desc=arrival_bar_desc,
+        disable=problem.concise_logging,
+    )
+    finished_bar = tqdm.tqdm(
+        total=len(requests),
+        desc='Finished Requests',
+        disable=problem.concise_logging,
+    )
     
     global_start_time = time.time()
     print(f'global_start_time: {global_start_time}')
@@ -2758,8 +2846,14 @@ async def main(
         n_devices=problem.n_devices,
         tensor_parallel_size=problem.tensor_parallel_size,
         output_prefix=f'{problem.store_prefix}.{i}',
-        scheduling_policy=problem.scheduling_policy,
-        routing_policy=problem.routing_policy,
+        scheduling_policy=_policy_name_with_admission_output_length(
+            problem.scheduling_policy,
+            problem.admission_output_length_mode,
+        ),
+        routing_policy=_policy_name_with_admission_output_length(
+            problem.routing_policy,
+            problem.admission_output_length_mode,
+        ),
     )
     extra_metrics.update(benchmark_energy_figure_metrics)
     arrival_duration_s = (
@@ -2985,6 +3079,68 @@ def _baseline_cap_suffix(baseline_decode_cap: int | None) -> str:
     return f"_bcap{int(baseline_decode_cap)}"
 
 
+def _normalize_admission_output_length_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized == "max":
+        return normalized
+    if normalized.startswith("p"):
+        try:
+            percentile = int(normalized[1:])
+        except ValueError as exc:
+            raise ValueError(
+                f"Unsupported admission output length mode: {mode}"
+            ) from exc
+        if 0 <= percentile <= 100:
+            return f"p{percentile}"
+    raise ValueError(f"Unsupported admission output length mode: {mode}")
+
+
+def _admission_output_length_suffix(mode: str) -> str:
+    normalized = _normalize_admission_output_length_mode(mode)
+    if normalized == "max":
+        return ""
+    return f"_{normalized}"
+
+
+def _policy_name_with_admission_output_length(
+    policy_name: str,
+    mode: str,
+) -> str:
+    return f"{policy_name}{_admission_output_length_suffix(mode)}"
+
+
+def _base_policy_name_from_result(
+    result: dict[str, Any],
+    *,
+    key: str,
+    base_key: str,
+) -> str:
+    base_policy_name = result.get(base_key)
+    if base_policy_name:
+        return str(base_policy_name)
+    policy_name = str(result[key])
+    mode = _normalize_admission_output_length_mode(
+        result.get("admission_output_length_mode", "max")
+    )
+    suffix = _admission_output_length_suffix(mode)
+    if suffix and policy_name.endswith(suffix):
+        return policy_name[: -len(suffix)]
+    return policy_name
+
+
+def _select_admission_output_length(
+    output_lengths: np.ndarray,
+    mode: str,
+) -> int:
+    normalized = _normalize_admission_output_length_mode(mode)
+    if output_lengths.size == 0:
+        raise ValueError("Cannot select an admission output length from empty data")
+    if normalized == "max":
+        return int(np.max(output_lengths))
+    percentile = int(normalized[1:])
+    return max(1, int(math.ceil(float(np.percentile(output_lengths, percentile)))))
+
+
 def build_problems(
     model_name: str,
     trace: str,
@@ -3013,18 +3169,30 @@ def build_problems(
     enable_piecewise_perf_model_regression: bool = False,
     perf_model_piecewise_breakpoints: list[int] | None = None,
     baseline_decode_cap: int | None = None,
+    admission_output_length_mode: str = "max",
 ):
+    admission_output_length_mode = _normalize_admission_output_length_mode(
+        admission_output_length_mode
+    )
     session_replay_suffix = _session_replay_suffix(
         enable_session_replay,
         session_pause_s,
     )
     baseline_cap_suffix = _baseline_cap_suffix(baseline_decode_cap)
+    display_scheduling_policy = _policy_name_with_admission_output_length(
+        scheduling_policy,
+        admission_output_length_mode,
+    )
+    display_routing_policy = _policy_name_with_admission_output_length(
+        routing_policy,
+        admission_output_length_mode,
+    )
     perf_model_regression_suffix = _perf_model_regression_suffix(
         enable_piecewise_perf_model_regression,
         perf_model_piecewise_breakpoints,
     )
     store_prefix = (
-        f'{experiment_dir}/{scheduling_policy}_{routing_policy}_{load_scale}_'
+        f'{experiment_dir}/{display_scheduling_policy}_{display_routing_policy}_{load_scale}_'
         f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
         f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
         f'{session_replay_suffix}{baseline_cap_suffix}'
@@ -3046,6 +3214,10 @@ def build_problems(
     average_output_length = float(np.mean(output_lengths))
     output_length_percentiles = np.percentile(output_lengths, [50, 75, 85, 90, 95, 99])
     max_output_length = int(max(output_lengths))
+    admission_output_length = _select_admission_output_length(
+        output_lengths,
+        admission_output_length_mode,
+    )
     input_length_percentiles = np.percentile(input_lengths, [50, 75, 85, 90, 95, 99])
     print(f'average_input_length: {average_input_length}')
     print(f'average_output_length: {average_output_length}')
@@ -3068,6 +3240,11 @@ def build_problems(
         f'p99={output_length_percentiles[5]}'
     )
     print(f'max_output_length: {max_output_length}')
+    print(
+        'admission_output_length: '
+        f'mode={admission_output_length_mode}, '
+        f'value={admission_output_length}'
+    )
     from SLOsServe.perf_model import PerfModel
     perf_model = PerfModel.get_perf_model(model_name, perf_model_task)
     loaded_perf_model_params = perf_model.describe_hardware_params()
@@ -3241,6 +3418,7 @@ def build_problems(
 
     for sch_kwargs in scheduling_kwargss:
         sch_kwargs['max_decoding_length'] = max_output_length
+        sch_kwargs['admission_max_decoding_length'] = admission_output_length
     
     routing_kwargss = []
     if routing_policy == 'round_robin_session':
@@ -3433,6 +3611,7 @@ def build_problems(
 
         routing_kwargss.append({
             "max_decode_length": max_output_length,
+            "admission_max_decode_length": admission_output_length,
             "enable_rescheduling": True,
             "enable_rerouting": False,
             'device_mem': 1248576, # TODO: make it concrete. 
@@ -3483,6 +3662,8 @@ def build_problems(
         scheduling_kwargs = scheduling_kwargs,
         store_prefix = store_prefix,
         admission_mode = admission_mode,
+        admission_output_length_mode = admission_output_length_mode,
+        admission_output_length = admission_output_length,
         perf_model_err = perf_model_err,
         scheduling_overhead = scheduling_overhead,
         routing_overhead = routing_overhead,
@@ -3537,8 +3718,16 @@ def run(
     enable_piecewise_perf_model_regression: bool,
     perf_model_piecewise_breakpoints: list[int] | None,
     baseline_decode_cap: int | None,
+    admission_output_length_mode: str,
+    concise_logging: bool = False,
     update_clients: bool = True,
 ):
+    admission_output_length_mode = _normalize_admission_output_length_mode(
+        admission_output_length_mode
+    )
+    original_log_level = logger.level
+    if concise_logging:
+        logger.setLevel(logging.WARNING)
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     
@@ -3556,41 +3745,47 @@ def run(
         f"{output_dir}/{model_name_easy}_{profit}_{_trace_name}_{window}_{admission_mode}_{slo_routing_overhead}")
     os.makedirs(experiment_dir, exist_ok=True)
     
-    print('--Problem Grid--')
-    print(f"model_name: {model_name_easy}")
-    print(f"ttft_slo_scales: {ttft_slo_scales}")
-    print(f"slo_tpots: {slo_tpots}")
-    print(f"profit: {profit}")
-    print(f"trace: {trace}")
-    print(f"window: {window}")
-    print(f"load_scales: {load_scales}")
-    print(f"n_devices: {n_devices}")
-    print(f"tensor_parallel_size: {tensor_parallel_size}")
-    print(f"policies: {policies}")
-    print(f"Experiment directory: {experiment_dir}")    
-    print(f"admission_mode: {admission_mode}")
-    print(f"scheduling_overhead: {scheduling_overhead}")
-    print(f'performance model errors: {perf_model_errs}')
-    print(f'routing fallback policy: {routing_fallback_policy}')
-    print(f'kv_xfer_delay: {kv_xfer_delay}')
-    print(f'enable_session_replay: {enable_session_replay}')
-    print(f'session_pause_s: {session_pause_s}')
-    print(f'log_perf_model_errors: {log_perf_model_errors}')
-    print(f'include_perf_model_time_lists: {include_perf_model_time_lists}')
-    print(f'draw_perf_model_error_figure: {draw_perf_model_error_figure}')
-    print(
-        'enable_piecewise_perf_model_regression: '
-        f'{enable_piecewise_perf_model_regression}'
-    )
-    print(
-        'perf_model_piecewise_breakpoints: '
-        f'{perf_model_piecewise_breakpoints}'
-    )
-    print(f'baseline_decode_cap: {baseline_decode_cap}')
-    print('--End of Problem Grid--')
+    if not concise_logging:
+        print('--Problem Grid--')
+        print(f"model_name: {model_name_easy}")
+        print(f"ttft_slo_scales: {ttft_slo_scales}")
+        print(f"slo_tpots: {slo_tpots}")
+        print(f"profit: {profit}")
+        print(f"trace: {trace}")
+        print(f"window: {window}")
+        print(f"load_scales: {load_scales}")
+        print(f"n_devices: {n_devices}")
+        print(f"tensor_parallel_size: {tensor_parallel_size}")
+        print(f"policies: {policies}")
+        print(f"Experiment directory: {experiment_dir}")    
+        print(f"admission_mode: {admission_mode}")
+        print(f"scheduling_overhead: {scheduling_overhead}")
+        print(f'performance model errors: {perf_model_errs}')
+        print(f'routing fallback policy: {routing_fallback_policy}')
+        print(f'kv_xfer_delay: {kv_xfer_delay}')
+        print(f'enable_session_replay: {enable_session_replay}')
+        print(f'session_pause_s: {session_pause_s}')
+        print(f'log_perf_model_errors: {log_perf_model_errors}')
+        print(f'include_perf_model_time_lists: {include_perf_model_time_lists}')
+        print(f'draw_perf_model_error_figure: {draw_perf_model_error_figure}')
+        print(
+            'enable_piecewise_perf_model_regression: '
+            f'{enable_piecewise_perf_model_regression}'
+        )
+        print(
+            'perf_model_piecewise_breakpoints: '
+            f'{perf_model_piecewise_breakpoints}'
+        )
+        print(f'baseline_decode_cap: {baseline_decode_cap}')
+        print(
+            'admission_output_length_mode: '
+            f'{admission_output_length_mode}'
+        )
+        print('--End of Problem Grid--')
     results = {}
     if os.path.exists(f'{experiment_dir}/results.jsonl'):
-        print(f'Loading cached results from {experiment_dir}/results.jsonl')
+        if not concise_logging:
+            print(f'Loading cached results from {experiment_dir}/results.jsonl')
         with open(f'{experiment_dir}/results.jsonl', 'r') as f:
             results = [json.loads(line) for line in f]
             results = {
@@ -3599,12 +3794,21 @@ def run(
                     r.get('requested_n_device', r['n_device']),
                     r.get('effective_n_device', r['n_device']),
                     r.get('tensor_parallel_size', 1),
-                    r['scheduling_policy'],
-                    r['routing_policy'],
+                    _base_policy_name_from_result(
+                        r,
+                        key='scheduling_policy',
+                        base_key='base_scheduling_policy',
+                    ),
+                    _base_policy_name_from_result(
+                        r,
+                        key='routing_policy',
+                        base_key='base_routing_policy',
+                    ),
                     r['ttft_slo_scale'],
                     r['slo_tpot'],
                     r['perf_model_err'],
                     r.get('baseline_decode_cap'),
+                    r.get('admission_output_length_mode', 'max'),
                     r.get('enable_piecewise_perf_model_regression', False),
                     tuple(r.get('perf_model_piecewise_breakpoints') or ()),
                     r.get('enable_session_replay', False),
@@ -3621,8 +3825,17 @@ def run(
         else:
             scheduling_policy = policy
             routing_policy = 'round_robin'
+        display_scheduling_policy = _policy_name_with_admission_output_length(
+            scheduling_policy,
+            admission_output_length_mode,
+        )
+        display_routing_policy = _policy_name_with_admission_output_length(
+            routing_policy,
+            admission_output_length_mode,
+        )
         if n_device == 1 and 'disaggregated' in routing_policy:
-            print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot} because n_device is 1 and routing policy is disaggregated')
+            if not concise_logging:
+                print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot} because n_device is 1 and routing policy is disaggregated')
             continue
         effective_n_device, _ = _resolve_rr_effective_n_devices(
             n_device,
@@ -3641,61 +3854,107 @@ def run(
             slo_tpot,
             perf_model_err,
             baseline_decode_cap,
+            admission_output_length_mode,
             enable_piecewise_perf_model_regression,
             tuple(perf_model_piecewise_breakpoints or ()),
             enable_session_replay,
             session_pause_s,
         )
         if not overwrite and cache_key in results:
-            print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot}, {perf_model_err} because it already exists')
+            if concise_logging:
+                with _maybe_suppress_stdout(True):
+                    summary_problems = build_problems(
+                        model_name,
+                        trace,
+                        ttft_slo_scale,
+                        slo_tpot,
+                        profit,
+                        scheduling_policy,
+                        routing_policy,
+                        n_device,
+                        tensor_parallel_size,
+                        window,
+                        load_scale,
+                        experiment_dir,
+                        slo_routing_overhead,
+                        admission_mode,
+                        perf_model_err,
+                        routing_overhead,
+                        scheduling_overhead=scheduling_overhead,
+                        routing_fallback_policy=routing_fallback_policy,
+                        kv_xfer_delay=kv_xfer_delay,
+                        enable_session_replay=enable_session_replay,
+                        session_pause_s=session_pause_s,
+                        log_perf_model_errors=log_perf_model_errors,
+                        include_perf_model_time_lists=include_perf_model_time_lists,
+                        draw_perf_model_error_figure=draw_perf_model_error_figure,
+                        enable_piecewise_perf_model_regression=(
+                            enable_piecewise_perf_model_regression
+                        ),
+                        perf_model_piecewise_breakpoints=perf_model_piecewise_breakpoints,
+                        baseline_decode_cap=baseline_decode_cap,
+                        admission_output_length_mode=admission_output_length_mode,
+                    )
+                summary_problem = summary_problems[0] if summary_problems else None
+                _print_concise_result_row(
+                    results[cache_key],
+                    trace_used=trace,
+                    problem=summary_problem,
+                )
+            else:
+                print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot}, {perf_model_err} because it already exists')
             continue
-        problems = build_problems(
-            model_name,
-            trace,
-            ttft_slo_scale,
-            slo_tpot,
-            profit,
-            scheduling_policy,
-            routing_policy,
-            n_device,
-            tensor_parallel_size,
-            window,
-            load_scale,
-            experiment_dir,
-            slo_routing_overhead,
-            admission_mode,
-            perf_model_err,
-            routing_overhead,
-            scheduling_overhead = scheduling_overhead,
-            routing_fallback_policy=routing_fallback_policy,
-            kv_xfer_delay=kv_xfer_delay,
-            enable_session_replay=enable_session_replay,
-            session_pause_s=session_pause_s,
-            log_perf_model_errors=log_perf_model_errors,
-            include_perf_model_time_lists=include_perf_model_time_lists,
-            draw_perf_model_error_figure=draw_perf_model_error_figure,
-            enable_piecewise_perf_model_regression=(
-                enable_piecewise_perf_model_regression
-            ),
-            perf_model_piecewise_breakpoints=perf_model_piecewise_breakpoints,
-            baseline_decode_cap=baseline_decode_cap,
-        )
+        with _maybe_suppress_stdout(concise_logging):
+            problems = build_problems(
+                model_name,
+                trace,
+                ttft_slo_scale,
+                slo_tpot,
+                profit,
+                scheduling_policy,
+                routing_policy,
+                n_device,
+                tensor_parallel_size,
+                window,
+                load_scale,
+                experiment_dir,
+                slo_routing_overhead,
+                admission_mode,
+                perf_model_err,
+                routing_overhead,
+                scheduling_overhead = scheduling_overhead,
+                routing_fallback_policy=routing_fallback_policy,
+                kv_xfer_delay=kv_xfer_delay,
+                enable_session_replay=enable_session_replay,
+                session_pause_s=session_pause_s,
+                log_perf_model_errors=log_perf_model_errors,
+                include_perf_model_time_lists=include_perf_model_time_lists,
+                draw_perf_model_error_figure=draw_perf_model_error_figure,
+                enable_piecewise_perf_model_regression=(
+                    enable_piecewise_perf_model_regression
+                ),
+                perf_model_piecewise_breakpoints=perf_model_piecewise_breakpoints,
+                baseline_decode_cap=baseline_decode_cap,
+                admission_output_length_mode=admission_output_length_mode,
+            )
         if not len(problems):
             logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
             continue
         run_results = []
         for problem in problems:
             # print(f"Running problem: {problem}")
+            problem.concise_logging = concise_logging
             problem.scheduling_kwargs['scheduling_overhead'] = scheduling_overhead
             try:
-                exec_result = asyncio.run(
-                    main(
-                        problem,
-                        endpoint,
-                        clients,
-                        update_clients=update_clients,
+                with _maybe_suppress_stdout(concise_logging):
+                    exec_result = asyncio.run(
+                        main(
+                            problem,
+                            endpoint,
+                            clients,
+                            update_clients=update_clients,
+                        )
                     )
-                )
             except (BenchmarkOverloadedError,
                     httpx.HTTPError,
                     aiohttp.ClientError,
@@ -3730,8 +3989,10 @@ def run(
             'tensor_parallel_size': tensor_parallel_size,
             'total_gpus': effective_n_device * tensor_parallel_size,
             'requested_total_gpus': requested_n_device * tensor_parallel_size,
-            'scheduling_policy': scheduling_policy,
-            'routing_policy': routing_policy,
+            'scheduling_policy': display_scheduling_policy,
+            'routing_policy': display_routing_policy,
+            'base_scheduling_policy': scheduling_policy,
+            'base_routing_policy': routing_policy,
             'profit': best_result.profit,
             'ttft_slo_scale': ttft_slo_scale,
             'slo_tpot': slo_tpot,
@@ -3745,6 +4006,8 @@ def run(
                 else [int(point) for point in perf_model_piecewise_breakpoints]
             ),
             'baseline_decode_cap': baseline_decode_cap,
+            'admission_output_length_mode': admission_output_length_mode,
+            'admission_output_length': problems[0].admission_output_length,
             'enable_session_replay': enable_session_replay,
             'session_pause_s': session_pause_s,
             
@@ -3753,6 +4016,11 @@ def run(
             'per_gpu_energy_consumption': best_result.per_gpu_energy_consumption,
             'scheduling_overhead': scheduling_overhead,
             'burstiness_level': burstiness_level,
+            'trace_used': trace,
+            'slo_routing_overhead': problems[0].slo_routing_overhead,
+            'slo_ttft_per_token': problems[0].slo_ttft_per_token,
+            'slo_ttft_constant': problems[0].slo_ttft_constant,
+            'cache_hit_rate': best_result.results.get('average_cache_hit_rate'),
             'run_status': best_result.results.get('run_status', 'completed'),
             'overloaded': bool(best_result.results.get('overloaded', False)),
             'rr_slice_kept_request_count': best_result.results.get(
@@ -3771,6 +4039,9 @@ def run(
             result.update(best_result.results['auto_scaling_analysis'])
         if 'extra_metrics' in best_result.results:
             result.update(best_result.results['extra_metrics'])
+        result['average_n_server'] = result.get('average_n_active_servers')
+        if result.get('cache_hit_rate') is None:
+            result['cache_hit_rate'] = result.get('average_cache_hit_rate')
         if result.get('window_time_pct_vs_active_requests_figure') is not None:
             result['window_time_pct_vs_active_requests_figure'] = (
                 f'{problems[0].store_prefix}.window_time_pct_vs_active_requests.png'
@@ -3828,9 +4099,12 @@ def run(
         if 'empirical_scheduling_overhead_summary' in best_result.results:
             result['empirical_scheduling_overhead_summary'] = (
                 best_result.results['empirical_scheduling_overhead_summary'])
-        print('--Result--')
-        pprint.pprint(result)
-        print('--End of Result--')
+        if concise_logging:
+            _print_concise_result_row(result, trace_used=trace)
+        else:
+            print('--Result--')
+            pprint.pprint(result)
+            print('--End of Result--')
         
         results[cache_key] = result
         with open(f'{experiment_dir}/results.jsonl', 'a') as f:
@@ -3883,7 +4157,8 @@ def run(
     # Convert results to DataFrame and save source data
     df = pd.DataFrame(results)
     df.to_csv(f'{experiment_dir}/profit_vs_n_device_and_load.csv', index=False)
-    print(f"Saved source data to {experiment_dir}/profit_vs_n_device_and_load.csv")
+    if not concise_logging:
+        print(f"Saved source data to {experiment_dir}/profit_vs_n_device_and_load.csv")
 
     # 1. Plot: for each (scheduling_policy, routing_policy) pair, show profit vs n_device (for each load_scale)
     import math
@@ -3926,7 +4201,9 @@ def run(
                 ax.legend()
             fig.tight_layout()
             fig.savefig(f'{experiment_dir}/figs/{ylabel}_vs_{xlabel}_change_{feature}.png', dpi=300)
-            print(f"Saved plot to {experiment_dir}/figs/{ylabel}_vs_{xlabel}_change_{feature}.png")
+            if not concise_logging:
+                print(f"Saved plot to {experiment_dir}/figs/{ylabel}_vs_{xlabel}_change_{feature}.png")
+    logger.setLevel(original_log_level)
 
 PROBLEM_GRID = {
     'model_name': [
@@ -4043,6 +4320,22 @@ if __name__ == '__main__':
             '(Sarathi and QLM); defaults to the perf-model-derived cap'
         ),
     )
+    parser.add_argument(
+        '--admission_output_length_mode',
+        type=str,
+        default='max',
+        help=(
+            'output-length cap used for admission bounds. Supports "max" '
+            'or percentile forms like "p80", "p90", and "p95".'
+        ),
+    )
+    parser.add_argument(
+        '--concise_logging',
+        '--concise_log',
+        action='store_true',
+        default=False,
+        help='suppress verbose stdout and emit one concise JSON summary per result row',
+    )
     args = parser.parse_args()
     
     if not args.run_all:
@@ -4084,6 +4377,10 @@ if __name__ == '__main__':
                     args.piecewise_perf_model_breakpoints
                 ),
                 baseline_decode_cap = args.baseline_decode_cap,
+                admission_output_length_mode = (
+                    args.admission_output_length_mode
+                ),
+                concise_logging = args.concise_logging,
                 update_clients = not args.skip_update_clients,
             )
         exit(0)
@@ -4156,6 +4453,11 @@ if __name__ == '__main__':
                 'perf_model_piecewise_breakpoints': (
                     args.piecewise_perf_model_breakpoints
                 ),
+                'baseline_decode_cap': args.baseline_decode_cap,
+                'admission_output_length_mode': (
+                    args.admission_output_length_mode
+                ),
+                'concise_logging': args.concise_logging,
                 'update_clients': not args.skip_update_clients,
             })
         p.start()
