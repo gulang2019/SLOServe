@@ -30,6 +30,7 @@ BATCH_CATEGORY_COLORS = {
     "unknown": "#7f7f7f",
 }
 DEFAULT_CURRENT_TOKEN_BREAKPOINTS = (512, 2048)
+DEFAULT_UPPER_BOUND_PERCENTILES = (80, 90, 99)
 
 
 def _coerce_non_negative_int(value: Any, default: int = 0) -> int:
@@ -44,6 +45,58 @@ def _coerce_non_negative_float(value: Any, default: float = 0.0) -> float:
         return max(0.0, float(value))
     except (TypeError, ValueError):
         return default
+
+
+def _compute_percentile(
+    values: np.ndarray,
+    percentile: float,
+    *,
+    method: str = "linear",
+) -> float:
+    try:
+        return float(np.percentile(values, percentile, method=method))
+    except TypeError:
+        return float(np.percentile(values, percentile, interpolation=method))
+
+
+def _compute_empirical_cdf_quantile(
+    values: np.ndarray,
+    percentile: float,
+) -> float:
+    if values.size == 0:
+        raise ValueError("Cannot compute a quantile from an empty array.")
+
+    sorted_values = np.sort(np.asarray(values, dtype=float))
+    normalized_percentile = min(max(float(percentile), 0.0), 100.0)
+    rank = int(math.ceil(normalized_percentile * sorted_values.size / 100.0))
+    index = min(sorted_values.size - 1, max(0, rank - 1))
+    return float(sorted_values[index])
+
+
+def normalize_upper_bound_percentiles(
+    percentiles: tuple[int, ...] | list[int] | None = None,
+) -> tuple[int, ...]:
+    raw_percentiles = (
+        DEFAULT_UPPER_BOUND_PERCENTILES
+        if percentiles is None else percentiles
+    )
+    normalized: list[int] = []
+    for raw_percentile in raw_percentiles:
+        try:
+            percentile = int(raw_percentile)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid upper-bound percentile: {raw_percentile!r}"
+            ) from exc
+        if percentile < 0 or percentile > 100:
+            raise ValueError(
+                f"Upper-bound percentiles must be within [0, 100]: {percentile}"
+            )
+        if percentile not in normalized:
+            normalized.append(percentile)
+    if not normalized:
+        raise ValueError("At least one upper-bound percentile is required.")
+    return tuple(normalized)
 
 
 def normalize_current_token_breakpoints(
@@ -281,7 +334,7 @@ def _summarize_numeric(values: list[float] | list[int]) -> dict[str, float] | No
 def _compute_prediction_stats(
     measured_times: list[float],
     predicted_times: list[float],
-) -> dict[str, float]:
+) -> dict[str, Any]:
     measured = np.asarray(measured_times, dtype=float)
     predicted = np.asarray(predicted_times, dtype=float)
     if measured.size == 0 or predicted.size == 0 or measured.size != predicted.size:
@@ -305,8 +358,49 @@ def _compute_prediction_stats(
     if np.any(positive_mask):
         abs_relative_errors = np.abs(residuals[positive_mask]) / measured[positive_mask]
         stats["mape"] = float(np.mean(abs_relative_errors))
-        stats["p95_abs_relative_error"] = float(np.percentile(abs_relative_errors, 95))
+        stats["p95_abs_relative_error"] = _compute_percentile(
+            abs_relative_errors,
+            95,
+        )
+    stats.update(compute_upper_bound_metrics(measured, predicted))
     return stats
+
+
+def compute_upper_bound_metrics(
+    measured_times: list[float] | np.ndarray,
+    predicted_times: list[float] | np.ndarray,
+    *,
+    percentiles: tuple[int, ...] | list[int] | None = None,
+) -> dict[str, Any]:
+    measured = np.asarray(measured_times, dtype=float)
+    predicted = np.asarray(predicted_times, dtype=float)
+    if measured.size == 0 or predicted.size == 0 or measured.size != predicted.size:
+        raise ValueError(
+            "Measured and predicted times must be non-empty arrays of equal length."
+        )
+
+    normalized_percentiles = normalize_upper_bound_percentiles(percentiles)
+    deficits = measured - predicted
+    tolerance = 1e-12
+
+    constant_offsets: dict[str, float] = {}
+    achieved_rates: dict[str, float] = {}
+    for percentile in normalized_percentiles:
+        key = f"p{percentile}"
+        constant_offset = max(
+            0.0,
+            _compute_empirical_cdf_quantile(deficits, percentile),
+        )
+        constant_offsets[key] = float(constant_offset)
+        achieved_rates[key] = float(
+            np.mean(deficits <= constant_offset + tolerance)
+        )
+
+    return {
+        "upper_bound_rate": float(np.mean(deficits <= tolerance)),
+        "upper_bound_constant_s": constant_offsets,
+        "upper_bound_rate_with_constant": achieved_rates,
+    }
 
 
 def _derive_plot_path(

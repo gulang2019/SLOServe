@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import numpy as np
+
 from Dataset.dataset import Request
 from motivation import bench_api_server
 
@@ -171,3 +173,94 @@ def test_make_overload_run_result_records_terminal_overload(tmp_path, monkeypatc
     assert event_path.exists()
     payload = json.loads(event_path.read_text())
     assert payload[0]["status"] == "overloaded"
+
+
+def test_select_admission_output_length_supports_percentiles():
+    output_lengths = np.asarray([8, 16, 32, 64], dtype=np.float64)
+
+    assert bench_api_server._select_admission_output_length(
+        output_lengths,
+        "max",
+    ) == 64
+    assert bench_api_server._select_admission_output_length(
+        output_lengths,
+        "p80",
+    ) == 45
+    assert bench_api_server._select_admission_output_length(
+        output_lengths,
+        "p95",
+    ) == 60
+
+
+def test_build_problems_uses_configured_admission_output_length(
+    monkeypatch,
+    tmp_path,
+):
+    requests = [
+        Request(input_length=16, output_length=8),
+        Request(input_length=24, output_length=16),
+        Request(input_length=32, output_length=32),
+        Request(input_length=40, output_length=64),
+    ]
+
+    monkeypatch.setattr(
+        bench_api_server,
+        "_load_trace_inputs",
+        lambda *args, **kwargs: (requests, [0.0, 1.0, 2.0, 3.0], [("trace", "trace")]),
+    )
+
+    class _FakePerfModel:
+        is_piecewise_current_tokens = False
+
+        def describe_hardware_params(self):
+            return {}
+
+        def get_max_decode_batch_size(self, slo_tpot, average_input_length=0.0):
+            return 16
+
+        def get_batch_time(self, batch):
+            return 0.01
+
+        def get_zero_load_prefill_affine_params(self):
+            return 0.001, 0.01
+
+    monkeypatch.setattr(
+        bench_api_server.PerfModel,
+        "get_perf_model",
+        staticmethod(lambda *args, **kwargs: _FakePerfModel()),
+    )
+
+    problems = bench_api_server.build_problems(
+        model_name="test-model",
+        trace="trace",
+        ttft_slo_scale=1.0,
+        slo_tpot=0.05,
+        profit="constant",
+        scheduling_policy="atfc",
+        routing_policy="slosserve",
+        n_device=4,
+        tensor_parallel_size=1,
+        window="0:4",
+        load_scale=1.0,
+        experiment_dir=str(tmp_path),
+        admission_output_length_mode="p80",
+    )
+
+    assert len(problems) == 1
+    problem = problems[0]
+    expected_cap = bench_api_server._select_admission_output_length(
+        np.asarray([request.output_length for request in requests], dtype=np.float64),
+        "p80",
+    )
+
+    assert problem.admission_output_length_mode == "p80"
+    assert problem.admission_output_length == expected_cap
+    assert problem.scheduling_kwargs["max_decoding_length"] == 64
+    assert (
+        problem.scheduling_kwargs["admission_max_decoding_length"] == expected_cap
+    )
+    assert problem.routing_kwargs["max_decode_length"] == 64
+    assert (
+        problem.routing_kwargs["admission_max_decode_length"] == expected_cap
+    )
+    assert "/atfc_p80_slosserve_p80_" in problem.store_prefix

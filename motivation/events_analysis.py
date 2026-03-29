@@ -73,6 +73,7 @@ class Batch(Event):
     scheduling_overhead: float
     between_batch_time: Optional[float] = None
     estimated_time: float = 0
+    control_estimated_time: Optional[float] = None
     output_processing_elapsed: Optional[float] = None
     rejected_reqs: List[str] = None
     publish_overhead: Optional[float] = None

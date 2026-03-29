@@ -135,6 +135,21 @@ def test_perf_model_copy_with_adjustments_keeps_source_model_unchanged():
     assert model.hardware_params == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0])
 
 
+def test_compute_upper_bound_metrics_returns_empirical_constants():
+    metrics = perf_model.compute_upper_bound_metrics(
+        measured_times=[1.0, 1.1, 1.2, 1.3, 1.4],
+        predicted_times=[1.0, 1.0, 1.0, 1.0, 1.0],
+    )
+
+    assert metrics["upper_bound_rate"] == pytest.approx(0.2)
+    assert metrics["upper_bound_constant_s"]["p80"] == pytest.approx(0.3)
+    assert metrics["upper_bound_constant_s"]["p90"] == pytest.approx(0.4)
+    assert metrics["upper_bound_constant_s"]["p99"] == pytest.approx(0.4)
+    assert metrics["upper_bound_rate_with_constant"]["p80"] == pytest.approx(0.8)
+    assert metrics["upper_bound_rate_with_constant"]["p90"] == pytest.approx(1.0)
+    assert metrics["upper_bound_rate_with_constant"]["p99"] == pytest.approx(1.0)
+
+
 def test_piecewise_perf_model_runtime_selects_segments_and_copies_adjustments():
     piecewise_params = perf_model.build_piecewise_current_token_hardware_params(
         PIECEWISE_TRUE_HW_PARAMS,
@@ -293,6 +308,56 @@ def test_collect_batch_perf_error_rows_handles_zero_measured_time():
     assert rows[0]["estimated_full_over_elapsed"] == pytest.approx(2.5)
 
 
+def test_build_concise_result_row_includes_load_scale_and_upper_bound_metrics():
+    concise_row = bench_api_server._build_concise_result_row(
+        {
+            "load_scale": 2.0,
+            "n_device": 4,
+            "routing_policy": "slosserve",
+            "scheduling_policy": "atfc",
+            "perf_model_error_summary": {
+                "current_estimator_upper_bound_metrics": {
+                    "upper_bound_rate": 0.73,
+                    "upper_bound_constant_s": {
+                        "p80": 0.01,
+                        "p90": 0.02,
+                        "p99": 0.04,
+                    },
+                },
+            },
+        },
+        trace_used="unit_trace",
+    )
+
+    assert concise_row["load_scale"] == pytest.approx(2.0)
+    assert concise_row["current_perf_model_upper_bound"]["rate"] == pytest.approx(0.73)
+    assert concise_row["current_perf_model_upper_bound"]["constant_s"]["p80"] == pytest.approx(0.01)
+    assert concise_row["current_perf_model_upper_bound"]["constant_s"]["p90"] == pytest.approx(0.02)
+    assert concise_row["current_perf_model_upper_bound"]["constant_s"]["p99"] == pytest.approx(0.04)
+
+
+def test_fit_batch_perf_trace_reports_upper_bound_metrics(tmp_path):
+    _, events = _make_batch_events()
+    trace_path = tmp_path / "trace.jsonl"
+    trace_path.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+
+    report = perf_model.fit_batch_perf_trace(
+        trace_path,
+        report_path=tmp_path / "report.json",
+    )
+
+    assert report["existing_estimator_stats"]["upper_bound_rate"] == pytest.approx(1.0)
+    assert report["existing_estimator_stats"]["upper_bound_constant_s"]["p80"] == pytest.approx(0.0)
+    assert report["existing_estimator_stats"]["upper_bound_constant_s"]["p90"] == pytest.approx(0.0)
+    assert report["existing_estimator_stats"]["upper_bound_constant_s"]["p99"] == pytest.approx(0.0)
+    assert report["fitted_estimator_stats"]["upper_bound_rate"] == pytest.approx(1.0)
+    assert report["fitted_estimator_stats"]["upper_bound_constant_s"]["p99"] == pytest.approx(0.0)
+    assert Path(report["report_path"]).exists()
+
+
 def test_log_perf_model_errors_from_batch_events_writes_jsonl_summary_and_rows(tmp_path):
     batches, events = _make_batch_events()
     problem = bench_api_server.Problem(
@@ -349,6 +414,10 @@ def test_log_perf_model_errors_from_batch_events_writes_jsonl_summary_and_rows(t
         "gt_2048",
     ]
     assert summary["relative_error_denominator"] == "measured_time"
+    assert summary["current_estimator_upper_bound_metrics"]["upper_bound_rate"] == pytest.approx(1.0)
+    assert summary["current_estimator_upper_bound_metrics"]["upper_bound_constant_s"]["p80"] == pytest.approx(0.0)
+    assert summary["current_estimator_upper_bound_metrics"]["upper_bound_constant_s"]["p90"] == pytest.approx(0.0)
+    assert summary["current_estimator_upper_bound_metrics"]["upper_bound_constant_s"]["p99"] == pytest.approx(0.0)
     assert summary["estimated_minus_measured_s"]["count"] == len(events)
     assert summary["estimated_minus_measured_s"]["mean"] == pytest.approx(
         sum(expected_signed_errors) / len(expected_signed_errors)
@@ -375,6 +444,39 @@ def test_log_perf_model_errors_from_batch_events_writes_jsonl_summary_and_rows(t
         row["estimated_over_measured"] == pytest.approx(1.1)
         for row in batch_rows
     )
+
+
+def test_log_perf_model_errors_from_batch_events_reports_upper_bound_constants(tmp_path):
+    batches, events = _make_batch_events()
+    offsets = [0.0, 0.1, 0.2, 0.3, 0.4]
+    for event, batch, offset in zip(events, batches, offsets):
+        event["estimated_time"] = _expected_time(batch) - offset
+
+    problem = bench_api_server.Problem(
+        model_name="Qwen/Qwen2.5-7B-Instruct",
+        length_pattern="unit_task",
+        store_prefix=str(tmp_path / "runs" / "case_b"),
+        perf_model_err=1.0,
+        scheduling_overhead=0.05,
+    )
+
+    artifacts = bench_api_server._log_perf_model_errors_from_batch_events(
+        problem,
+        events,
+        tmp_path / "case_b.perf_model_errors.jsonl",
+        event_file="case_b.0.events.jsonl",
+        draw_figure=False,
+    )
+
+    assert artifacts is not None
+    metrics = artifacts["summary"]["current_estimator_upper_bound_metrics"]
+    assert metrics["upper_bound_rate"] == pytest.approx(0.2)
+    assert metrics["upper_bound_constant_s"]["p80"] == pytest.approx(0.3)
+    assert metrics["upper_bound_constant_s"]["p90"] == pytest.approx(0.4)
+    assert metrics["upper_bound_constant_s"]["p99"] == pytest.approx(0.4)
+    assert metrics["upper_bound_rate_with_constant"]["p80"] == pytest.approx(0.8)
+    assert metrics["upper_bound_rate_with_constant"]["p90"] == pytest.approx(1.0)
+    assert metrics["upper_bound_rate_with_constant"]["p99"] == pytest.approx(1.0)
 
 
 def test_load_batch_trace_events_accepts_jsonl_lines(tmp_path):

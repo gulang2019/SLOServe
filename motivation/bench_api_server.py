@@ -51,6 +51,7 @@ BENCHMARK_BATCH_POWER_MATCH_TOLERANCE_S = 0.2
 from SLOsServe.perf_model import (
     PerfModel,
     build_piecewise_current_token_hardware_params,
+    compute_upper_bound_metrics,
     extract_batch_perf_sample as extract_perf_model_batch_sample,
     fit_piecewise_current_token_model,
     get_easy_name,
@@ -98,11 +99,38 @@ def _build_concise_result_row(
     slo_routing_overhead = result.get("slo_routing_overhead")
     if slo_routing_overhead is None and problem is not None:
         slo_routing_overhead = getattr(problem, "slo_routing_overhead", None)
+    load_scale = result.get("load_scale")
+    if load_scale is None and problem is not None:
+        load_scale = getattr(problem, "load_scale", None)
+    perf_model_error_summary = result.get("perf_model_error_summary")
+    if not isinstance(perf_model_error_summary, dict):
+        perf_model_error_summary = {}
+    current_upper_bound_metrics = perf_model_error_summary.get(
+        "current_estimator_upper_bound_metrics",
+        {},
+    )
+    if not isinstance(current_upper_bound_metrics, dict):
+        current_upper_bound_metrics = {}
+    current_upper_bound_constants = current_upper_bound_metrics.get(
+        "upper_bound_constant_s",
+        {},
+    )
+    if not isinstance(current_upper_bound_constants, dict):
+        current_upper_bound_constants = {}
     return {
         "average_n_server": average_n_server,
         "cache_hit_rate": cache_hit_rate,
         "energy_consumption": result.get("energy_consumption"),
+        "load_scale": load_scale,
         "n_device": result.get("n_device", result.get("effective_n_device")),
+        "current_perf_model_upper_bound": {
+            "rate": current_upper_bound_metrics.get("upper_bound_rate"),
+            "constant_s": {
+                "p80": current_upper_bound_constants.get("p80"),
+                "p90": current_upper_bound_constants.get("p90"),
+                "p99": current_upper_bound_constants.get("p99"),
+            },
+        },
         "rejection_rate": result.get("rejection_rate"),
         "routing_policy": result.get("routing_policy"),
         "scheduling_policy": result.get("scheduling_policy"),
@@ -616,6 +644,10 @@ def _log_perf_model_errors_from_batch_events(
         float(row["estimated_full_time"]) for row in error_rows
     ]
     elapsed_times = [float(row["elapsed_time"]) for row in error_rows]
+    current_estimator_upper_bound_metrics = compute_upper_bound_metrics(
+        measured_times,
+        estimated_times,
+    )
 
     summary = {
         "model_name": problem.model_name,
@@ -631,6 +663,9 @@ def _log_perf_model_errors_from_batch_events(
         "regressed_hardware_params_delta": regressed_hardware_params_delta,
         "regression_stats": regression_stats,
         "relative_error_denominator": "measured_time",
+        "current_estimator_upper_bound_metrics": (
+            current_estimator_upper_bound_metrics
+        ),
         "estimated_minus_measured_s": _summarize_distribution(
             [float(row["error_s"]) for row in error_rows]
         ),
@@ -2663,28 +2698,6 @@ async def main(
                 event['accepted_ids'] = [backend_id_2_id(req_id) for req_id in event['accepted_ids']]
                 for batch in event['batch_schedule']:
                     batch['id'] = backend_id_2_id(batch['id'])
-        control_estimated_batch_times = {}
-        for event in events:
-            if event['event_type'] == 'schedule_problem':
-                control_estimated_batch_times[
-                    (event.get('device_id', 0), event['batch_id'])
-                ] = event.get('estimated_time')
-        for event in events:
-            if event['event_type'] == 'batch':
-                batch_key = (event.get('device_id', 0), event['batch_id'])
-                control_estimated_time = control_estimated_batch_times.get(
-                    batch_key
-                )
-                if control_estimated_time is not None:
-                    event['control_estimated_time'] = control_estimated_time
-                if (
-                    'estimated_time' not in event
-                    or event.get('estimated_time') is None
-                ):
-                    event['estimated_time'] = (
-                        control_estimated_time
-                        if control_estimated_time is not None else 0
-                    )
         with open(filename, 'w') as f:
             json.dump(events, f, indent=4)
     
@@ -2740,10 +2753,22 @@ async def main(
             empirical_scheduling_overhead = error_summary.get(
                 "empirical_scheduling_overhead", {}
             ).get("overhead_s", {})
+            current_upper_bound_metrics = error_summary.get(
+                "current_estimator_upper_bound_metrics",
+                {},
+            )
+            current_upper_bound_constants = current_upper_bound_metrics.get(
+                "upper_bound_constant_s",
+                {},
+            )
             print(
                 "Perf-model error summary:",
                 f"old_params={error_summary['old_hardware_params']}",
                 f"regressed_params={error_summary['regressed_hardware_params']}",
+                f"current_upper_bound_rate={current_upper_bound_metrics.get('upper_bound_rate')}",
+                f"current_upper_bound_p99={current_upper_bound_constants.get('p99')}",
+                f"current_upper_bound_p90={current_upper_bound_constants.get('p90')}",
+                f"current_upper_bound_p80={current_upper_bound_constants.get('p80')}",
                 f"signed_mean={error_summary['estimated_minus_measured_s'].get('mean')}",
                 f"abs_mean={error_summary['abs_estimated_minus_measured_s'].get('mean')}",
                 f"relative_p50={error_summary['estimated_minus_measured_relative'].get('p50')}",

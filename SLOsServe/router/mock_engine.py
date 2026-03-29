@@ -445,6 +445,15 @@ class MockEngineCore:
                 )
                 launch_start = time.time()
                 batch_time = self.perf_model.get_batch_time(batch)
+                control_perf_model = getattr(self.scheduler, "perf_model", None)
+                control_estimated_time = None
+                if control_perf_model is not None:
+                    try:
+                        control_estimated_time = float(
+                            control_perf_model.get_batch_time(batch)
+                        )
+                    except Exception:
+                        control_estimated_time = None
                 
                 # we mimic the current runtime by blocking the loop for the batch time.
                 await asyncio.sleep(batch_time)
@@ -509,6 +518,7 @@ class MockEngineCore:
                         "between_batch_time": elapsed,
                         "output_processing_elapsed": output_processing_elapsed,
                         "estimated_time": batch_time,
+                        "control_estimated_time": control_estimated_time,
                         "rejected_reqs": [r['request_id'] for r in rejs],
                         "publish_overhead": publish_overhead,
                         "extra_args": {
