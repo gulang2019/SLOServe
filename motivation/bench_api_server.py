@@ -2391,12 +2391,12 @@ async def main(
     arrival_bar = tqdm.tqdm(
         total=len(trace_request_indices),
         desc=arrival_bar_desc,
-        disable=problem.concise_logging,
+        disable=False,
     )
     finished_bar = tqdm.tqdm(
         total=len(requests),
         desc='Finished Requests',
-        disable=problem.concise_logging,
+        disable=False,
     )
     
     global_start_time = time.time()
@@ -3726,8 +3726,6 @@ def run(
         admission_output_length_mode
     )
     original_log_level = logger.level
-    if concise_logging:
-        logger.setLevel(logging.WARNING)
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     
@@ -3745,47 +3743,45 @@ def run(
         f"{output_dir}/{model_name_easy}_{profit}_{_trace_name}_{window}_{admission_mode}_{slo_routing_overhead}")
     os.makedirs(experiment_dir, exist_ok=True)
     
-    if not concise_logging:
-        print('--Problem Grid--')
-        print(f"model_name: {model_name_easy}")
-        print(f"ttft_slo_scales: {ttft_slo_scales}")
-        print(f"slo_tpots: {slo_tpots}")
-        print(f"profit: {profit}")
-        print(f"trace: {trace}")
-        print(f"window: {window}")
-        print(f"load_scales: {load_scales}")
-        print(f"n_devices: {n_devices}")
-        print(f"tensor_parallel_size: {tensor_parallel_size}")
-        print(f"policies: {policies}")
-        print(f"Experiment directory: {experiment_dir}")    
-        print(f"admission_mode: {admission_mode}")
-        print(f"scheduling_overhead: {scheduling_overhead}")
-        print(f'performance model errors: {perf_model_errs}')
-        print(f'routing fallback policy: {routing_fallback_policy}')
-        print(f'kv_xfer_delay: {kv_xfer_delay}')
-        print(f'enable_session_replay: {enable_session_replay}')
-        print(f'session_pause_s: {session_pause_s}')
-        print(f'log_perf_model_errors: {log_perf_model_errors}')
-        print(f'include_perf_model_time_lists: {include_perf_model_time_lists}')
-        print(f'draw_perf_model_error_figure: {draw_perf_model_error_figure}')
-        print(
-            'enable_piecewise_perf_model_regression: '
-            f'{enable_piecewise_perf_model_regression}'
-        )
-        print(
-            'perf_model_piecewise_breakpoints: '
-            f'{perf_model_piecewise_breakpoints}'
-        )
-        print(f'baseline_decode_cap: {baseline_decode_cap}')
-        print(
-            'admission_output_length_mode: '
-            f'{admission_output_length_mode}'
-        )
-        print('--End of Problem Grid--')
+    print('--Problem Grid--')
+    print(f"model_name: {model_name_easy}")
+    print(f"ttft_slo_scales: {ttft_slo_scales}")
+    print(f"slo_tpots: {slo_tpots}")
+    print(f"profit: {profit}")
+    print(f"trace: {trace}")
+    print(f"window: {window}")
+    print(f"load_scales: {load_scales}")
+    print(f"n_devices: {n_devices}")
+    print(f"tensor_parallel_size: {tensor_parallel_size}")
+    print(f"policies: {policies}")
+    print(f"Experiment directory: {experiment_dir}")    
+    print(f"admission_mode: {admission_mode}")
+    print(f"scheduling_overhead: {scheduling_overhead}")
+    print(f'performance model errors: {perf_model_errs}')
+    print(f'routing fallback policy: {routing_fallback_policy}')
+    print(f'kv_xfer_delay: {kv_xfer_delay}')
+    print(f'enable_session_replay: {enable_session_replay}')
+    print(f'session_pause_s: {session_pause_s}')
+    print(f'log_perf_model_errors: {log_perf_model_errors}')
+    print(f'include_perf_model_time_lists: {include_perf_model_time_lists}')
+    print(f'draw_perf_model_error_figure: {draw_perf_model_error_figure}')
+    print(
+        'enable_piecewise_perf_model_regression: '
+        f'{enable_piecewise_perf_model_regression}'
+    )
+    print(
+        'perf_model_piecewise_breakpoints: '
+        f'{perf_model_piecewise_breakpoints}'
+    )
+    print(f'baseline_decode_cap: {baseline_decode_cap}')
+    print(
+        'admission_output_length_mode: '
+        f'{admission_output_length_mode}'
+    )
+    print('--End of Problem Grid--')
     results = {}
     if os.path.exists(f'{experiment_dir}/results.jsonl'):
-        if not concise_logging:
-            print(f'Loading cached results from {experiment_dir}/results.jsonl')
+        print(f'Loading cached results from {experiment_dir}/results.jsonl')
         with open(f'{experiment_dir}/results.jsonl', 'r') as f:
             results = [json.loads(line) for line in f]
             results = {
@@ -3834,8 +3830,7 @@ def run(
             admission_output_length_mode,
         )
         if n_device == 1 and 'disaggregated' in routing_policy:
-            if not concise_logging:
-                print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot} because n_device is 1 and routing policy is disaggregated')
+            print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot} because n_device is 1 and routing policy is disaggregated')
             continue
         effective_n_device, _ = _resolve_rr_effective_n_devices(
             n_device,
@@ -3861,6 +3856,7 @@ def run(
             session_pause_s,
         )
         if not overwrite and cache_key in results:
+            print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot}, {perf_model_err} because it already exists')
             if concise_logging:
                 with _maybe_suppress_stdout(True):
                     summary_problems = build_problems(
@@ -3901,42 +3897,39 @@ def run(
                     trace_used=trace,
                     problem=summary_problem,
                 )
-            else:
-                print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot}, {perf_model_err} because it already exists')
             continue
-        with _maybe_suppress_stdout(concise_logging):
-            problems = build_problems(
-                model_name,
-                trace,
-                ttft_slo_scale,
-                slo_tpot,
-                profit,
-                scheduling_policy,
-                routing_policy,
-                n_device,
-                tensor_parallel_size,
-                window,
-                load_scale,
-                experiment_dir,
-                slo_routing_overhead,
-                admission_mode,
-                perf_model_err,
-                routing_overhead,
-                scheduling_overhead = scheduling_overhead,
-                routing_fallback_policy=routing_fallback_policy,
-                kv_xfer_delay=kv_xfer_delay,
-                enable_session_replay=enable_session_replay,
-                session_pause_s=session_pause_s,
-                log_perf_model_errors=log_perf_model_errors,
-                include_perf_model_time_lists=include_perf_model_time_lists,
-                draw_perf_model_error_figure=draw_perf_model_error_figure,
-                enable_piecewise_perf_model_regression=(
-                    enable_piecewise_perf_model_regression
-                ),
-                perf_model_piecewise_breakpoints=perf_model_piecewise_breakpoints,
-                baseline_decode_cap=baseline_decode_cap,
-                admission_output_length_mode=admission_output_length_mode,
-            )
+        problems = build_problems(
+            model_name,
+            trace,
+            ttft_slo_scale,
+            slo_tpot,
+            profit,
+            scheduling_policy,
+            routing_policy,
+            n_device,
+            tensor_parallel_size,
+            window,
+            load_scale,
+            experiment_dir,
+            slo_routing_overhead,
+            admission_mode,
+            perf_model_err,
+            routing_overhead,
+            scheduling_overhead = scheduling_overhead,
+            routing_fallback_policy=routing_fallback_policy,
+            kv_xfer_delay=kv_xfer_delay,
+            enable_session_replay=enable_session_replay,
+            session_pause_s=session_pause_s,
+            log_perf_model_errors=log_perf_model_errors,
+            include_perf_model_time_lists=include_perf_model_time_lists,
+            draw_perf_model_error_figure=draw_perf_model_error_figure,
+            enable_piecewise_perf_model_regression=(
+                enable_piecewise_perf_model_regression
+            ),
+            perf_model_piecewise_breakpoints=perf_model_piecewise_breakpoints,
+            baseline_decode_cap=baseline_decode_cap,
+            admission_output_length_mode=admission_output_length_mode,
+        )
         if not len(problems):
             logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
             continue
@@ -3946,15 +3939,14 @@ def run(
             problem.concise_logging = concise_logging
             problem.scheduling_kwargs['scheduling_overhead'] = scheduling_overhead
             try:
-                with _maybe_suppress_stdout(concise_logging):
-                    exec_result = asyncio.run(
-                        main(
-                            problem,
-                            endpoint,
-                            clients,
-                            update_clients=update_clients,
-                        )
+                exec_result = asyncio.run(
+                    main(
+                        problem,
+                        endpoint,
+                        clients,
+                        update_clients=update_clients,
                     )
+                )
             except (BenchmarkOverloadedError,
                     httpx.HTTPError,
                     aiohttp.ClientError,
