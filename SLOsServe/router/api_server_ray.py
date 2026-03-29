@@ -459,7 +459,7 @@ class EngineWorker:
                     KVTransferConfig(kv_connector='NixlConnector', kv_role='kv_both')
                     if not mock_connector else None
                 ),
-                # enable_prefix_caching = False
+                enable_prefix_caching = True
             )
             self.engine = AsyncLLM.from_engine_args(engine_args)
             if execplan_bus is not None:
