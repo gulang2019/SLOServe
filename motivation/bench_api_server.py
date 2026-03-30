@@ -124,6 +124,7 @@ def _build_concise_result_row(
         "average_n_server": average_n_server,
         "cache_hit_rate": cache_hit_rate,
         "energy_consumption": result.get("energy_consumption"),
+        "fast_sched_baseline_bsz": result.get("fast_sched_baseline_bsz"),
         "load_scale": load_scale,
         "n_device": result.get("n_device", result.get("effective_n_device")),
         "current_perf_model_upper_bound": {
@@ -869,6 +870,7 @@ class Problem:
     frontend_dedicated_client_per_request: bool = False
     enable_best_effort_tier: bool = False
     best_effort_max_inflight: int = 0
+    fast_sched_baseline_bsz: int | None = None
      
     # profit model 
     profit_per_input_token: float = 0.0
@@ -1274,6 +1276,7 @@ def _print_benchmark_slo_violation_grid_tables(df: pd.DataFrame) -> None:
             "routing_policy",
             "perf_model_err",
             "baseline_decode_cap",
+            "fast_sched_baseline_bsz",
             "admission_output_length_mode",
             "enable_piecewise_perf_model_regression",
             "perf_model_piecewise_breakpoints",
@@ -4165,6 +4168,14 @@ def _baseline_cap_suffix(baseline_decode_cap: int | None) -> str:
     return f"_bcap{int(baseline_decode_cap)}"
 
 
+def _fast_sched_baseline_bsz_suffix(
+    fast_sched_baseline_bsz: int | None,
+) -> str:
+    if fast_sched_baseline_bsz is None:
+        return ""
+    return f"_fbsz{int(fast_sched_baseline_bsz)}"
+
+
 def _normalize_admission_output_length_mode(mode: str) -> str:
     normalized = str(mode).strip().lower()
     if normalized == "max":
@@ -4255,6 +4266,7 @@ def build_problems(
     enable_piecewise_perf_model_regression: bool = False,
     perf_model_piecewise_breakpoints: list[int] | None = None,
     baseline_decode_cap: int | None = None,
+    fast_sched_baseline_bsz: int | None = None,
     admission_output_length_mode: str = "max",
     frontend_httpx_max_connections: int | None = None,
     frontend_httpx_max_keepalive_connections: int | None = None,
@@ -4270,6 +4282,9 @@ def build_problems(
         session_pause_s,
     )
     baseline_cap_suffix = _baseline_cap_suffix(baseline_decode_cap)
+    fast_sched_baseline_bsz_suffix = _fast_sched_baseline_bsz_suffix(
+        fast_sched_baseline_bsz
+    )
     display_scheduling_policy = _policy_name_with_admission_output_length(
         scheduling_policy,
         admission_output_length_mode,
@@ -4301,7 +4316,7 @@ def build_problems(
         f'{experiment_dir}/{display_scheduling_policy}_{display_routing_policy}_{load_scale}_'
         f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
         f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
-        f'{session_replay_suffix}{baseline_cap_suffix}'
+        f'{session_replay_suffix}{baseline_cap_suffix}{fast_sched_baseline_bsz_suffix}'
         f'{perf_model_regression_suffix}{frontend_httpx_suffix}{best_effort_suffix}')
     requests_trace = trace
     arrival_times_trace = trace
@@ -4786,6 +4801,10 @@ def build_problems(
             None if perf_model_piecewise_breakpoints is None
             else [int(point) for point in perf_model_piecewise_breakpoints]
         ),
+        fast_sched_baseline_bsz = (
+            int(fast_sched_baseline_bsz)
+            if fast_sched_baseline_bsz is not None else None
+        ),
         frontend_httpx_max_connections = frontend_httpx_max_connections,
         frontend_httpx_max_keepalive_connections = (
             frontend_httpx_max_keepalive_connections
@@ -4835,6 +4854,7 @@ def run(
     enable_piecewise_perf_model_regression: bool,
     perf_model_piecewise_breakpoints: list[int] | None,
     baseline_decode_cap: int | None,
+    fast_sched_baseline_bsz: int | None,
     admission_output_length_mode: str,
     frontend_httpx_max_connections: int | None,
     frontend_httpx_max_keepalive_connections: int | None,
@@ -4915,6 +4935,7 @@ def run(
         f'{perf_model_piecewise_breakpoints}'
     )
     print(f'baseline_decode_cap: {baseline_decode_cap}')
+    print(f'fast_sched_baseline_bsz: {fast_sched_baseline_bsz}')
     print(
         'admission_output_length_mode: '
         f'{admission_output_length_mode}'
@@ -4960,6 +4981,7 @@ def run(
                     r['slo_tpot'],
                     r['perf_model_err'],
                     r.get('baseline_decode_cap'),
+                    r.get('fast_sched_baseline_bsz'),
                     r.get('admission_output_length_mode', 'max'),
                     r.get('enable_piecewise_perf_model_regression', False),
                     tuple(r.get('perf_model_piecewise_breakpoints') or ()),
@@ -5015,6 +5037,7 @@ def run(
             slo_tpot,
             perf_model_err,
             baseline_decode_cap,
+            fast_sched_baseline_bsz,
             admission_output_length_mode,
             enable_piecewise_perf_model_regression,
             tuple(perf_model_piecewise_breakpoints or ()),
@@ -5061,6 +5084,7 @@ def run(
                         ),
                         perf_model_piecewise_breakpoints=perf_model_piecewise_breakpoints,
                         baseline_decode_cap=baseline_decode_cap,
+                        fast_sched_baseline_bsz=fast_sched_baseline_bsz,
                         admission_output_length_mode=admission_output_length_mode,
                         frontend_httpx_max_connections=frontend_httpx_max_connections,
                         frontend_httpx_max_keepalive_connections=(
@@ -5139,6 +5163,7 @@ def run(
             ),
             perf_model_piecewise_breakpoints=perf_model_piecewise_breakpoints,
             baseline_decode_cap=baseline_decode_cap,
+            fast_sched_baseline_bsz=fast_sched_baseline_bsz,
             admission_output_length_mode=admission_output_length_mode,
             frontend_httpx_max_connections=frontend_httpx_max_connections,
             frontend_httpx_max_keepalive_connections=(
@@ -5218,6 +5243,7 @@ def run(
                 else [int(point) for point in perf_model_piecewise_breakpoints]
             ),
             'baseline_decode_cap': baseline_decode_cap,
+            'fast_sched_baseline_bsz': fast_sched_baseline_bsz,
             'admission_output_length_mode': admission_output_length_mode,
             'admission_output_length': problems[0].admission_output_length,
             'enable_session_replay': enable_session_replay,
@@ -5646,6 +5672,15 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        '--fast_sched_baseline_bsz',
+        type=int,
+        default=None,
+        help=(
+            'override the synthetic baseline batch size used by the ATFC fast '
+            'scheduler floor; leave unset to use the server default'
+        ),
+    )
+    parser.add_argument(
         '--admission_output_length_mode',
         type=str,
         default='max',
@@ -5766,6 +5801,7 @@ if __name__ == '__main__':
                     args.piecewise_perf_model_breakpoints
                 ),
                 baseline_decode_cap = args.baseline_decode_cap,
+                fast_sched_baseline_bsz = args.fast_sched_baseline_bsz,
                 admission_output_length_mode = (
                     args.admission_output_length_mode
                 ),
@@ -5859,6 +5895,7 @@ if __name__ == '__main__':
                     args.piecewise_perf_model_breakpoints
                 ),
                 'baseline_decode_cap': args.baseline_decode_cap,
+                'fast_sched_baseline_bsz': args.fast_sched_baseline_bsz,
                 'admission_output_length_mode': (
                     args.admission_output_length_mode
                 ),

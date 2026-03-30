@@ -95,6 +95,7 @@ class BatchPlanner:
     _cpp_adm_ctrl_iterations: int = 0
     _cpp_schedule_iterations: int = 0
     _fast_sched_perf_mode: str = "full"
+    _fast_sched_baseline_bsz: int | None = None
     
     
     def __post_init__(self):
@@ -109,6 +110,20 @@ class BatchPlanner:
             )
             fast_sched_perf_mode = "full"
         self._fast_sched_perf_mode = fast_sched_perf_mode
+        if self._fast_sched_baseline_bsz is None:
+            raw_fast_sched_baseline_bsz = os.getenv(
+                "SLOSERVE_PY_FAST_SCHED_BASELINE_BSZ",
+                "1",
+            ).strip()
+            try:
+                self._fast_sched_baseline_bsz = int(raw_fast_sched_baseline_bsz)
+            except ValueError:
+                logger.warning(
+                    "[BatchPlanner] Unknown SLOSERVE_PY_FAST_SCHED_BASELINE_BSZ=%r; falling back to 1",
+                    raw_fast_sched_baseline_bsz,
+                )
+                self._fast_sched_baseline_bsz = 1
+        self._fast_sched_baseline_bsz = max(1, int(self._fast_sched_baseline_bsz))
         # Initialize C++ admission controller; TPOT is set lazily per request mix.
         self._adm_ctrler = SLOsServe_C.AdmCtrlScheduler("edf_sim", self._block_size, False, False)
         self._adm_ctrler_tpot = None
@@ -180,35 +195,6 @@ class BatchPlanner:
             num_past_tokens=num_past_tokens,
             num_decode_steps=num_decode_steps,
         )
-
-    def _fast_sched_find_first_satisfiable_deadline(
-        self,
-        load_ddls: list[tuple[str, float, int]],
-    ) -> tuple[float, int, str, int, int, int] | None:
-        cumulative_load = 0
-        cumulative_past_tokens = 0
-        for prefix_num_reqs, (req_id, next_ddl, next_load) in enumerate(load_ddls, start=1):
-            req = self._requests[req_id]
-            cumulative_load += next_load
-            cumulative_past_tokens += req.num_computed_tokens
-            batch_time_budget = max(0.0, next_ddl)
-            candidate_batch_size = self._cap_batch_size(
-                self._fast_sched_get_bs(
-                    batch_time_budget,
-                    num_reqs=prefix_num_reqs,
-                    num_past_tokens=cumulative_past_tokens,
-                )
-            )
-            if candidate_batch_size >= cumulative_load and candidate_batch_size > 0:
-                return (
-                    batch_time_budget,
-                    candidate_batch_size,
-                    req_id,
-                    cumulative_load,
-                    cumulative_past_tokens,
-                    prefix_num_reqs,
-                )
-        return None
 
     def _get_num_blocks(self, n_tokens: int) -> int:
         if n_tokens <= 0:
@@ -622,6 +608,16 @@ class BatchPlanner:
             x for x in load_ddls
             if self._requests[x[0]].service_tier == "best_effort"
         ]
+        recovery_cutoff = 0.0
+        recovering_overdue_regular = bool(
+            missed_deadline_regular_load_ddls and not in_deadline_regular_load_ddls
+        )
+        baseline_batch_size = self._cap_batch_size(self._fast_sched_baseline_bsz)
+        baseline_batch_time = (
+            self._fast_sched_get_batch_time([(0, baseline_batch_size)])
+            if baseline_batch_size > 0
+            else 0.0
+        )
         batch_time_budget = 0.0
         batch_size = 0
         batch_size_source = "none"
@@ -631,28 +627,24 @@ class BatchPlanner:
         selected_deadline_num_reqs = 0
 
         if in_deadline_regular_load_ddls:
-            satisfiable_deadline = self._fast_sched_find_first_satisfiable_deadline(
-                in_deadline_regular_load_ddls
+            selected_deadline_req_id = in_deadline_regular_load_ddls[0][0]
+            selected_deadline_cumulative_load = in_deadline_regular_load_ddls[0][2]
+            selected_deadline_total_past_tokens = self._requests[
+                selected_deadline_req_id
+            ].num_computed_tokens
+            selected_deadline_num_reqs = 1
+            batch_time_budget = max(
+                in_deadline_regular_load_ddls[0][1],
+                baseline_batch_time,
             )
-            if satisfiable_deadline is not None:
-                (
-                    batch_time_budget,
-                    batch_size,
-                    selected_deadline_req_id,
-                    selected_deadline_cumulative_load,
-                    selected_deadline_total_past_tokens,
-                    selected_deadline_num_reqs,
-                ) = satisfiable_deadline
-                batch_size_source = "first_satisfiable_in_deadline_regular_deadline"
-            else:
-                batch_size_source = "no_satisfiable_in_deadline_regular_deadline"
+            batch_size = self._cap_batch_size(
+                self._fast_sched_get_bs(batch_time_budget, num_reqs=1)
+            )
+            batch_size_source = "baseline_bsz_floor_in_deadline_regular"
         elif missed_deadline_regular_load_ddls:
-            # Once no regular request can still meet its next deadline, let
-            # overdue regular traffic use the remaining engine capacity before
-            # best-effort traffic.
             batch_size = self._cap_batch_size(16384)
             batch_time_budget = self._fast_sched_get_batch_time([(0, batch_size)])
-            batch_size_source = "missed_deadline_regular_only"
+            batch_size_source = "overdue_regular_recovery"
         else:
             # If only downgraded work remains, let it use the leftover engine
             # capacity while still respecting the batch-size limit.
@@ -672,12 +664,16 @@ class BatchPlanner:
                         'unsched_tokens': 0,
                         'in_deadline_regular_count': len(in_deadline_regular_load_ddls),
                         'missed_deadline_regular_count': len(missed_deadline_regular_load_ddls),
+                        'baseline_bsz': baseline_batch_size,
                         'batch_size_source': batch_size_source,
+                        'cutoff': baseline_batch_time,
                         'batch_time_budget': batch_time_budget,
                         'selected_deadline_req_id': selected_deadline_req_id,
                         'selected_deadline_cumulative_load': selected_deadline_cumulative_load,
                         'selected_deadline_total_past_tokens': selected_deadline_total_past_tokens,
                         'selected_deadline_num_reqs': selected_deadline_num_reqs,
+                        'recovery_cutoff': recovery_cutoff,
+                        'recovering_overdue_regular': recovering_overdue_regular,
                         'fast_sched_perf_mode': self._fast_sched_perf_mode,
                         'total_past_tokens': 0,
                         'total_scheduled_tokens': 0,
@@ -731,12 +727,16 @@ class BatchPlanner:
                     'unsched_tokens': b.unscheduled_tokens,
                     'in_deadline_regular_count': len(in_deadline_regular_load_ddls),
                     'missed_deadline_regular_count': len(missed_deadline_regular_load_ddls),
+                    'baseline_bsz': baseline_batch_size,
                     'batch_size_source': batch_size_source,
+                    'cutoff': baseline_batch_time,
                     'batch_time_budget': batch_time_budget,
                     'selected_deadline_req_id': selected_deadline_req_id,
                     'selected_deadline_cumulative_load': selected_deadline_cumulative_load,
                     'selected_deadline_total_past_tokens': selected_deadline_total_past_tokens,
                     'selected_deadline_num_reqs': selected_deadline_num_reqs,
+                    'recovery_cutoff': recovery_cutoff,
+                    'recovering_overdue_regular': recovering_overdue_regular,
                     'fast_sched_perf_mode': self._fast_sched_perf_mode,
                     'total_past_tokens': total_past_tokens,
                     'total_scheduled_tokens': total_scheduled_tokens,
