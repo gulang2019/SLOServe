@@ -266,6 +266,21 @@ def _build_trace_server_router_kwargs(
 ) -> str:
     merged = dict(server_router_kwargs)
     merged["model_name"] = trace_spec["model_name"]
+    if "scheduling_overhead" in trace_spec:
+        merged["scheduling_overhead"] = float(trace_spec["scheduling_overhead"])
+
+    slo_tpots = trace_spec.get("slo_tpots", [])
+    if len(slo_tpots) == 1:
+        merged["tpot"] = float(slo_tpots[0])
+    else:
+        merged.pop("tpot", None)
+
+    perf_model_errs = trace_spec.get("perf_model_errs", [])
+    if len(perf_model_errs) == 1:
+        merged["perf_model_err"] = float(perf_model_errs[0])
+    else:
+        merged.pop("perf_model_err", None)
+
     return json.dumps(merged, separators=(",", ":"), sort_keys=True)
 
 

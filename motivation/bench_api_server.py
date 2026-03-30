@@ -47,6 +47,8 @@ REQUEST_CANCEL_GRACE_S = 5.0
 BENCHMARK_METRIC_WINDOW_S = 1.0
 BENCHMARK_IDLE_POWER_PER_GPU_W = 70.0
 BENCHMARK_BATCH_POWER_MATCH_TOLERANCE_S = 0.2
+DEFAULT_REPORT_TTFT_SLO_SCALES = (2.0, 3.0, 5.0, 7.0, 10.0)
+DEFAULT_REPORT_SLO_TPOTS = (0.015, 0.025, 0.05, 0.10, 0.2)
 
 from SLOsServe.perf_model import (
     PerfModel,
@@ -866,6 +868,536 @@ def compute_ttft_slo(
         + float(slo_ttft_per_token) * new_tokens
         + float(slo_routing_overhead)
     )
+
+
+def _load_saved_request_rows(reqs_file: str | Path) -> List[Dict[str, Any]]:
+    path = Path(reqs_file)
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return []
+    if raw.lstrip().startswith("["):
+        rows = json.loads(raw)
+    else:
+        rows = [
+            json.loads(line)
+            for line in raw.splitlines()
+            if line.strip()
+        ]
+    if not isinstance(rows, list):
+        raise ValueError(f"expected a list of requests in {path}")
+    return rows
+
+
+def _sanitize_metric_key(value: Any) -> str:
+    return "".join(
+        ch if ch.isalnum() else "_"
+        for ch in str(value)
+    ).strip("_") or "unknown"
+
+
+def _resolve_saved_request_ttft_budget(
+    req_row: Dict[str, Any],
+    *,
+    ttft_mode: str,
+    ttft_value: float,
+    ttft_overhead: float,
+) -> float:
+    if ttft_mode == "scale":
+        return (
+            float(req_row.get("zero_load_ttft", 0.0)) * float(ttft_value)
+            + float(ttft_overhead)
+        )
+    if ttft_mode == "absolute":
+        return float(ttft_value) + float(ttft_overhead)
+    raise ValueError(f"unknown ttft_mode: {ttft_mode}")
+
+
+def _evaluate_saved_request_slo(
+    req_row: Dict[str, Any],
+    *,
+    ttft_budget_s: float,
+    slo_tpot: float,
+    routing_overhead: float = -1.0,
+    lag_cutoff_s: float = 0.10,
+) -> Dict[str, Any]:
+    if routing_overhead < 0.0:
+        arrival_time = float(req_row.get("arrival_time", 0.0))
+    else:
+        arrival_time = (
+            float(req_row.get("engine_arrival_time", req_row.get("arrival_time", 0.0)))
+            + float(routing_overhead)
+        )
+
+    prompt_tokens = int(req_row.get("prompt_tokens", 0))
+    cached_tokens = int(req_row.get("num_cached_tokens", 0))
+    output_tokens = max(int(req_row.get("output_tokens", 0)), 0)
+    uncached_prompt_tokens = max(prompt_tokens - cached_tokens, 0)
+
+    corrected_schedules: list[tuple[float, int]] = []
+    lag = 0.0
+    prev_timestamp: float | None = None
+    for schedule in req_row.get("schedules", []):
+        timestamp = float(schedule.get("timestamp", arrival_time)) - lag
+        if (
+            prev_timestamp is not None
+            and prev_timestamp + float(lag_cutoff_s) < timestamp
+        ):
+            delta = timestamp - prev_timestamp - float(lag_cutoff_s)
+            lag += delta
+            timestamp -= delta
+        corrected_schedules.append((
+            timestamp,
+            int(schedule.get("num_scheduled_tokens", 0)),
+        ))
+        prev_timestamp = timestamp
+
+    required_tokens = [(arrival_time + float(ttft_budget_s), uncached_prompt_tokens)]
+    for i in range(max(output_tokens - 1, 0)):
+        required_tokens.append((
+            arrival_time + float(ttft_budget_s) + (i + 1) * float(slo_tpot),
+            1,
+        ))
+
+    schedule_idx = 0
+    available_tokens = 0
+    completion_timestamp = arrival_time
+    ttft_laxity = 0.0
+    tpot_laxities: list[float] = []
+    effective_timestamps: list[float] = []
+    expected_finish_time: list[float] = []
+
+    for required_idx, (deadline, required_token_count) in enumerate(required_tokens):
+        while (
+            schedule_idx < len(corrected_schedules)
+            and available_tokens < required_token_count
+        ):
+            completion_timestamp, num_scheduled_tokens = corrected_schedules[schedule_idx]
+            available_tokens += num_scheduled_tokens
+            schedule_idx += 1
+        available_tokens -= required_token_count
+        effective_timestamps.append(completion_timestamp)
+        expected_finish_time.append(deadline)
+        laxity = float(completion_timestamp - deadline)
+        if required_idx == 0:
+            ttft_laxity = laxity
+        else:
+            tpot_laxities.append(laxity)
+
+    finish_reason = req_row.get("finish_reason")
+    if finish_reason != "length":
+        violation = finish_reason or "unfinished"
+    elif ttft_laxity > 0:
+        violation = "ttft"
+    elif tpot_laxities and float(np.percentile(tpot_laxities, 90)) > 0:
+        violation = "tpot"
+    else:
+        violation = "none"
+
+    return {
+        "req_id": req_row.get("req_id"),
+        "ttft_budget_s": float(ttft_budget_s),
+        "slo_tpot": float(slo_tpot),
+        "finish_reason": finish_reason,
+        "violation": violation,
+        "ttft_laxity": float(ttft_laxity),
+        "max_tpot_laxity": float(max(tpot_laxities, default=0.0)),
+        "p90_tpot_laxity": (
+            float(np.percentile(tpot_laxities, 90))
+            if tpot_laxities else None
+        ),
+        "effective_timestamps": effective_timestamps,
+        "expected_finish_time": expected_finish_time,
+    }
+
+
+def _flatten_saved_req_slo_grid_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    flat = {
+        key: value
+        for key, value in row.items()
+        if key not in {
+            "ttft_budget_s_summary",
+            "violation_reason_counts",
+            "violation_reason_rates",
+            "ttft_laxity_summary",
+            "max_tpot_laxity_summary",
+        }
+    }
+    for summary_key in (
+        "ttft_budget_s_summary",
+        "ttft_laxity_summary",
+        "max_tpot_laxity_summary",
+    ):
+        summary = row.get(summary_key, {})
+        if not isinstance(summary, dict):
+            continue
+        for metric_key, metric_value in summary.items():
+            flat[f"{summary_key}_{metric_key}"] = metric_value
+    for reason_key, count in row.get("violation_reason_counts", {}).items():
+        flat[f"violation_count_{_sanitize_metric_key(reason_key)}"] = count
+    for reason_key, rate in row.get("violation_reason_rates", {}).items():
+        flat[f"violation_rate_{_sanitize_metric_key(reason_key)}"] = rate
+    return flat
+
+
+def _default_saved_req_slo_grid_prefix(
+    reqs_file: str | Path,
+    *,
+    ttft_mode: str,
+) -> Path:
+    reqs_path = Path(reqs_file)
+    name = reqs_path.name
+    if name.endswith(".reqs.jsonl"):
+        base_name = name[:-len(".reqs.jsonl")]
+    else:
+        base_name = reqs_path.stem
+    return reqs_path.with_name(f"{base_name}.slo_grid_{ttft_mode}")
+
+
+def _reqs_file_from_event_prefix(event_prefix: str | Path) -> Path:
+    event_prefix = str(event_prefix)
+    if event_prefix.endswith(".events.jsonl"):
+        return Path(
+            f"{event_prefix[:-len('.events.jsonl')]}.reqs.jsonl"
+        )
+    prefix, dot, suffix = event_prefix.rpartition(".")
+    if dot and suffix.isdigit():
+        return Path(f"{prefix}.reqs.jsonl")
+    return Path(f"{event_prefix}.reqs.jsonl")
+
+
+def _save_saved_req_slo_grid_heatmap(
+    rows: List[Dict[str, Any]],
+    *,
+    ttft_key: str,
+    ttft_label: str,
+    output_path: str | Path,
+) -> Path | None:
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return None
+    pivot = (
+        df.pivot(
+            index="slo_tpot",
+            columns=ttft_key,
+            values="slo_violation_rate",
+        )
+        .sort_index()
+        .sort_index(axis=1)
+    )
+    if pivot.empty:
+        return None
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig_width = max(6.0, 1.0 + 0.9 * len(pivot.columns))
+    fig_height = max(4.5, 1.5 + 0.7 * len(pivot.index))
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height), tight_layout=True)
+    image = ax.imshow(
+        pivot.to_numpy(dtype=float),
+        origin="lower",
+        aspect="auto",
+        cmap="viridis",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    ax.set_xticks(np.arange(len(pivot.columns)))
+    ax.set_xticklabels([f"{value:.4g}" for value in pivot.columns], rotation=45, ha="right")
+    ax.set_yticks(np.arange(len(pivot.index)))
+    ax.set_yticklabels([f"{value:.4g}" for value in pivot.index])
+    ax.set_xlabel(ttft_label)
+    ax.set_ylabel("slo_tpot (s/token)")
+    ax.set_title("SLO Violation Rate Grid")
+
+    values = pivot.to_numpy(dtype=float)
+    for row_idx in range(values.shape[0]):
+        for col_idx in range(values.shape[1]):
+            value = float(values[row_idx, col_idx])
+            ax.text(
+                col_idx,
+                row_idx,
+                f"{value:.3f}",
+                ha="center",
+                va="center",
+                color="white" if value >= 0.5 else "black",
+                fontsize=8,
+            )
+
+    fig.colorbar(image, ax=ax, label="slo_violation_rate")
+    fig.savefig(output_path, dpi=220)
+    plt.close(fig)
+    return output_path
+
+
+def _normalize_groupby_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return tuple(
+            _normalize_groupby_value(item)
+            for item in value
+        )
+    if isinstance(value, dict):
+        return tuple(sorted(
+            (str(key), _normalize_groupby_value(item))
+            for key, item in value.items()
+        ))
+    return value
+
+
+def _print_benchmark_slo_violation_grid_tables(df: pd.DataFrame) -> None:
+    required_columns = {"ttft_slo_scale", "slo_tpot", "slo_violation_rate"}
+    if df.empty or not required_columns.issubset(df.columns):
+        return
+
+    grid_df = df.copy()
+    group_columns = [
+        column
+        for column in [
+            "trace_used",
+            "load_scale",
+            "requested_n_device",
+            "effective_n_device",
+            "tensor_parallel_size",
+            "scheduling_policy",
+            "routing_policy",
+            "perf_model_err",
+            "baseline_decode_cap",
+            "admission_output_length_mode",
+            "enable_piecewise_perf_model_regression",
+            "perf_model_piecewise_breakpoints",
+            "enable_session_replay",
+            "session_pause_s",
+        ]
+        if column in grid_df.columns
+    ]
+    for column in group_columns:
+        grid_df[column] = grid_df[column].map(_normalize_groupby_value)
+
+    if group_columns:
+        grouped = grid_df.groupby(group_columns, dropna=False, sort=True)
+    else:
+        grouped = [((), grid_df)]
+
+    print("--SLO Violation Grid Tables--")
+    printed_any = False
+    for group_values, group in grouped:
+        pivot = (
+            group.pivot_table(
+                index="slo_tpot",
+                columns="ttft_slo_scale",
+                values="slo_violation_rate",
+                aggfunc="first",
+            )
+            .sort_index()
+            .sort_index(axis=1)
+        )
+        if pivot.empty:
+            continue
+        printed_any = True
+        if not isinstance(group_values, tuple):
+            group_values = (group_values,)
+        if group_columns:
+            group_summary = ", ".join(
+                f"{column}={value}"
+                for column, value in zip(group_columns, group_values)
+            )
+        else:
+            group_summary = "all_results"
+        pivot.index.name = "slo_tpot"
+        pivot.columns.name = "ttft_slo_scale"
+        print(f"SLO grid: {group_summary}")
+        print(pivot.to_string(float_format=lambda value: f"{value:.6f}"))
+        print()
+    if not printed_any:
+        print("SLO grid: no rows")
+
+
+def _maybe_report_independent_slo_grid(
+    *,
+    reqs_file: str | Path,
+    output_prefix: str | Path,
+    report_ttft_slo_scales: list[float],
+    report_slo_tpots: list[float],
+    context: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
+    reqs_path = Path(reqs_file)
+    if not reqs_path.exists():
+        print(f"Independent SLO grid skipped: missing reqs file {reqs_path}")
+        return None
+
+    print("--Independent SLO Report Grid--")
+    if context:
+        print(json.dumps(context, sort_keys=True))
+    return sweep_saved_reqs_slo_grid(
+        reqs_path,
+        ttft_slo_scales=[float(value) for value in report_ttft_slo_scales],
+        slo_tpots=[float(value) for value in report_slo_tpots],
+        output_prefix=output_prefix,
+    )
+
+
+def sweep_saved_reqs_slo_grid(
+    reqs_file: str | Path,
+    *,
+    ttft_slo_scales: list[float] | None = None,
+    slo_ttfts: list[float] | None = None,
+    slo_tpots: list[float],
+    ttft_overhead: float = 0.0,
+    routing_overhead: float = -1.0,
+    output_prefix: str | Path | None = None,
+) -> Dict[str, Any]:
+    if slo_ttfts is not None:
+        ttft_mode = "absolute"
+        ttft_values = [float(value) for value in slo_ttfts]
+        ttft_key = "slo_ttft"
+        ttft_label = "slo_ttft (s)"
+    else:
+        ttft_mode = "scale"
+        ttft_values = [float(value) for value in (ttft_slo_scales or [])]
+        ttft_key = "ttft_slo_scale"
+        ttft_label = "ttft_slo_scale"
+
+    if not ttft_values:
+        raise ValueError("ttft grid is empty")
+    if not slo_tpots:
+        raise ValueError("slo_tpot grid is empty")
+
+    req_rows = _load_saved_request_rows(reqs_file)
+    if not req_rows:
+        raise ValueError(f"no requests found in {reqs_file}")
+
+    results: list[dict[str, Any]] = []
+    for ttft_value, slo_tpot in product(ttft_values, [float(value) for value in slo_tpots]):
+        violations = Counter()
+        ttft_budgets: list[float] = []
+        ttft_laxities: list[float] = []
+        max_tpot_laxities: list[float] = []
+        for req_row in req_rows:
+            ttft_budget_s = _resolve_saved_request_ttft_budget(
+                req_row,
+                ttft_mode=ttft_mode,
+                ttft_value=ttft_value,
+                ttft_overhead=ttft_overhead,
+            )
+            evaluation = _evaluate_saved_request_slo(
+                req_row,
+                ttft_budget_s=ttft_budget_s,
+                slo_tpot=float(slo_tpot),
+                routing_overhead=float(routing_overhead),
+            )
+            violations[evaluation["violation"]] += 1
+            ttft_budgets.append(float(ttft_budget_s))
+            ttft_laxities.append(float(evaluation["ttft_laxity"]))
+            max_tpot_laxities.append(float(evaluation["max_tpot_laxity"]))
+
+        total_requests = len(req_rows)
+        attained = int(violations.get("none", 0))
+        non_terminal_reasons = {
+            reason: count
+            for reason, count in violations.items()
+            if reason not in {"none", "ttft", "tpot"}
+        }
+        result_row = {
+            "reqs_file": str(reqs_file),
+            ttft_key: float(ttft_value),
+            "slo_tpot": float(slo_tpot),
+            "ttft_mode": ttft_mode,
+            "ttft_overhead": float(ttft_overhead),
+            "routing_overhead": float(routing_overhead),
+            "total_requests": total_requests,
+            "slo_attainment_rate": float(attained / total_requests) if total_requests else 0.0,
+            "slo_violation_rate": float(1.0 - attained / total_requests) if total_requests else 0.0,
+            "ttft_violation_rate": float(violations.get("ttft", 0) / total_requests) if total_requests else 0.0,
+            "tpot_violation_rate": float(violations.get("tpot", 0) / total_requests) if total_requests else 0.0,
+            "unfinished_or_rejected_rate": (
+                float(sum(non_terminal_reasons.values()) / total_requests)
+                if total_requests else 0.0
+            ),
+            "violation_reason_counts": dict(sorted(violations.items())),
+            "violation_reason_rates": {
+                reason: float(count / total_requests)
+                for reason, count in sorted(violations.items())
+            } if total_requests else {},
+            "ttft_budget_s_summary": _summarize_distribution(ttft_budgets),
+            "ttft_laxity_summary": _summarize_distribution(ttft_laxities),
+            "max_tpot_laxity_summary": _summarize_distribution(max_tpot_laxities),
+        }
+        results.append(result_row)
+
+    output_prefix_path = (
+        Path(output_prefix)
+        if output_prefix is not None else
+        _default_saved_req_slo_grid_prefix(reqs_file, ttft_mode=ttft_mode)
+    )
+    flat_rows = [_flatten_saved_req_slo_grid_row(row) for row in results]
+    jsonl_path = _write_jsonl(f"{output_prefix_path}.jsonl", results)
+    csv_path = Path(f"{output_prefix_path}.csv")
+    pd.DataFrame(flat_rows).sort_values([ttft_key, "slo_tpot"]).to_csv(csv_path, index=False)
+    pivot_csv_path = Path(f"{output_prefix_path}.pivot.csv")
+    (
+        pd.DataFrame(results)
+        .pivot(index="slo_tpot", columns=ttft_key, values="slo_violation_rate")
+        .sort_index()
+        .sort_index(axis=1)
+        .to_csv(pivot_csv_path)
+    )
+    heatmap_path = _save_saved_req_slo_grid_heatmap(
+        results,
+        ttft_key=ttft_key,
+        ttft_label=ttft_label,
+        output_path=f"{output_prefix_path}.png",
+    )
+
+    display_df = pd.DataFrame(results).sort_values([ttft_key, "slo_tpot"])
+    print("--Offline SLO Sweep--")
+    print(f"reqs_file: {reqs_file}")
+    print(f"ttft_mode: {ttft_mode}")
+    print(f"ttft_values: {ttft_values}")
+    print(f"slo_tpots: {[float(value) for value in slo_tpots]}")
+    print(f"ttft_overhead: {float(ttft_overhead)}")
+    print(f"routing_overhead: {float(routing_overhead)}")
+    print(
+        display_df[
+            [
+                ttft_key,
+                "slo_tpot",
+                "slo_violation_rate",
+                "ttft_violation_rate",
+                "tpot_violation_rate",
+                "unfinished_or_rejected_rate",
+            ]
+        ].to_string(index=False)
+    )
+    print(f"Saved offline SLO grid rows to {jsonl_path}")
+    print(f"Saved offline SLO grid csv to {csv_path}")
+    print(f"Saved offline SLO grid pivot to {pivot_csv_path}")
+    if heatmap_path is not None:
+        print(f"Saved offline SLO grid heatmap to {heatmap_path}")
+
+    best_row = min(results, key=lambda row: row["slo_violation_rate"])
+    worst_row = max(results, key=lambda row: row["slo_violation_rate"])
+    return {
+        "reqs_file": str(reqs_file),
+        "ttft_mode": ttft_mode,
+        "ttft_values": ttft_values,
+        "slo_tpots": [float(value) for value in slo_tpots],
+        "total_requests": len(req_rows),
+        "jsonl_path": str(jsonl_path),
+        "csv_path": str(csv_path),
+        "pivot_csv_path": str(pivot_csv_path),
+        "heatmap_path": str(heatmap_path) if heatmap_path is not None else None,
+        "best": {
+            ttft_key: best_row[ttft_key],
+            "slo_tpot": best_row["slo_tpot"],
+            "slo_violation_rate": best_row["slo_violation_rate"],
+        },
+        "worst": {
+            ttft_key: worst_row[ttft_key],
+            "slo_tpot": worst_row["slo_tpot"],
+            "slo_violation_rate": worst_row["slo_violation_rate"],
+        },
+    }
 
 
 def _perf_model_regression_suffix(
@@ -3717,6 +4249,8 @@ def run(
     model_name: str,
     ttft_slo_scales: list[float],
     slo_tpots: list[float],
+    report_ttft_slo_scales: list[float] | None,
+    report_slo_tpots: list[float] | None,
     profit: str,
     trace: str,
     window: str,
@@ -3744,6 +4278,7 @@ def run(
     perf_model_piecewise_breakpoints: list[int] | None,
     baseline_decode_cap: int | None,
     admission_output_length_mode: str,
+    disable_independent_slo_grid_report: bool = False,
     concise_logging: bool = False,
     update_clients: bool = True,
 ):
@@ -3753,6 +4288,22 @@ def run(
     original_log_level = logger.level
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
+    if report_ttft_slo_scales is None:
+        report_ttft_slo_scales = [
+            float(value) for value in DEFAULT_REPORT_TTFT_SLO_SCALES
+        ]
+    else:
+        report_ttft_slo_scales = [
+            float(value) for value in report_ttft_slo_scales
+        ]
+    if report_slo_tpots is None:
+        report_slo_tpots = [
+            float(value) for value in DEFAULT_REPORT_SLO_TPOTS
+        ]
+    else:
+        report_slo_tpots = [
+            float(value) for value in report_slo_tpots
+        ]
     
     model_name_easy = get_easy_name(model_name)
     global experiment_dir
@@ -3772,6 +4323,8 @@ def run(
     print(f"model_name: {model_name_easy}")
     print(f"ttft_slo_scales: {ttft_slo_scales}")
     print(f"slo_tpots: {slo_tpots}")
+    print(f"report_ttft_slo_scales: {report_ttft_slo_scales}")
+    print(f"report_slo_tpots: {report_slo_tpots}")
     print(f"profit: {profit}")
     print(f"trace: {trace}")
     print(f"window: {window}")
@@ -3802,6 +4355,10 @@ def run(
     print(
         'admission_output_length_mode: '
         f'{admission_output_length_mode}'
+    )
+    print(
+        'disable_independent_slo_grid_report: '
+        f'{disable_independent_slo_grid_report}'
     )
     print('--End of Problem Grid--')
     results = {}
@@ -3882,6 +4439,7 @@ def run(
         )
         if not overwrite and cache_key in results:
             print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot}, {perf_model_err} because it already exists')
+            summary_problem = None
             if concise_logging:
                 with _maybe_suppress_stdout(True):
                     summary_problems = build_problems(
@@ -3922,6 +4480,36 @@ def run(
                     trace_used=trace,
                     problem=summary_problem,
                 )
+            if not disable_independent_slo_grid_report:
+                cached_result = results[cache_key]
+                cached_event_file = cached_result.get('event_file')
+                cached_reqs_file = (
+                    _reqs_file_from_event_prefix(cached_event_file)
+                    if cached_event_file is not None else None
+                )
+                if cached_reqs_file is not None:
+                    _maybe_report_independent_slo_grid(
+                        reqs_file=cached_reqs_file,
+                        output_prefix=(
+                            f'{Path(cached_reqs_file).with_suffix("").with_suffix("")}.'
+                            'report_slo_grid'
+                        ),
+                        report_ttft_slo_scales=report_ttft_slo_scales,
+                        report_slo_tpots=report_slo_tpots,
+                        context={
+                            "trace": trace,
+                            "load_scale": load_scale,
+                            "requested_n_device": cached_result.get(
+                                'requested_n_device', n_device),
+                            "effective_n_device": cached_result.get(
+                                'effective_n_device', effective_n_device),
+                            "scheduling_policy": display_scheduling_policy,
+                            "routing_policy": display_routing_policy,
+                            "benchmark_ttft_slo_scale": ttft_slo_scale,
+                            "benchmark_slo_tpot": slo_tpot,
+                            "source": "cache",
+                        },
+                    )
             continue
         problems = build_problems(
             model_name,
@@ -4122,14 +4710,14 @@ def run(
             print('--Result--')
             pprint.pprint(result)
             print('--End of Result--')
-        
-        results[cache_key] = result
-        with open(f'{experiment_dir}/results.jsonl', 'a') as f:
-            f.write(json.dumps(result) + '\n')            
-            
+
+        best_result_reqs_file = _reqs_file_from_event_prefix(
+            best_result.event_file
+        )
+        canonical_reqs_file = Path(f'{problems[0].store_prefix}.reqs.jsonl')
+
         for surfix in [
             'events',
-            'reqs',
             'admission_history',
             'perf_model_errors',
         ]:
@@ -4137,6 +4725,8 @@ def run(
             dst = f'{problems[0].store_prefix}.{surfix}.jsonl'
             if os.path.exists(src):
                 os.system(f'cp {src} {dst}')
+        if best_result_reqs_file.exists():
+            os.system(f'cp {best_result_reqs_file} {canonical_reqs_file}')
         src = f'{best_result.event_file}.perf_model_estimated_vs_measured.png'
         dst = f'{problems[0].store_prefix}.perf_model_estimated_vs_measured.png'
         if os.path.exists(src):
@@ -4165,6 +4755,35 @@ def run(
             dst = f'{problems[0].store_prefix}.{figure_suffix}'
             if os.path.exists(src):
                 os.system(f'cp {src} {dst}')
+
+        report_slo_grid_summary = None
+        if not disable_independent_slo_grid_report:
+            report_slo_grid_summary = _maybe_report_independent_slo_grid(
+                reqs_file=canonical_reqs_file,
+                output_prefix=f'{problems[0].store_prefix}.report_slo_grid',
+                report_ttft_slo_scales=report_ttft_slo_scales,
+                report_slo_tpots=report_slo_tpots,
+                context={
+                    "trace": trace,
+                    "load_scale": load_scale,
+                    "requested_n_device": requested_n_device,
+                    "effective_n_device": effective_n_device,
+                    "scheduling_policy": display_scheduling_policy,
+                    "routing_policy": display_routing_policy,
+                    "benchmark_ttft_slo_scale": ttft_slo_scale,
+                    "benchmark_slo_tpot": slo_tpot,
+                },
+            )
+        if report_slo_grid_summary is not None:
+            result['report_slo_grid_ttft_slo_scales'] = list(
+                report_ttft_slo_scales
+            )
+            result['report_slo_grid_slo_tpots'] = list(report_slo_tpots)
+            result['report_slo_grid_summary'] = report_slo_grid_summary
+
+        results[cache_key] = result
+        with open(f'{experiment_dir}/results.jsonl', 'a') as f:
+            f.write(json.dumps(result) + '\n')
     
         for r in run_results:
             os.system(f'rm {r.event_file}*')
@@ -4176,6 +4795,7 @@ def run(
     df.to_csv(f'{experiment_dir}/profit_vs_n_device_and_load.csv', index=False)
     if not concise_logging:
         print(f"Saved source data to {experiment_dir}/profit_vs_n_device_and_load.csv")
+    _print_benchmark_slo_violation_grid_tables(df)
 
     # 1. Plot: for each (scheduling_policy, routing_policy) pair, show profit vs n_device (for each load_scale)
     import math
@@ -4259,8 +4879,77 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-7B-Instruct')
+    parser.add_argument(
+        '--reqs_file',
+        type=str,
+        default=None,
+        help=(
+            'offline mode: re-score a saved bench_api_server req dump '
+            '(.reqs.jsonl) over an SLO grid instead of running the server'
+        ),
+    )
     parser.add_argument('--ttft_slo_scales', type=float, default=[2.0], nargs='+', help = 'list of relative ttft slo (defined as slowdown to zero-load ttft)')
     parser.add_argument('--slo_tpots', type=float, default=[2.0], nargs='+', help = 'list of relative tpot slo (defined as absolute tpot per token in seconds)')
+    parser.add_argument(
+        '--report_ttft_slo_scales',
+        type=float,
+        default=list(DEFAULT_REPORT_TTFT_SLO_SCALES),
+        nargs='+',
+        help=(
+            'independent reporting grid for ttft_slo_scale, separate from '
+            '--ttft_slo_scales used to drive the benchmark itself'
+        ),
+    )
+    parser.add_argument(
+        '--report_slo_tpots',
+        type=float,
+        default=list(DEFAULT_REPORT_SLO_TPOTS),
+        nargs='+',
+        help=(
+            'independent reporting grid for slo_tpot, separate from '
+            '--slo_tpots used to drive the benchmark itself'
+        ),
+    )
+    parser.add_argument(
+        '--disable_independent_slo_grid_report',
+        action='store_true',
+        default=False,
+        help='disable the per-benchmark independent SLO grid table/artifacts',
+    )
+    parser.add_argument(
+        '--slo_ttfts',
+        type=float,
+        default=None,
+        nargs='+',
+        help=(
+            'offline req sweep only: absolute TTFT budgets in seconds. '
+            'If set, these override --ttft_slo_scales for the req sweep.'
+        ),
+    )
+    parser.add_argument(
+        '--sweep_ttft_overhead',
+        type=float,
+        default=0.0,
+        help='offline req sweep only: constant seconds added to each TTFT budget',
+    )
+    parser.add_argument(
+        '--sweep_routing_overhead',
+        type=float,
+        default=-1.0,
+        help=(
+            'offline req sweep only: if >= 0, evaluate TTFT from '
+            'engine_arrival_time + this overhead; otherwise use arrival_time'
+        ),
+    )
+    parser.add_argument(
+        '--sweep_output_prefix',
+        type=str,
+        default=None,
+        help=(
+            'offline req sweep only: artifact prefix for the output '
+            'jsonl/csv/pivot/heatmap'
+        ),
+    )
     parser.add_argument('--profit', type=str, default='constant', choices=['constant', 'weighted'])
     parser.add_argument(
         '--trace',
@@ -4354,6 +5043,21 @@ if __name__ == '__main__':
         help='suppress verbose stdout and emit one concise JSON summary per result row',
     )
     args = parser.parse_args()
+
+    if args.reqs_file is not None:
+        summary = sweep_saved_reqs_slo_grid(
+            args.reqs_file,
+            ttft_slo_scales=(
+                None if args.slo_ttfts is not None else args.ttft_slo_scales
+            ),
+            slo_ttfts=args.slo_ttfts,
+            slo_tpots=args.slo_tpots,
+            ttft_overhead=args.sweep_ttft_overhead,
+            routing_overhead=args.sweep_routing_overhead,
+            output_prefix=args.sweep_output_prefix,
+        )
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        exit(0)
     
     if not args.run_all:
         clients = _normalize_router_clients_arg(args.clients)
@@ -4362,6 +5066,8 @@ if __name__ == '__main__':
             run (args.model_name,
                 args.ttft_slo_scales,
                 args.slo_tpots,
+                args.report_ttft_slo_scales,
+                args.report_slo_tpots,
                 args.profit,
                 trace,
                 args.window,
@@ -4396,6 +5102,9 @@ if __name__ == '__main__':
                 baseline_decode_cap = args.baseline_decode_cap,
                 admission_output_length_mode = (
                     args.admission_output_length_mode
+                ),
+                disable_independent_slo_grid_report = (
+                    args.disable_independent_slo_grid_report
                 ),
                 concise_logging = args.concise_logging,
                 update_clients = not args.skip_update_clients,
@@ -4439,6 +5148,8 @@ if __name__ == '__main__':
                 'model_name': model_name,
                 'ttft_slo_scales': args.ttft_slo_scales,
                 'slo_tpots': args.slo_tpots,
+                'report_ttft_slo_scales': args.report_ttft_slo_scales,
+                'report_slo_tpots': args.report_slo_tpots,
                 'profit': profit,
                 'policies': args.policies,
                 'trace': trace,
@@ -4473,6 +5184,9 @@ if __name__ == '__main__':
                 'baseline_decode_cap': args.baseline_decode_cap,
                 'admission_output_length_mode': (
                     args.admission_output_length_mode
+                ),
+                'disable_independent_slo_grid_report': (
+                    args.disable_independent_slo_grid_report
                 ),
                 'concise_logging': args.concise_logging,
                 'update_clients': not args.skip_update_clients,
