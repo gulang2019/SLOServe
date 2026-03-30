@@ -22,7 +22,7 @@ RUN_BATCH_PORT="${RUN_BATCH_PORT:-8000}"
 SUCCEEDED_LOG="${SUCCEEDED_LOG:-$SCRIPT_DIR/succeeded_runs.log}"
 FAILED_LOG="${FAILED_LOG:-$SCRIPT_DIR/failed_runs.log}"
 RUN_LOG="${RUN_LOG:-$SCRIPT_DIR/all_runs.log}"
-SERVER_ROUTER_KWARGS='{"device_mem":1248576, "block_size":16, "model_name":"Qwen/Qwen2.5-7B-Instruct", "tpot":0.05, "scheduling_overhead":0.005, "max_decode_length":500, "is_pd_disagg":0, "n_prefill_per_group":1, "max_decode_bs":16, "enable_rerouting":0}'
+SERVER_ROUTER_KWARGS='{"device_mem":1248576, "block_size":16, "model_name":"Qwen/Qwen2.5-7B-Instruct", "tpot":0.05, "scheduling_overhead":0.003, "max_decode_length":500, "is_pd_disagg":0, "n_prefill_per_group":1, "max_decode_bs":16, "enable_rerouting":0}'
 SERVER_EXTRA_ARGS_SHELL="${SERVER_EXTRA_ARGS_SHELL:-}"
 SERVER_CLIENTS="${SERVER_CLIENTS:-0-7}"
 
@@ -128,10 +128,39 @@ load_config() {
   server_extra_args+=(--model_name "$model_name" --tensor_parallel_size "$tensor_parallel_size")
 }
 
+render_runtime_server_router_kwargs() {
+  local base_kwargs="$1"
+  local model_name="$2"
+  local scheduling_overhead="$3"
+  local slo_tpot="$4"
+  local perf_model_err="$5"
+
+  python - "$base_kwargs" "$model_name" "$scheduling_overhead" "$slo_tpot" "$perf_model_err" <<'PY'
+import json
+import sys
+
+kwargs = json.loads(sys.argv[1])
+kwargs["model_name"] = sys.argv[2]
+kwargs["scheduling_overhead"] = float(sys.argv[3])
+kwargs["tpot"] = float(sys.argv[4])
+kwargs["perf_model_err"] = float(sys.argv[5])
+print(json.dumps(kwargs, separators=(",", ":"), sort_keys=True))
+PY
+}
+
 make_run_key() {
   local trace="$1"
   local policy="$2"
+  local slo_tpots_key="${slo_tpots[*]}"
+  local perf_model_errs_key="${perf_model_errs[*]}"
   shift 2
+
+  if (($# >= 2)) && [[ ! "$1" =~ ^[0-9]+$ ]]; then
+    slo_tpots_key="$1"
+    perf_model_errs_key="$2"
+    shift 2
+  fi
+
   local devices=("$@")
   local length_trace="$trace"
   local arrival_trace="$trace"
@@ -146,7 +175,7 @@ make_run_key() {
     "$length_trace" \
     "$arrival_trace" \
     "$policy" \
-    "$window|load_scales=${load_scales[*]}|ttft_slo_scales=${ttft_slo_scales[*]}|slo_tpots=${slo_tpots[*]}|perf_model_errs=${perf_model_errs[*]}|model_name=${model_name}|tensor_parallel_size=${tensor_parallel_size}|profit=${profit}|admission_mode=${admission_mode}|slo_routing_overhead=${slo_routing_overhead}|scheduling_overhead=${scheduling_overhead}|routing_overhead=${routing_overhead}|routing_fallback_policy=${routing_fallback_policy}|output_dir=${output_dir}|extra_args=${extra_bench_args[*]}" \
+    "$window|load_scales=${load_scales[*]}|ttft_slo_scales=${ttft_slo_scales[*]}|slo_tpots=${slo_tpots_key}|perf_model_errs=${perf_model_errs_key}|model_name=${model_name}|tensor_parallel_size=${tensor_parallel_size}|profit=${profit}|admission_mode=${admission_mode}|slo_routing_overhead=${slo_routing_overhead}|scheduling_overhead=${scheduling_overhead}|routing_overhead=${routing_overhead}|routing_fallback_policy=${routing_fallback_policy}|output_dir=${output_dir}|extra_args=${extra_bench_args[*]}" \
     "${devices[*]}"
 }
 
@@ -304,29 +333,23 @@ run_suite() {
   local -a trace_policies=()
   local -a extra_bench_args=()
   local -a server_extra_args=()
+  local trace_server_router_kwargs_base
+  local current_slo_tpot
+  local current_perf_model_err
 
   available_clients="$(count_clients_spec "$SERVER_CLIENTS")"
   trap 'cleanup_server "$server_pid"' EXIT
 
   for trace in "${TRACES[@]}"; do
     load_config "$trace"
-    next_server_signature="$(compute_server_signature)"
-    if [[ -z "$server_pid" || "$next_server_signature" != "$current_server_signature" ]]; then
-      if [[ -n "$server_pid" ]]; then
-        echo "RESTARTING SERVER for ${trace}"
-        cleanup_server "$server_pid"
-        server_pid=""
-      fi
-      current_server_signature="$next_server_signature"
-      start_server
-    fi
+    trace_server_router_kwargs_base="$server_router_kwargs"
 
     for policy in "${trace_policies[@]}"; do
       run_devices=("${n_devices[@]}")
       if ! policy_supports_partial_rr "$policy"; then
         mapfile -t run_devices < <(filter_compatible_devices "$available_clients" "${n_devices[@]}")
         if ((${#run_devices[@]} == 0)); then
-          run_key="$(make_run_key "$trace" "$policy" "${n_devices[@]}")"
+          run_key="$(make_run_key "$trace" "$policy" "${slo_tpots[*]}" "${perf_model_errs[*]}" "${n_devices[@]}")"
           echo "SKIP (no compatible client counts for non-RR policy): $run_key"
           echo "  available_clients=$available_clients"
           echo "  requested_n_devices=${n_devices[*]}"
@@ -335,82 +358,102 @@ run_suite() {
         fi
       fi
 
-      run_key="$(make_run_key "$trace" "$policy" "${run_devices[@]}")"
+      for current_perf_model_err in "${perf_model_errs[@]}"; do
+        for current_slo_tpot in "${slo_tpots[@]}"; do
+          run_key="$(make_run_key "$trace" "$policy" "$current_slo_tpot" "$current_perf_model_err" "${run_devices[@]}")"
 
-      if already_succeeded "$run_key"; then
-        echo "SKIP (already succeeded): $run_key"
-        log_run_cmd "SKIPPED" "$run_key" "<already succeeded>"
-        continue
-      fi
+          if already_succeeded "$run_key"; then
+            echo "SKIP (already succeeded): $run_key"
+            log_run_cmd "SKIPPED" "$run_key" "<already succeeded>"
+            continue
+          fi
 
-      echo "RUNNING: ${trace}"
-      echo "  policy=$policy"
-      echo "  window=$window"
-      echo "  load_scales=${load_scales[*]}"
-      echo "  n_devices=${run_devices[*]}"
-      echo "  ttft_slo_scales=${ttft_slo_scales[*]}"
-      echo "  slo_tpots=${slo_tpots[*]}"
-      echo "  perf_model_errs=${perf_model_errs[*]}"
-      echo "  model_name=$model_name"
-      echo "  tensor_parallel_size=$tensor_parallel_size"
-      echo "  profit=$profit"
-      echo "  admission_mode=$admission_mode"
-      echo "  slo_routing_overhead=$slo_routing_overhead"
-      echo "  scheduling_overhead=$scheduling_overhead"
-      echo "  routing_overhead=$routing_overhead"
-      echo "  routing_fallback_policy=$routing_fallback_policy"
-      echo "  output_dir=$output_dir"
-      echo "  extra_args=${extra_bench_args[*]}"
-      if ((${#run_devices[@]} != ${#n_devices[@]})); then
-        echo "  requested_n_devices=${n_devices[*]}"
-        echo "  available_clients=$available_clients"
-      fi
+          server_router_kwargs="$(render_runtime_server_router_kwargs \
+            "$trace_server_router_kwargs_base" \
+            "$model_name" \
+            "$scheduling_overhead" \
+            "$current_slo_tpot" \
+            "$current_perf_model_err")"
+          next_server_signature="$(compute_server_signature)"
+          if [[ -z "$server_pid" || "$next_server_signature" != "$current_server_signature" ]]; then
+            if [[ -n "$server_pid" ]]; then
+              echo "RESTARTING SERVER for ${trace}"
+              cleanup_server "$server_pid"
+              server_pid=""
+            fi
+            current_server_signature="$next_server_signature"
+          fi
 
-      ensure_server_ready
+          echo "RUNNING: ${trace}"
+          echo "  policy=$policy"
+          echo "  window=$window"
+          echo "  load_scales=${load_scales[*]}"
+          echo "  n_devices=${run_devices[*]}"
+          echo "  ttft_slo_scales=${ttft_slo_scales[*]}"
+          echo "  slo_tpots=$current_slo_tpot"
+          echo "  perf_model_errs=$current_perf_model_err"
+          echo "  model_name=$model_name"
+          echo "  tensor_parallel_size=$tensor_parallel_size"
+          echo "  profit=$profit"
+          echo "  admission_mode=$admission_mode"
+          echo "  slo_routing_overhead=$slo_routing_overhead"
+          echo "  scheduling_overhead=$scheduling_overhead"
+          echo "  routing_overhead=$routing_overhead"
+          echo "  routing_fallback_policy=$routing_fallback_policy"
+          echo "  output_dir=$output_dir"
+          echo "  extra_args=${extra_bench_args[*]}"
+          if ((${#run_devices[@]} != ${#n_devices[@]})); then
+            echo "  requested_n_devices=${n_devices[*]}"
+            echo "  available_clients=$available_clients"
+          fi
 
-      cmd=(
-        python motivation/bench_api_server.py
-        --overwrite
-        --n_devices "${run_devices[@]}"
-        --policies "$policy"
-        --load_scales "${load_scales[@]}"
-        --slo_tpots "${slo_tpots[@]}"
-        --ttft_slo_scales "${ttft_slo_scales[@]}"
-        --perf_model_err "${perf_model_errs[@]}"
-        --window "$window"
-        --trace "$trace"
-        --profit "$profit"
-        --admission_mode "$admission_mode"
-        --slo_routing_overhead "$slo_routing_overhead"
-        --scheduling_overhead "$scheduling_overhead"
-        --model_name "$model_name"
-        --tensor_parallel_size "$tensor_parallel_size"
-        --port "$RUN_BATCH_PORT"
-        --clients "$SERVER_CLIENTS"
-        --output_dir "$output_dir"
-        --routing_overhead "$routing_overhead"
-        --routing_fallback_policy "$routing_fallback_policy"
-        "${extra_bench_args[@]}"
-      )
+          ensure_server_ready
 
-      printf -v cmd_str '%q ' "${cmd[@]}"
+          cmd=(
+            python motivation/bench_api_server.py
+            --overwrite
+            --n_devices "${run_devices[@]}"
+            --policies "$policy"
+            --load_scales "${load_scales[@]}"
+            --slo_tpots "$current_slo_tpot"
+            --ttft_slo_scales "${ttft_slo_scales[@]}"
+            --perf_model_err "$current_perf_model_err"
+            --window "$window"
+            --trace "$trace"
+            --profit "$profit"
+            --admission_mode "$admission_mode"
+            --slo_routing_overhead "$slo_routing_overhead"
+            --scheduling_overhead "$scheduling_overhead"
+            --model_name "$model_name"
+            --tensor_parallel_size "$tensor_parallel_size"
+            --port "$RUN_BATCH_PORT"
+            --clients "$SERVER_CLIENTS"
+            --output_dir "$output_dir"
+            --routing_overhead "$routing_overhead"
+            --routing_fallback_policy "$routing_fallback_policy"
+            "${extra_bench_args[@]}"
+          )
 
-      set +e
-      "${cmd[@]}"
-      bench_status=$?
-      set -e
+          printf -v cmd_str '%q ' "${cmd[@]}"
 
-      if ((bench_status == 0)); then
-        echo "SUCCESS: $run_key"
-        echo "$run_key" >> "$SUCCEEDED_LOG"
-        log_run_cmd "SUCCESS" "$run_key" "$cmd_str"
-      else
-        echo "FAILED: $run_key"
-        echo "$run_key" >> "$FAILED_LOG"
-        log_run_cmd "FAILED" "$run_key" "$cmd_str"
-        cleanup_server "$server_pid"
-        server_pid=""
-      fi
+          set +e
+          "${cmd[@]}"
+          bench_status=$?
+          set -e
+
+          if ((bench_status == 0)); then
+            echo "SUCCESS: $run_key"
+            echo "$run_key" >> "$SUCCEEDED_LOG"
+            log_run_cmd "SUCCESS" "$run_key" "$cmd_str"
+          else
+            echo "FAILED: $run_key"
+            echo "$run_key" >> "$FAILED_LOG"
+            log_run_cmd "FAILED" "$run_key" "$cmd_str"
+            cleanup_server "$server_pid"
+            server_pid=""
+          fi
+        done
+      done
     done
   done
 

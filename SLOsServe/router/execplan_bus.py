@@ -12,8 +12,13 @@ from collections import defaultdict
 
 DEFAULT_LOAD_STATS = {
     "num_free_blocks": 0,
+    "effective_num_free_blocks": 0,
     "n_waitings": 0,
     "n_running": 0,
+    "n_regular_waitings": 0,
+    "n_regular_running": 0,
+    "n_best_effort_waitings": 0,
+    "n_best_effort_running": 0,
 }
 
 

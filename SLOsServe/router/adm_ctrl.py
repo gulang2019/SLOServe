@@ -566,7 +566,7 @@ class BatchPlanner:
 
     def _refresh_fast(self) -> tuple[bool, list[Batch], str | None]:
         now = max(self._next_batch_time or 0, self._now())
-        baseline_batch_time = self._fast_sched_get_batch_time([(0, 256)])
+        baseline_batch_time = self._fast_sched_get_batch_time([(0, 1)])
         load_ddls = sorted(
             [
                 (req_id, req.get_next_ddl() - now, req.get_next_load())

@@ -131,7 +131,23 @@ def _normalize_mock_prompt_token_ids(
 
 
 def _get_scheduler_exec_plan_snapshot(scheduler) -> Any | None:
-    getter = getattr(scheduler, "get_exec_plan", None)
+    def _get_optional_method(method_name: str):
+        mock_children = getattr(scheduler, "_mock_children", None)
+        if isinstance(mock_children, dict) and method_name in mock_children:
+            method = mock_children[method_name]
+            return method if callable(method) else None
+        scheduler_dict = getattr(scheduler, "__dict__", None)
+        if isinstance(scheduler_dict, dict) and method_name in scheduler_dict:
+            method = scheduler_dict[method_name]
+            return method if callable(method) else None
+        if getattr(type(scheduler), method_name, None) is None:
+            return None
+        method = getattr(scheduler, method_name, None)
+        return method if callable(method) else None
+
+    getter = _get_optional_method("get_router_exec_plan")
+    if getter is None:
+        getter = _get_optional_method("get_exec_plan")
     if not callable(getter):
         return None
     return getter()

@@ -958,6 +958,7 @@ class LoadEvent:
     type: str
     timestamp: float
     device_id: int = -1
+    service_tier: str = "default"
 
 @dataclass
 class SLOsServeEvent(LoadEvent):
@@ -1002,6 +1003,7 @@ class LoadStat:
         self.max_window = max_window
         self.n_devices = n_devices
         self.n_requests = [0 for _ in range(n_devices)]
+        self.n_regular_requests = [0 for _ in range(n_devices)]
         self.version_id = 0
         
     def reset(self, n_devices: int = 8):
@@ -1009,29 +1011,46 @@ class LoadStat:
         self.events = []
         self.n_devices = n_devices
         self.n_requests = [0 for _ in range(n_devices)]
+        self.n_regular_requests = [0 for _ in range(n_devices)]
+
+    @staticmethod
+    def _is_best_effort_service_tier(service_tier: Any) -> bool:
+        return str(service_tier or "default") == "best_effort"
 
     def _add_stat(self, event: dict[str, Any]):
+        is_best_effort = self._is_best_effort_service_tier(
+            event.get('service_tier', 'default'))
         if event['type'] == 'slosserve':
             self.events.append(SLOsServeEvent(**event))
         elif event['type'] == 'pool':
             self.events.append(PoolEvent(**event))
         elif event['type'] == 'arrival' and (self.n_devices > event['device_id'] >= 0):
             self.n_requests[event['device_id']] += 1
+            if not is_best_effort:
+                self.n_regular_requests[event['device_id']] += 1
             self.events.append(ArrivalEvent(**event))
         elif event['type'] == 'finish' and (self.n_devices > event['device_id'] >= 0):
             self.events.append(FinishEvent(**event))
             self.n_requests[event['device_id']] -= 1
+            if not is_best_effort:
+                self.n_regular_requests[event['device_id']] -= 1
         elif event['type'] == 'reject' and (self.n_devices > event['device_id'] >= 0):
             self.events.append(RejectEvent(**event))
             self.n_requests[event['device_id']] -= 1
+            if not is_best_effort:
+                self.n_regular_requests[event['device_id']] -= 1
 
-    def get_rejection_rate(self, window = 5) -> float:
+    def get_rejection_rate(self, window = 5, include_best_effort: bool = True) -> float:
         earliest_time = time.time() - window
         per_device_stats = defaultdict(lambda: {'n_arrivals': 0, 'n_rejects': 0})
         rejected = set()
         for req in self.events[::-1]:
             if req.timestamp < earliest_time:
                 break
+            if ((not include_best_effort)
+                    and self._is_best_effort_service_tier(
+                        getattr(req, 'service_tier', 'default'))):
+                continue
             if req.type == 'arrival':
                 if req.device_id not in per_device_stats:
                     per_device_stats[req.device_id] = {
@@ -1152,8 +1171,15 @@ class LoadStat:
                 }
         return {device_id: ret.get(device_id, {'waiting_size': 0, 'running_size': 0}) for device_id in range(self.n_devices)}
 
-    def get_stat(self, window = 5) -> list[DeviceStat]:
-        rejection_rates = self.get_rejection_rate(window)
+    def get_stat(
+        self,
+        window = 5,
+        include_best_effort: bool = True,
+    ) -> list[DeviceStat]:
+        rejection_rates = self.get_rejection_rate(
+            window,
+            include_best_effort=include_best_effort,
+        )
         batch_utilizations = self.get_batch_utilization(window)
         pool_sizes = self.get_pool_size(window)
         ret = []
@@ -1166,7 +1192,11 @@ class LoadStat:
                 batch_utilizations[device_id]['future_utilization'],
                 pool_sizes[device_id]['waiting_size'],
                 pool_sizes[device_id]['running_size'],
-                self.n_requests[device_id]))
+                (
+                    self.n_requests[device_id]
+                    if include_best_effort else
+                    self.n_regular_requests[device_id]
+                )))
         return ret
 
     def add_event(self, event: dict[str, Any] | list):
@@ -1268,7 +1298,8 @@ class Router(ABC):
             return request.prefill_device_id, decode_device_id
         if request is not None:
             return 0, 0
-        n_reqs = [stat.n_requests for stat in load_stat.get_stat()]
+        n_reqs = [stat.n_requests for stat in load_stat.get_stat(
+            include_best_effort=True)]
         min_n_req = min(n_reqs)
         freest_device_id = n_reqs.index(min_n_req)
         return freest_device_id, freest_device_id
@@ -1347,7 +1378,7 @@ class AutoScalingRouter(Router):
         # we implement a try next 
         waiting_requests.sort(key=lambda x: x.payload['vllm_xargs']['prefill_ddl'])
         
-        stats = self.load_stat.get_stat()
+        stats = self.load_stat.get_stat(include_best_effort=False)
         
         if len(waiting_requests):
             self._iter += 1
@@ -1630,7 +1661,7 @@ class DisaggregatedLCRouter(AutoScalingRouter):
 
     def run(self, waiting_requests: List[RequestInstance],
             running_requests: List[RequestInstance]):
-        stats = self.load_stat.get_stat()
+        stats = self.load_stat.get_stat(include_best_effort=False)
         for request in waiting_requests:
             if time.time() > request.payload['vllm_xargs']['prefill_ddl']:
                 request.admitted = False
@@ -2181,8 +2212,9 @@ class SLOsServeRouter(Router):
             if isinstance(load_stats, dict):
                 try:
                     engine_state.num_free_blocks = int(
-                        load_stats.get('num_free_blocks',
-                                       engine_state.num_free_blocks))
+                        load_stats.get('effective_num_free_blocks',
+                                       load_stats.get('num_free_blocks',
+                                       engine_state.num_free_blocks)))
                 except (TypeError, ValueError):
                     pass
             exec_plan = state.get('exec_plan')
@@ -3201,6 +3233,12 @@ class RequestPool:
             request.payload['vllm_xargs']['service_tier'] = 'best_effort'
             request.admitted = True
 
+    def _get_regular_running_requests(self) -> list[RequestInstance]:
+        return [
+            request for request in self.running_pool
+            if request.service_tier != 'best_effort'
+        ]
+
     async def routing_loop(self):
         next_load_statistics_time = time.time()
         next_auto_scaling_time = time.time()
@@ -3237,7 +3275,10 @@ class RequestPool:
                     if request.service_tier == 'best_effort'
                 ]
                 if regular_waiting_requests:
-                    self.router.run(regular_waiting_requests, self.running_pool)
+                    self.router.run(
+                        regular_waiting_requests,
+                        self._get_regular_running_requests(),
+                    )
                 if best_effort_waiting_requests:
                     self._route_best_effort_requests(best_effort_waiting_requests)
             routing_elapsed = time.time() - it_start_time
@@ -3362,6 +3403,7 @@ class RequestPool:
                             'request_id': request.request_id,
                             'is_rejection': True, 
                             'is_slo_violation': True,
+                            'service_tier': request.service_tier,
                         })
 
                         request.rejection_reason = "ROUTER"
@@ -3452,6 +3494,7 @@ class RequestPool:
                 'timestamp': time.time(),
                 'device_id': request.prefill_device_id,
                 'request_id': request.request_id,
+                'service_tier': request.service_tier,
             })
             # logger.info(f"Request {request.request_id} will be streamed from device {request.prefill_device_id}")
             self._profile_events.append({
@@ -3465,7 +3508,11 @@ class RequestPool:
             
             # print('dispatch', request.request_id, time.time(), 'router')
 
-            admission_history = request.admission_stat or asdict(self.load_stat.get_stat()[request.prefill_device_id])
+            admission_history = request.admission_stat or asdict(
+                self.load_stat.get_stat(
+                    include_best_effort=(request.service_tier == 'best_effort'),
+                )[request.prefill_device_id]
+            )
             admission_history.update({
                 'input_length': request.payload['vllm_xargs']['input_length'],
                 'output_length': request.payload['vllm_xargs']['output_length'],
@@ -3488,6 +3535,7 @@ class RequestPool:
                     'timestamp': time.time(),
                     'device_id': request.prefill_device_id,
                     'request_id': request.request_id,
+                    'service_tier': request.service_tier,
                 })
                 admission_history.update({
                     'is_rejected': True
@@ -3533,6 +3581,7 @@ class RequestPool:
                 'timestamp': time.time(),
                 'device_id': request.prefill_device_id,
                 'request_id': request.request_id,
+                'service_tier': request.service_tier,
             })
             self._profile_events.append({
                 "event_type": "dispatch-prefill",
@@ -3562,6 +3611,7 @@ class RequestPool:
                     'timestamp': time.time(),
                     'device_id': request.prefill_device_id,
                     'request_id': request.request_id,
+                    'service_tier': request.service_tier,
                 })
                 self.update_req_state(request, RequestState.PREFILL_REJECTED)
                 if self.enable_rescheduling:
@@ -3592,6 +3642,7 @@ class RequestPool:
                 'request_id': request.request_id,
                 'is_rejection': False,
                 'is_slo_violation': False,
+                'service_tier': request.service_tier,
             })
             request.update({'num_computed_tokens': request.num_prompt_tokens, 'timestamp': time.time()})
 
@@ -3609,6 +3660,7 @@ class RequestPool:
             'timestamp': time.time(),
             'device_id': request.decode_device_id,
             'request_id': request.request_id,
+            'service_tier': request.service_tier,
         })
         
         self._profile_events.append({
@@ -3652,6 +3704,7 @@ class RequestPool:
                 'timestamp': time.time(),
                 'device_id': request.decode_device_id,
                 'request_id': request.request_id,
+                'service_tier': request.service_tier,
             })
             self.update_req_state(request, RequestState.DECODE_REJECTED)
             if self.enable_rescheduling:
@@ -3685,6 +3738,7 @@ class RequestPool:
             'request_id': request.request_id,
             'is_rejection': False,
             'is_slo_violation': request.is_slo_violation,
+            'service_tier': request.service_tier,
         })
         await request.response_queue.put(None)
         self.update_req_state(request, RequestState.DECODE_FINISHED)
