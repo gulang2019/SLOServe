@@ -185,6 +185,40 @@ def _request_id_sort_key(request_id: Any) -> tuple[int, int | str]:
         return (1, request_id_str)
 
 
+def _rewrite_planner_sch_event_request_ids(
+    event: Dict[str, Any],
+    backend_id_2_id,
+) -> None:
+    extra_args = event.get("extra_args")
+    if not isinstance(extra_args, dict):
+        return
+
+    load_ddls = extra_args.get("load_ddls")
+    if isinstance(load_ddls, list):
+        rewritten_load_ddls = []
+        for item in load_ddls:
+            if isinstance(item, (list, tuple)) and item:
+                rewritten_item = list(item)
+                rewritten_item[0] = backend_id_2_id(rewritten_item[0])
+                rewritten_load_ddls.append(rewritten_item)
+            else:
+                rewritten_load_ddls.append(item)
+        extra_args["load_ddls"] = rewritten_load_ddls
+
+    sch = extra_args.get("sch")
+    if isinstance(sch, dict):
+        extra_args["sch"] = {
+            backend_id_2_id(req_id): num_scheduled_tokens
+            for req_id, num_scheduled_tokens in sch.items()
+        }
+
+    selected_deadline_req_id = extra_args.get("selected_deadline_req_id")
+    if selected_deadline_req_id is not None:
+        extra_args["selected_deadline_req_id"] = backend_id_2_id(
+            selected_deadline_req_id
+        )
+
+
 def _normalize_rejection_reason(reason: Any) -> str | None:
     if reason is None:
         return None
@@ -3707,6 +3741,11 @@ async def main(
                 event['num_scheduled_tokens'] = {backend_id_2_id(req_id): num_scheduled_tokens for req_id, num_scheduled_tokens in event['num_scheduled_tokens'].items()}
                 if 'rejected_reqs' in event:
                     event['rejected_reqs'] = [backend_id_2_id(req_id) for req_id in event['rejected_reqs']]
+            if event['event_type'] == 'planner_sch':
+                _rewrite_planner_sch_event_request_ids(
+                    event,
+                    backend_id_2_id,
+                )
             if event['event_type'] == 'req_state':
                 event['ddl'] = apply_time_offsets(event['ddl'])
             if event['event_type'] == 'arrival':
