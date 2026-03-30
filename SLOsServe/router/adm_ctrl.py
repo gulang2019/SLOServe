@@ -353,20 +353,43 @@ class BatchPlanner:
             arrival_time=req.kv_ready_time - now if req.kv_ready_time is not None else 0,
         )
 
-    def _cpp_feasible_with_new(self, new_req: Request, now: float) -> tuple[bool, str | None]:
+    def _cpp_feasible_with_new(
+        self,
+        new_req: Request,
+        now: float,
+        num_free_blocks_override: int | None = None,
+    ) -> tuple[bool, str | None]:
         start = time.time()
-        reqs = list(self._requests.values()) + [new_req]
+        existing_reqs = list(self._requests.values())
+        if new_req.service_tier != "best_effort":
+            existing_reqs = [
+                req for req in existing_reqs
+                if req.service_tier != "best_effort"
+            ]
+        reqs = existing_reqs + [new_req]
         tpot = min(r.slo_tpot for r in reqs) if reqs else new_req.slo_tpot
         self._ensure_cpp_planner(tpot)
-        c_reqs = [self._to_cpp_request(r, is_new_req=False, now=now) for r in self._requests.values()]
+        c_reqs = [
+            self._to_cpp_request(r, is_new_req=False, now=now)
+            for r in existing_reqs
+        ]
         c_reqs.append(self._to_cpp_request(new_req, is_new_req=True, now=now))
+        num_free_blocks = (
+            self._num_free_blocks
+            if num_free_blocks_override is None
+            else int(num_free_blocks_override)
+        )
         reject_reason = None
         if hasattr(self._adm_ctrler, "adm_ctrl_with_reason"):
             is_feasible, is_accepteds, reject_reason = self._adm_ctrler.adm_ctrl_with_reason(
-                c_reqs, self._num_free_blocks, 0.0
+                c_reqs, num_free_blocks, 0.0
             )
         else:
-            is_feasible, is_accepteds = self._adm_ctrler.adm_ctrl(c_reqs, self._num_free_blocks, 0.0)
+            is_feasible, is_accepteds = self._adm_ctrler.adm_ctrl(
+                c_reqs,
+                num_free_blocks,
+                0.0,
+            )
         # print('c_reqs', c_reqs, 'num_free_blocks', self._num_free_blocks)
         # print('is_feasible', is_feasible, 'is_accepteds', is_accepteds)
         self._cpp_adm_ctrl_iterations += 1
@@ -391,7 +414,7 @@ class BatchPlanner:
             self._dump_schedule_inputs(
                 c_reqs,
                 [req.id for req, is_acc in zip(c_reqs, is_accepteds) if is_acc],
-                num_free_blocks=self._num_free_blocks,
+                num_free_blocks=num_free_blocks,
                 current_time=0.0,
                 is_feasible=bool(is_feasible),
                 surfix = f'adm_ctrl_{new_req.request_id}'
@@ -413,7 +436,8 @@ class BatchPlanner:
                         kv_ready_time: float | None = None,
                         must_admit: bool = False,
                         service_tier: str | None = None,
-                        output_length: int | None = None):
+                        output_length: int | None = None,
+                        num_free_blocks_override: int | None = None):
         assert not self._is_oracle or output_length is not None
         if service_tier is None:
             service_tier = "best_effort" if must_admit else "default"
@@ -427,7 +451,11 @@ class BatchPlanner:
                           service_tier = service_tier,
                           output_length = output_length)
         now = self._next_batch_time if self._next_batch_time is not None else self._now()
-        feasible, reject_reason = self._cpp_feasible_with_new(new_req, now)
+        feasible, reject_reason = self._cpp_feasible_with_new(
+            new_req,
+            now,
+            num_free_blocks_override=num_free_blocks_override,
+        )
         if (not feasible) and (not must_admit):
             self._last_infeasible_reason = reject_reason or "UNKNOWN"
         else:
@@ -495,7 +523,11 @@ class BatchPlanner:
         return next_batch.n_scheduled_tokens, admitted_requests, exec_plan
     
     def finish_request(self, request_id: str):
-        self._requests.pop(request_id)
+        self._requests.pop(request_id, None)
+        self._admitted_requests = [
+            req_id for req_id in self._admitted_requests
+            if req_id != request_id
+        ]
         # is_feasible, self._batch_plan, reason = self._refresh()
         # if not is_feasible:
         #     logger.info(f'[BatchPlanner]: Infeasibility detected. {reason=}')
@@ -514,7 +546,13 @@ class BatchPlanner:
         #     logger.warning(f"num_scheduled_tokens mismatch: {num_scheduled_tokens=}, {self._batch_plan[0].n_scheduled_tokens=}")
             
         for req_id in finished_reqs:
-            self._requests.pop(req_id) 
+            self._requests.pop(req_id, None)
+        if finished_reqs:
+            finished_request_ids = set(finished_reqs)
+            self._admitted_requests = [
+                req_id for req_id in self._admitted_requests
+                if req_id not in finished_request_ids
+            ]
         
         self._num_free_blocks = num_free_blocks 
         # After the batch actually commits, use the real completion time as the
