@@ -896,6 +896,19 @@ class RequestInstance:
         return self.payload.get('vllm_xargs', {}).get('session_id')
 
     @property
+    def service_tier(self) -> str:
+        return str(self.payload.get('vllm_xargs', {}).get('service_tier', 'default'))
+
+    @property
+    def initial_service_tier(self) -> str:
+        return str(
+            self.payload.get('vllm_xargs', {}).get(
+                'initial_service_tier',
+                self.service_tier,
+            )
+        )
+
+    @property
     def cached_tokens(self) -> int:
         try:
             return max(0, int(self.payload.get('vllm_xargs', {}).get('cached_tokens', 0)))
@@ -2892,6 +2905,15 @@ class RequestPool:
         request_id = request_json['vllm_xargs'].get('request_id', str(uuid.uuid4()))
         request_json['vllm_xargs']['cached_tokens'] = int(request_json['vllm_xargs'].get('cached_tokens', 0) or 0)
         request_json['vllm_xargs']['router_arrival_time'] = current_time
+        request_json['vllm_xargs']['service_tier'] = str(
+            request_json['vllm_xargs'].get('service_tier', 'default')
+        )
+        request_json['vllm_xargs']['initial_service_tier'] = str(
+            request_json['vllm_xargs'].get(
+                'initial_service_tier',
+                request_json['vllm_xargs']['service_tier'],
+            )
+        )
         if 'prefill_ddl' not in request_json['vllm_xargs']:
             request_json['vllm_xargs']['prefill_ddl'] = current_time + request_json['vllm_xargs']['slo_ttft']
         request_instance = RequestInstance(request_id, request_json, response_queue, current_time)
@@ -2910,6 +2932,11 @@ class RequestPool:
             "prompt_tokens": request_json['vllm_xargs'].get('input_length', 0),
             "num_cached_tokens": request_json['vllm_xargs'].get('cached_tokens', 0),
             "max_tokens": request_json['max_tokens'],
+            "service_tier": request_json['vllm_xargs'].get('service_tier', 'default'),
+            "initial_service_tier": request_json['vllm_xargs'].get(
+                'initial_service_tier',
+                request_json['vllm_xargs'].get('service_tier', 'default'),
+            ),
             "extra_args": {
                 "session_id": request_json['vllm_xargs'].get('session_id'),
             },
@@ -3157,6 +3184,23 @@ class RequestPool:
         stats = list(await asyncio.gather(*refs))
         return stats
 
+    def _route_best_effort_requests(
+        self,
+        waiting_requests: list[RequestInstance],
+    ) -> None:
+        for request in waiting_requests:
+            if request.admitted is True:
+                continue
+            prefill_device_id, decode_device_id = self.router.select_asap_server(
+                self.load_stat,
+                request=None,
+            )
+            request.prefill_device_id = prefill_device_id
+            request.decode_device_id = decode_device_id
+            request.payload['vllm_xargs']['must_admit'] = True
+            request.payload['vllm_xargs']['service_tier'] = 'best_effort'
+            request.admitted = True
+
     async def routing_loop(self):
         next_load_statistics_time = time.time()
         next_auto_scaling_time = time.time()
@@ -3184,7 +3228,18 @@ class RequestPool:
             if len(self.waiting_pool): 
                 routing_iter += 1
                 self.router.set_iter(routing_iter)
-                self.router.run(self.waiting_pool, self.running_pool)
+                regular_waiting_requests = [
+                    request for request in self.waiting_pool
+                    if request.service_tier != 'best_effort'
+                ]
+                best_effort_waiting_requests = [
+                    request for request in self.waiting_pool
+                    if request.service_tier == 'best_effort'
+                ]
+                if regular_waiting_requests:
+                    self.router.run(regular_waiting_requests, self.running_pool)
+                if best_effort_waiting_requests:
+                    self._route_best_effort_requests(best_effort_waiting_requests)
             routing_elapsed = time.time() - it_start_time
 
             if len(self.waiting_pool) > 0:
@@ -3235,8 +3290,15 @@ class RequestPool:
             for request in self.waiting_pool:
                 prefill_ddl = request.payload['vllm_xargs']['prefill_ddl']
                 now = time.time()
-                overdue = now > (prefill_ddl - (self.kv_xfer_delay if (request.is_prefill and self.enable_rerouting) else 0))
-                if self.routing_overhead < 0 and (
+                is_best_effort = request.service_tier == 'best_effort'
+                overdue = (
+                    False if is_best_effort else
+                    now > (
+                        prefill_ddl
+                        - (self.kv_xfer_delay if (request.is_prefill and self.enable_rerouting) else 0)
+                    )
+                )
+                if (not is_best_effort) and self.routing_overhead < 0 and (
                     (request.state in (RequestState.WAITING, RequestState.PREFILL_REJECTED_WAITING) and overdue ) or 
                     (request.state == RequestState.PREFILL_FINISHED and overdue)
                 ):

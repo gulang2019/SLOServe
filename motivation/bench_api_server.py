@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 from motivation.events_analysis import (
     _compute_active_device_series,
     _compute_measured_power_series,
+    _resolve_service_time_bounds,
     analyze_events,
     analyze_slo_violation,
     build_active_requests_step,
@@ -145,6 +146,15 @@ def _build_concise_result_row(
             "per_token": slo_ttft_per_token,
         },
         "slo_violation_rate": result.get("slo_violation_rate"),
+        "enable_best_effort_tier": result.get("enable_best_effort_tier"),
+        "best_effort_max_inflight": result.get("best_effort_max_inflight"),
+        "normal_slo_attainment_rate": result.get("normal_slo_attainment_rate"),
+        "best_effort_scheduled_token_throughput_tps": result.get(
+            "best_effort_scheduled_token_throughput_tps"
+        ),
+        "best_effort_completed_requests": result.get(
+            "best_effort_completed_requests"
+        ),
         "trace_used": trace_used if trace_used is not None else result.get("trace_used"),
     }
 
@@ -820,6 +830,11 @@ class Problem:
     slo_routing_overhead: float = 0.16
     enable_session_replay: bool = False
     session_pause_s: float = 0.0
+    frontend_httpx_max_connections: int | None = None
+    frontend_httpx_max_keepalive_connections: int | None = None
+    frontend_dedicated_client_per_request: bool = False
+    enable_best_effort_tier: bool = False
+    best_effort_max_inflight: int = 0
      
     # profit model 
     profit_per_input_token: float = 0.0
@@ -852,6 +867,68 @@ class Problem:
 
     def get_expected_profit(self, input_length: int):
         return float(self.profit_per_input_token * input_length + self.profit_per_output_token * average_output_length + self.profit_base)
+
+
+def _build_frontend_httpx_limits(
+    *,
+    max_connections: int | None,
+    max_keepalive_connections: int | None,
+) -> httpx.Limits | None:
+    if max_connections is None and max_keepalive_connections is None:
+        return None
+
+    normalized_max_connections = None
+    if max_connections is not None:
+        normalized_max_connections = max(1, int(max_connections))
+
+    normalized_max_keepalive_connections = None
+    if max_keepalive_connections is not None:
+        normalized_max_keepalive_connections = max(
+            0,
+            int(max_keepalive_connections),
+        )
+        if normalized_max_connections is not None:
+            normalized_max_keepalive_connections = min(
+                normalized_max_keepalive_connections,
+                normalized_max_connections,
+            )
+
+    return httpx.Limits(
+        max_connections=normalized_max_connections,
+        max_keepalive_connections=normalized_max_keepalive_connections,
+    )
+
+
+def _frontend_httpx_suffix(
+    *,
+    dedicated_client_per_request: bool,
+    max_connections: int | None,
+    max_keepalive_connections: int | None,
+) -> str:
+    parts: list[str] = []
+    if dedicated_client_per_request:
+        parts.append("dedicated")
+    if max_connections is not None:
+        parts.append(f"mc{int(max_connections)}")
+    if max_keepalive_connections is not None:
+        parts.append(f"mk{int(max_keepalive_connections)}")
+    if not parts:
+        return ""
+    return "_fhx_" + "_".join(parts)
+
+
+def _make_frontend_httpx_client(
+    *,
+    endpoint: str,
+    frontend_httpx_limits: httpx.Limits | None,
+) -> httpx.AsyncClient:
+    client_kwargs: dict[str, Any] = {
+        "timeout": 3600,
+        "base_url": endpoint,
+    }
+    if frontend_httpx_limits is not None:
+        client_kwargs["limits"] = frontend_httpx_limits
+    return httpx.AsyncClient(**client_kwargs)
 
 
 def compute_ttft_slo(
@@ -1548,7 +1625,12 @@ def _build_request_payload(
     slo_tpot: float,
     expected_profit: float,
     request_id: str,
+    must_admit: bool = False,
+    service_tier: str = "default",
+    initial_service_tier: str | None = None,
 ) -> dict[str, Any]:
+    if initial_service_tier is None:
+        initial_service_tier = service_tier
     vllm_xargs = {
         'input_length': input_length,
         'output_length': output_length,
@@ -1558,7 +1640,11 @@ def _build_request_payload(
         'slo_tpot': slo_tpot,
         'profit': expected_profit,
         'request_id': request_id,
+        'service_tier': service_tier,
+        'initial_service_tier': initial_service_tier,
     }
+    if must_admit:
+        vllm_xargs['must_admit'] = True
     if session_id is not None:
         vllm_xargs['session_id'] = session_id
     return {
@@ -1608,6 +1694,15 @@ class ExecutionResult:
     expected_finish_time: List[float] = field(default_factory=list)
     
     
+@dataclass
+class BenchmarkTask:
+    task: asyncio.Task
+    request: Request
+    task_start_time: float
+    request_id: str
+    tier: str = "default"
+
+
 @dataclass
 class ExecutionResults:
     problem: Problem
@@ -1748,7 +1843,26 @@ def _make_overload_run_result(
     )
     
 
-async def run_request(client: httpx.AsyncClient,
+def _build_synthetic_prompt_tokens(input_length: int, *, seed: int) -> list[int]:
+    rng = random.Random(int(seed))
+    return [1000 + rng.randrange(20000) for _ in range(max(0, int(input_length)))]
+
+
+def _make_best_effort_request(
+    template: Request,
+    *,
+    seed: int,
+) -> Request:
+    return Request(
+        input_length=int(template.input_length),
+        output_length=int(template.output_length),
+        cached_length=0,
+        session_id=None,
+        prompt=_build_synthetic_prompt_tokens(int(template.input_length), seed=seed),
+    )
+
+
+async def _run_request_with_client(client: httpx.AsyncClient,
                     request_id: str,
                     model_name: str,
                     prompt: str | list[int], 
@@ -1760,7 +1874,11 @@ async def run_request(client: httpx.AsyncClient,
                     ttft_slo: float,
                     slo_tpot: float, 
                     expected_profit: float,
-                    real_arrival_times: dict) -> Tuple[bool, str | None, str, List[float]]:
+                    real_arrival_times: dict,
+                    *,
+                    must_admit: bool = False,
+                    service_tier: str = "default",
+                    initial_service_tier: str | None = None) -> Tuple[bool, str | None, str, List[float]]:
         real_arrival_times[request_id] = time.time()
         timestamps = []
         response_text = ""
@@ -1782,6 +1900,9 @@ async def run_request(client: httpx.AsyncClient,
             slo_tpot=slo_tpot,
             expected_profit=expected_profit,
             request_id=request_id,
+            must_admit=must_admit,
+            service_tier=service_tier,
+            initial_service_tier=initial_service_tier,
         )
         
         chunks = []
@@ -1840,6 +1961,234 @@ async def run_request(client: httpx.AsyncClient,
             logger.info(f"Streaming response finished: request_id={request_id}")
         # print(f'Request {request_id} finished with {len(timestamps)} timestamps IL: {input_length} OL: {output_length} .')
         return is_rejected, rejection_reason, response_text, timestamps
+
+
+async def run_request(client: httpx.AsyncClient | None,
+                    request_id: str,
+                    model_name: str,
+                    prompt: str | list[int], 
+                    input_length: int,
+                    output_length: int,
+                    zero_load_ttft: float,
+                    cached_tokens: int,
+                    session_id: str | None,
+                    ttft_slo: float,
+                    slo_tpot: float, 
+                    expected_profit: float,
+                    real_arrival_times: dict,
+                    *,
+                    endpoint: str | None = None,
+                    frontend_httpx_limits: httpx.Limits | None = None,
+                    must_admit: bool = False,
+                    service_tier: str = "default",
+                    initial_service_tier: str | None = None) -> Tuple[bool, str | None, str, List[float]]:
+        if client is not None:
+            return await _run_request_with_client(
+                client,
+                request_id,
+                model_name,
+                prompt,
+                input_length,
+                output_length,
+                zero_load_ttft,
+                cached_tokens,
+                session_id,
+                ttft_slo,
+                slo_tpot,
+                expected_profit,
+                real_arrival_times,
+                must_admit=must_admit,
+                service_tier=service_tier,
+                initial_service_tier=initial_service_tier,
+            )
+
+        if endpoint is None:
+            raise ValueError("endpoint is required when no shared HTTP client is provided")
+
+        async with _make_frontend_httpx_client(
+            endpoint=endpoint,
+            frontend_httpx_limits=frontend_httpx_limits,
+        ) as dedicated_client:
+            return await _run_request_with_client(
+                dedicated_client,
+                request_id,
+                model_name,
+                prompt,
+                input_length,
+                output_length,
+                zero_load_ttft,
+                cached_tokens,
+                session_id,
+                ttft_slo,
+                slo_tpot,
+                expected_profit,
+                real_arrival_times,
+                must_admit=must_admit,
+                service_tier=service_tier,
+                initial_service_tier=initial_service_tier,
+            )
+
+
+def _request_initial_service_tier(req: Any) -> str:
+    tier = getattr(req, "initial_service_tier", None)
+    if tier:
+        return str(tier)
+    tier = getattr(req, "service_tier", None)
+    if tier:
+        return str(tier)
+    return "default"
+
+
+def _request_finish_time(req: Any) -> float:
+    finish_candidates: list[float] = []
+    for schedule in getattr(req, "schedules", []):
+        finish_candidates.append(
+            float(getattr(schedule, "timestamp", 0.0))
+            + float(getattr(schedule, "elapsed", 0.0))
+        )
+    for event in getattr(req, "events", []):
+        if getattr(event, "event_type", None) == "finish":
+            finish_candidates.append(float(getattr(event, "timestamp", 0.0)))
+    if finish_candidates:
+        return max(finish_candidates)
+    return float(getattr(req, "arrival_time", 0.0))
+
+
+def _summarize_service_tier_metrics(
+    reqs: Dict[str, Any],
+    all_events: List[Any],
+) -> Dict[str, Any]:
+    req_list = list(reqs.values())
+    regular_reqs = [
+        req for req in req_list
+        if _request_initial_service_tier(req) != "best_effort"
+    ]
+    best_effort_reqs = [
+        req for req in req_list
+        if _request_initial_service_tier(req) == "best_effort"
+    ]
+
+    def _violation_summary(
+        selected_reqs: list[Any],
+    ) -> tuple[float, Dict[str, int], Dict[str, float]]:
+        if not selected_reqs:
+            return 0.0, {}, {}
+        counts = Counter(str(req.violate_slo()) for req in selected_reqs)
+        total = float(len(selected_reqs))
+        attainment = float(counts.get("none", 0) / total)
+        return (
+            attainment,
+            dict(sorted(counts.items())),
+            {
+                key: float(value / total)
+                for key, value in sorted(counts.items())
+            },
+        )
+
+    normal_attainment, normal_violation_counts, normal_violation_rates = (
+        _violation_summary(regular_reqs)
+    )
+
+    if regular_reqs:
+        request_events = [{
+            "arrival_time": float(getattr(req, "arrival_time", 0.0)),
+            "violation": str(req.violate_slo()),
+        } for req in regular_reqs]
+        service_start_time, _ = _resolve_service_time_bounds(request_events, [])
+        service_end_time = max(_request_finish_time(req) for req in regular_reqs)
+    elif req_list:
+        request_events = [{
+            "arrival_time": float(getattr(req, "arrival_time", 0.0)),
+            "violation": str(req.violate_slo()),
+        } for req in req_list]
+        service_start_time, service_end_time = _resolve_service_time_bounds(
+            request_events,
+            all_events,
+        )
+    else:
+        service_start_time = 0.0
+        service_end_time = 0.0
+
+    service_window_s = max(float(service_end_time - service_start_time), 1e-9)
+    best_effort_completed = [
+        req for req in best_effort_reqs
+        if getattr(req, "finish_reason", None) == "length"
+    ]
+    best_effort_completed_in_window = [
+        req for req in best_effort_completed
+        if _request_finish_time(req) <= service_end_time
+    ]
+    best_effort_scheduled_tokens_in_window = int(sum(
+        int(getattr(schedule, "num_scheduled_tokens", 0))
+        for req in best_effort_reqs
+        for schedule in getattr(req, "schedules", [])
+        if service_start_time <= float(getattr(schedule, "timestamp", 0.0)) <= service_end_time
+    ))
+
+    total_best_effort = len(best_effort_reqs)
+    return {
+        "normal_total_requests": len(regular_reqs),
+        "normal_slo_attainment_rate": normal_attainment,
+        "normal_slo_violation_rate": (
+            float(1.0 - normal_attainment) if regular_reqs else 0.0
+        ),
+        "normal_violation_reason_counts": normal_violation_counts,
+        "normal_violation_reason_rates": normal_violation_rates,
+        "best_effort_total_requests": total_best_effort,
+        "best_effort_completed_requests": len(best_effort_completed),
+        "best_effort_completed_requests_in_normal_window": len(
+            best_effort_completed_in_window
+        ),
+        "best_effort_completion_rate": (
+            float(len(best_effort_completed) / total_best_effort)
+            if total_best_effort else 0.0
+        ),
+        "best_effort_scheduled_tokens_in_normal_window": (
+            best_effort_scheduled_tokens_in_window
+        ),
+        "best_effort_normal_window_s": float(service_window_s),
+        "best_effort_completed_request_throughput_rps": (
+            float(len(best_effort_completed_in_window) / service_window_s)
+            if service_window_s > 0 else 0.0
+        ),
+        "best_effort_scheduled_token_throughput_tps": (
+            float(best_effort_scheduled_tokens_in_window / service_window_s)
+            if service_window_s > 0 else 0.0
+        ),
+    }
+
+
+def _apply_service_tier_reporting(
+    results: Dict[str, Any],
+    service_tier_metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    if service_tier_metrics.get('best_effort_total_requests', 0) <= 0:
+        return results
+
+    all_request_slo_attainment_rate = float(
+        results.get('slo_attainment_rate', 0.0) or 0.0
+    )
+    normal_slo_attainment_rate = float(
+        service_tier_metrics.get('normal_slo_attainment_rate', 0.0) or 0.0
+    )
+    normal_slo_violation_rate = float(
+        service_tier_metrics.get(
+            'normal_slo_violation_rate',
+            1.0 - normal_slo_attainment_rate,
+        ) or 0.0
+    )
+
+    results['all_request_slo_attainment_rate'] = all_request_slo_attainment_rate
+    results['all_request_slo_violation_rate'] = float(
+        1.0 - all_request_slo_attainment_rate
+    )
+    results['slo_attainment_rate'] = normal_slo_attainment_rate
+    results['slo_violation_rate'] = normal_slo_violation_rate
+    results['violations'] = dict(
+        sorted(service_tier_metrics.get('normal_violation_reason_rates', {}).items())
+    )
+    return results
+
 
 def summarize_energy_events(
     events: List[Dict[str, Any] | Any],
@@ -2969,7 +3318,12 @@ async def main(
     global_start_time = time.time()
     print(f'global_start_time: {global_start_time}')
     
-    tasks = []
+    tasks: list[BenchmarkTask] = []
+    best_effort_enabled = bool(
+        problem.enable_best_effort_tier and int(problem.best_effort_max_inflight) > 0
+    )
+    best_effort_template_idx = 0
+    best_effort_counter = 0
     pending_indices: list[int] = []
     time_offset = 0
     time_offsets = [(global_start_time, 0)]
@@ -2987,10 +3341,28 @@ async def main(
     n_timed_out = 0
     rejection_reason_counts: Counter[str] = Counter()
     rejected_request_reasons: dict[str, str] = {}
+    frontend_httpx_limits = _build_frontend_httpx_limits(
+        max_connections=problem.frontend_httpx_max_connections,
+        max_keepalive_connections=problem.frontend_httpx_max_keepalive_connections,
+    )
     
     try:
-        async with httpx.AsyncClient(timeout=3600, base_url=endpoint) as client:
-            while finished_bar.n < len(requests):
+        async with contextlib.AsyncExitStack() as exit_stack:
+            shared_client: httpx.AsyncClient | None = None
+            if not problem.frontend_dedicated_client_per_request:
+                shared_client = await exit_stack.enter_async_context(
+                    _make_frontend_httpx_client(
+                        endpoint=endpoint,
+                        frontend_httpx_limits=frontend_httpx_limits,
+                    )
+                )
+            while (
+                finished_bar.n < len(requests)
+                or (
+                    best_effort_enabled
+                    and any(task.tier == "best_effort" for task in tasks)
+                )
+            ):
                 elapsed_time = time.time() - global_start_time + time_offset
                 
                 while arrival_idx < len(trace_request_indices) and arrival_times[arrival_idx] <= elapsed_time:
@@ -3028,7 +3400,7 @@ async def main(
                         session_ready_at[request.session_id] = float("inf")
 
                     task = asyncio.create_task(run_request(
-                        client,
+                        shared_client,
                         request_id_backend,
                         problem.model_name,
                         prompt,
@@ -3052,9 +3424,90 @@ async def main(
                             request.input_length - request.cached_length,
                         ),
                         real_arrival_times=real_arrival_times,
+                        endpoint=(
+                            endpoint
+                            if problem.frontend_dedicated_client_per_request
+                            else None
+                        ),
+                        frontend_httpx_limits=frontend_httpx_limits,
                     ))
 
-                    tasks.append((task, request, task_start_time, request_id))
+                    tasks.append(
+                        BenchmarkTask(
+                            task=task,
+                            request=request,
+                            task_start_time=task_start_time,
+                            request_id=request_id,
+                            tier="default",
+                        )
+                    )
+
+                def _normal_work_remaining() -> bool:
+                    return (
+                        arrival_idx < len(trace_request_indices)
+                        or bool(pending_indices)
+                        or any(task.tier != "best_effort" for task in tasks)
+                    )
+
+                if best_effort_enabled and _normal_work_remaining():
+                    active_best_effort = sum(
+                        1 for task in tasks if task.tier == "best_effort"
+                    )
+                    while active_best_effort < int(problem.best_effort_max_inflight):
+                        template = requests[best_effort_template_idx % len(requests)]
+                        best_effort_template_idx += 1
+                        best_effort_request = _make_best_effort_request(
+                            template,
+                            seed=best_effort_counter,
+                        )
+                        task_start_time = time.time()
+                        request_id_backend = str(uuid.uuid1())
+                        request_id = f"best-effort-{best_effort_counter}"
+                        best_effort_counter += 1
+                        bid_to_id[request_id_backend] = request_id
+                        task = asyncio.create_task(run_request(
+                            shared_client,
+                            request_id_backend,
+                            problem.model_name,
+                            best_effort_request.prompt or [],
+                            best_effort_request.input_length,
+                            best_effort_request.output_length,
+                            zero_load_ttft=perf_model.get_zero_load_ttft(
+                                best_effort_request.input_length,
+                                0,
+                            ),
+                            cached_tokens=0,
+                            session_id=None,
+                            ttft_slo=compute_ttft_slo(
+                                best_effort_request.input_length,
+                                0,
+                                slo_ttft_per_token=problem.slo_ttft_per_token,
+                                slo_ttft_constant=problem.slo_ttft_constant,
+                                slo_routing_overhead=problem.slo_routing_overhead,
+                            ),
+                            slo_tpot=problem.slo_tpot,
+                            expected_profit=0.0,
+                            real_arrival_times=real_arrival_times,
+                            endpoint=(
+                                endpoint
+                                if problem.frontend_dedicated_client_per_request
+                                else None
+                            ),
+                            frontend_httpx_limits=frontend_httpx_limits,
+                            must_admit=True,
+                            service_tier="best_effort",
+                            initial_service_tier="best_effort",
+                        ))
+                        tasks.append(
+                            BenchmarkTask(
+                                task=task,
+                                request=best_effort_request,
+                                task_start_time=task_start_time,
+                                request_id=request_id,
+                                tier="best_effort",
+                            )
+                        )
+                        active_best_effort += 1
                     
                 real_time = time.time()
                 elapsed_time = real_time - global_start_time + time_offset
@@ -3066,18 +3519,31 @@ async def main(
                 new_tasks = []
                 current_time = time.time()
 
-                for task, request, task_start_time, request_id in tasks:
+                for task_entry in tasks:
+                    task = task_entry.task
+                    request = task_entry.request
+                    task_start_time = task_entry.task_start_time
+                    request_id = task_entry.request_id
+                    is_best_effort_task = task_entry.tier == "best_effort"
                     if task.done():
                         completion_elapsed_time = current_time - global_start_time + time_offset
                         timed_out_before = request_id in timed_out_requests
-                        finished_bar.update(1)
-                        finished_bar.set_description(f'Finished: {finished_bar.n}, Rejected: {n_rejected}, Timed Out: {n_timed_out}')
+                        if not is_best_effort_task:
+                            finished_bar.update(1)
+                            finished_bar.set_description(f'Finished: {finished_bar.n}, Rejected: {n_rejected}, Timed Out: {n_timed_out}')
 
                         # ---- explicit status checks ----
                         if task.cancelled():
                             logger.info(f"Request {request_id} cancelled before completion")
-                            execution_results.append(ExecutionResult(request, [task_start_time], request_id))
-                            if problem.enable_session_replay and request.session_id:
+                            if not is_best_effort_task:
+                                execution_results.append(
+                                    ExecutionResult(request, [task_start_time], request_id)
+                                )
+                            if (
+                                (not is_best_effort_task)
+                                and problem.enable_session_replay
+                                and request.session_id
+                            ):
                                 session_ready_at[request.session_id] = completion_elapsed_time + problem.session_pause_s
                             timed_out_requests.discard(request_id)
                             continue
@@ -3088,7 +3554,11 @@ async def main(
                             logger.error(f"Task for request {request_id} failed: {exc!r}")
                             import traceback
                             logger.error("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
-                            if problem.enable_session_replay and request.session_id:
+                            if (
+                                (not is_best_effort_task)
+                                and problem.enable_session_replay
+                                and request.session_id
+                            ):
                                 session_ready_at[request.session_id] = completion_elapsed_time + problem.session_pause_s
                             timed_out_requests.discard(request_id)
                             raise BenchmarkOverloadedError(
@@ -3102,24 +3572,29 @@ async def main(
                             normalized_rejection_reason = (
                                 rejection_reason if is_rejected else None
                             )
-                            if is_rejected:
+                            if is_rejected and not is_best_effort_task:
                                 n_rejected += 1
                                 reason_key = normalized_rejection_reason or "unknown"
                                 rejection_reason_counts[reason_key] += 1
                                 rejected_request_reasons[request_id] = reason_key
                             if not len(timestamps):
                                 timestamps = [task_start_time]
-                            execution_results.append(
-                                ExecutionResult(
-                                    request,
-                                    timestamps,
-                                    request_id,
-                                    rejection_reason=normalized_rejection_reason,
+                            if not is_best_effort_task:
+                                execution_results.append(
+                                    ExecutionResult(
+                                        request,
+                                        timestamps,
+                                        request_id,
+                                        rejection_reason=normalized_rejection_reason,
+                                    )
                                 )
-                            )
                             if timed_out_before:
                                 logger.info(f"Request {request_id} returned after timeout")
-                            if problem.enable_session_replay and request.session_id:
+                            if (
+                                (not is_best_effort_task)
+                                and problem.enable_session_replay
+                                and request.session_id
+                            ):
                                 session_ready_at[request.session_id] = completion_elapsed_time + problem.session_pause_s
                         finally:
                             timed_out_requests.discard(request_id)
@@ -3132,33 +3607,45 @@ async def main(
                                 request_id,
                                 current_time - task_start_time,
                             )
-                            finished_bar.update(1)
-                            finished_bar.set_description(f'Finished: {finished_bar.n}, Rejected: {n_rejected}, Timed Out: {n_timed_out}')
-                            execution_results.append(ExecutionResult(request, [task_start_time], request_id))
-                            if problem.enable_session_replay and request.session_id:
+                            if not is_best_effort_task:
+                                finished_bar.update(1)
+                                finished_bar.set_description(f'Finished: {finished_bar.n}, Rejected: {n_rejected}, Timed Out: {n_timed_out}')
+                                execution_results.append(
+                                    ExecutionResult(request, [task_start_time], request_id)
+                                )
+                            if (
+                                (not is_best_effort_task)
+                                and problem.enable_session_replay
+                                and request.session_id
+                            ):
                                 session_ready_at[request.session_id] = completion_elapsed_time + problem.session_pause_s
                             timed_out_requests.discard(request_id)
                             continue
-                        new_tasks.append((task, request, task_start_time, request_id))
+                        new_tasks.append(task_entry)
 
                     elif current_time - task_start_time > timeout:
-                        n_timed_out += 1
+                        if not is_best_effort_task:
+                            n_timed_out += 1
                         task.cancel()
                         timed_out_requests.add(request_id)
-                        if problem.enable_session_replay and request.session_id:
+                        if (
+                            (not is_best_effort_task)
+                            and problem.enable_session_replay
+                            and request.session_id
+                        ):
                             session_ready_at[request.session_id] = elapsed_time + problem.session_pause_s
-                        new_tasks.append((task, request, task_start_time, request_id))
+                        new_tasks.append(task_entry)
 
                     else:
-                        new_tasks.append((task, request, task_start_time, request_id))
+                        new_tasks.append(task_entry)
                 tasks = new_tasks
 
                 if tasks and current_time - last_health_check_time >= FRONTEND_HEALTH_CHECK_INTERVAL_S:
                     last_health_check_time = current_time
                     healthy, health_detail = await _get_server_health(endpoint)
                     if not healthy:
-                        for task, *_ in tasks:
-                            task.cancel()
+                        for task_entry in tasks:
+                            task_entry.task.cancel()
                         raise BenchmarkOverloadedError(
                             "Server became unhealthy during benchmark; aborting this run. "
                             f"endpoint={endpoint} detail={health_detail}"
@@ -3166,9 +3653,9 @@ async def main(
 
                 await asyncio.sleep(window_size)
     finally:
-        for task, *_ in tasks:
-            if not task.done():
-                task.cancel()
+        for task_entry in tasks:
+            if not task_entry.task.done():
+                task_entry.task.cancel()
         arrival_bar.close()
         finished_bar.close()
     
@@ -3341,6 +3828,8 @@ async def main(
                                     n_device = problem.n_devices,
                                     group_size = problem.routing_kwargs.get('group_size'),
                                     draw = True)
+    service_tier_metrics = _summarize_service_tier_metrics(reqs, events)
+    results = _apply_service_tier_reporting(results, service_tier_metrics)
     ttft_laxity_percentiles = results.get('ttft_laxity_percentiles', {})
     ttft_parts = [
         f"{key}={ttft_laxity_percentiles[key]:.6f}"
@@ -3393,6 +3882,7 @@ async def main(
             empirical_scheduling_overhead_summary
         )
     extra_metrics = results.setdefault('extra_metrics', {})
+    extra_metrics.update(service_tier_metrics)
     extra_metrics.update(_summarize_per_server_energy_metrics(
         events,
         problem.n_devices,
@@ -3727,6 +4217,11 @@ def build_problems(
     perf_model_piecewise_breakpoints: list[int] | None = None,
     baseline_decode_cap: int | None = None,
     admission_output_length_mode: str = "max",
+    frontend_httpx_max_connections: int | None = None,
+    frontend_httpx_max_keepalive_connections: int | None = None,
+    frontend_dedicated_client_per_request: bool = False,
+    enable_best_effort_tier: bool = False,
+    best_effort_max_inflight: int = 0,
 ):
     admission_output_length_mode = _normalize_admission_output_length_mode(
         admission_output_length_mode
@@ -3748,12 +4243,27 @@ def build_problems(
         enable_piecewise_perf_model_regression,
         perf_model_piecewise_breakpoints,
     )
+    frontend_httpx_suffix = _frontend_httpx_suffix(
+        dedicated_client_per_request=frontend_dedicated_client_per_request,
+        max_connections=frontend_httpx_max_connections,
+        max_keepalive_connections=frontend_httpx_max_keepalive_connections,
+    )
+    resolved_best_effort_max_inflight = (
+        int(best_effort_max_inflight)
+        if int(best_effort_max_inflight) > 0
+        else (int(n_device) if enable_best_effort_tier else 0)
+    )
+    best_effort_suffix = (
+        f"_be{resolved_best_effort_max_inflight}"
+        if enable_best_effort_tier and resolved_best_effort_max_inflight > 0
+        else ""
+    )
     store_prefix = (
         f'{experiment_dir}/{display_scheduling_policy}_{display_routing_policy}_{load_scale}_'
         f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
         f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
         f'{session_replay_suffix}{baseline_cap_suffix}'
-        f'{perf_model_regression_suffix}')
+        f'{perf_model_regression_suffix}{frontend_httpx_suffix}{best_effort_suffix}')
     requests_trace = trace
     arrival_times_trace = trace
     perf_model_task = _perf_model_task_for_trace_spec(trace)
@@ -4237,6 +4747,15 @@ def build_problems(
             None if perf_model_piecewise_breakpoints is None
             else [int(point) for point in perf_model_piecewise_breakpoints]
         ),
+        frontend_httpx_max_connections = frontend_httpx_max_connections,
+        frontend_httpx_max_keepalive_connections = (
+            frontend_httpx_max_keepalive_connections
+        ),
+        frontend_dedicated_client_per_request = (
+            frontend_dedicated_client_per_request
+        ),
+        enable_best_effort_tier = enable_best_effort_tier,
+        best_effort_max_inflight = resolved_best_effort_max_inflight,
     ) for (scheduling_kwargs, routing_kwargs) in product(
         scheduling_kwargss, routing_kwargss)]
 
@@ -4278,6 +4797,11 @@ def run(
     perf_model_piecewise_breakpoints: list[int] | None,
     baseline_decode_cap: int | None,
     admission_output_length_mode: str,
+    frontend_httpx_max_connections: int | None,
+    frontend_httpx_max_keepalive_connections: int | None,
+    frontend_dedicated_client_per_request: bool,
+    enable_best_effort_tier: bool = False,
+    best_effort_max_inflight: int = 0,
     disable_independent_slo_grid_report: bool = False,
     concise_logging: bool = False,
     update_clients: bool = True,
@@ -4360,6 +4884,17 @@ def run(
         'disable_independent_slo_grid_report: '
         f'{disable_independent_slo_grid_report}'
     )
+    print(
+        'frontend_httpx: '
+        f'max_connections={frontend_httpx_max_connections}, '
+        f'max_keepalive_connections={frontend_httpx_max_keepalive_connections}, '
+        f'dedicated_client_per_request={frontend_dedicated_client_per_request}'
+    )
+    print(
+        'best_effort_tier: '
+        f'enabled={enable_best_effort_tier}, '
+        f'max_inflight={best_effort_max_inflight}'
+    )
     print('--End of Problem Grid--')
     results = {}
     if os.path.exists(f'{experiment_dir}/results.jsonl'):
@@ -4391,6 +4926,11 @@ def run(
                     tuple(r.get('perf_model_piecewise_breakpoints') or ()),
                     r.get('enable_session_replay', False),
                     r.get('session_pause_s', 0.0),
+                    r.get('frontend_httpx_max_connections'),
+                    r.get('frontend_httpx_max_keepalive_connections'),
+                    r.get('frontend_dedicated_client_per_request', False),
+                    r.get('enable_best_effort_tier', False),
+                    r.get('best_effort_max_inflight', 0),
                 ): r for r in results
             }
     else:
@@ -4420,6 +4960,11 @@ def run(
             None,
             clients,
         )
+        resolved_best_effort_max_inflight = (
+            int(best_effort_max_inflight)
+            if int(best_effort_max_inflight) > 0
+            else (int(n_device) if enable_best_effort_tier else 0)
+        )
         cache_key = (
             load_scale,
             n_device,
@@ -4436,6 +4981,11 @@ def run(
             tuple(perf_model_piecewise_breakpoints or ()),
             enable_session_replay,
             session_pause_s,
+            frontend_httpx_max_connections,
+            frontend_httpx_max_keepalive_connections,
+            frontend_dedicated_client_per_request,
+            enable_best_effort_tier,
+            resolved_best_effort_max_inflight,
         )
         if not overwrite and cache_key in results:
             print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot}, {perf_model_err} because it already exists')
@@ -4473,6 +5023,15 @@ def run(
                         perf_model_piecewise_breakpoints=perf_model_piecewise_breakpoints,
                         baseline_decode_cap=baseline_decode_cap,
                         admission_output_length_mode=admission_output_length_mode,
+                        frontend_httpx_max_connections=frontend_httpx_max_connections,
+                        frontend_httpx_max_keepalive_connections=(
+                            frontend_httpx_max_keepalive_connections
+                        ),
+                        frontend_dedicated_client_per_request=(
+                            frontend_dedicated_client_per_request
+                        ),
+                        enable_best_effort_tier=enable_best_effort_tier,
+                        best_effort_max_inflight=best_effort_max_inflight,
                     )
                 summary_problem = summary_problems[0] if summary_problems else None
                 _print_concise_result_row(
@@ -4542,6 +5101,15 @@ def run(
             perf_model_piecewise_breakpoints=perf_model_piecewise_breakpoints,
             baseline_decode_cap=baseline_decode_cap,
             admission_output_length_mode=admission_output_length_mode,
+            frontend_httpx_max_connections=frontend_httpx_max_connections,
+            frontend_httpx_max_keepalive_connections=(
+                frontend_httpx_max_keepalive_connections
+            ),
+            frontend_dedicated_client_per_request=(
+                frontend_dedicated_client_per_request
+            ),
+            enable_best_effort_tier=enable_best_effort_tier,
+            best_effort_max_inflight=best_effort_max_inflight,
         )
         if not len(problems):
             logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
@@ -4615,6 +5183,15 @@ def run(
             'admission_output_length': problems[0].admission_output_length,
             'enable_session_replay': enable_session_replay,
             'session_pause_s': session_pause_s,
+            'frontend_httpx_max_connections': frontend_httpx_max_connections,
+            'frontend_httpx_max_keepalive_connections': (
+                frontend_httpx_max_keepalive_connections
+            ),
+            'frontend_dedicated_client_per_request': (
+                frontend_dedicated_client_per_request
+            ),
+            'enable_best_effort_tier': problems[0].enable_best_effort_tier,
+            'best_effort_max_inflight': int(problems[0].best_effort_max_inflight),
             
             'event_file': f'{problems[0].store_prefix}.events.jsonl',
             'energy_consumption': best_result.energy_consumption,
@@ -4929,8 +5506,11 @@ if __name__ == '__main__':
     parser.add_argument(
         '--sweep_ttft_overhead',
         type=float,
-        default=0.0,
-        help='offline req sweep only: constant seconds added to each TTFT budget',
+        default=None,
+        help=(
+            'offline req sweep only: constant seconds added to each TTFT '
+            'budget; defaults to --slo_routing_overhead'
+        ),
     )
     parser.add_argument(
         '--sweep_routing_overhead',
@@ -5042,7 +5622,54 @@ if __name__ == '__main__':
         default=False,
         help='suppress verbose stdout and emit one concise JSON summary per result row',
     )
+    parser.add_argument(
+        '--frontend_httpx_max_connections',
+        type=int,
+        default=None,
+        help=(
+            'override benchmark frontend httpx max_connections for the shared '
+            'AsyncClient; leave unset to use httpx defaults'
+        ),
+    )
+    parser.add_argument(
+        '--frontend_httpx_max_keepalive_connections',
+        type=int,
+        default=None,
+        help=(
+            'override benchmark frontend httpx max_keepalive_connections for '
+            'the shared AsyncClient; leave unset to use httpx defaults'
+        ),
+    )
+    parser.add_argument(
+        '--frontend_dedicated_client_per_request',
+        action='store_true',
+        default=False,
+        help=(
+            'create a fresh AsyncClient per benchmark request to bypass the '
+            'shared-client connection pool for debugging'
+        ),
+    )
+    parser.add_argument(
+        '--enable_best_effort_tier',
+        action='store_true',
+        default=False,
+        help=(
+            'inject a synthetic best-effort background tier with infinite demand; '
+            'normal-tier SLO metrics remain reported separately'
+        ),
+    )
+    parser.add_argument(
+        '--best_effort_max_inflight',
+        type=int,
+        default=0,
+        help=(
+            'maximum number of synthetic best-effort requests kept in flight; '
+            'leave at 0 to default to n_device when the tier is enabled'
+        ),
+    )
     args = parser.parse_args()
+    if args.sweep_ttft_overhead is None:
+        args.sweep_ttft_overhead = float(args.slo_routing_overhead)
 
     if args.reqs_file is not None:
         summary = sweep_saved_reqs_slo_grid(
@@ -5103,6 +5730,17 @@ if __name__ == '__main__':
                 admission_output_length_mode = (
                     args.admission_output_length_mode
                 ),
+                frontend_httpx_max_connections = (
+                    args.frontend_httpx_max_connections
+                ),
+                frontend_httpx_max_keepalive_connections = (
+                    args.frontend_httpx_max_keepalive_connections
+                ),
+                frontend_dedicated_client_per_request = (
+                    args.frontend_dedicated_client_per_request
+                ),
+                enable_best_effort_tier = args.enable_best_effort_tier,
+                best_effort_max_inflight = args.best_effort_max_inflight,
                 disable_independent_slo_grid_report = (
                     args.disable_independent_slo_grid_report
                 ),
@@ -5185,6 +5823,17 @@ if __name__ == '__main__':
                 'admission_output_length_mode': (
                     args.admission_output_length_mode
                 ),
+                'frontend_httpx_max_connections': (
+                    args.frontend_httpx_max_connections
+                ),
+                'frontend_httpx_max_keepalive_connections': (
+                    args.frontend_httpx_max_keepalive_connections
+                ),
+                'frontend_dedicated_client_per_request': (
+                    args.frontend_dedicated_client_per_request
+                ),
+                'enable_best_effort_tier': args.enable_best_effort_tier,
+                'best_effort_max_inflight': args.best_effort_max_inflight,
                 'disable_independent_slo_grid_report': (
                     args.disable_independent_slo_grid_report
                 ),

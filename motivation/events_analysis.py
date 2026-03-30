@@ -198,6 +198,8 @@ class RouterArrival(Event):
     max_tokens: int
     num_cached_tokens: int = 0
     zero_load_ttft: float = 0
+    service_tier: str = "default"
+    initial_service_tier: str = "default"
     
 @dataclass(kw_only=True)
 class Dispatch(Event):
@@ -243,6 +245,8 @@ class RequestInstance:
     slo_violation: str | None = None
     kv_xfer_delay: float = 0
     zero_load_ttft: float = 0
+    service_tier: str = "default"
+    initial_service_tier: str = "default"
 
 
     @property
@@ -656,6 +660,12 @@ def analyze_events(filepath, start_time = None, verbose = False):
             if event.event_type == 'arrival-router' and req.arrival_time < 0:
                 req.zero_load_ttft = event.zero_load_ttft
                 req.arrival_time = event.timestamp
+                req.service_tier = getattr(event, 'service_tier', 'default')
+                req.initial_service_tier = getattr(
+                    event,
+                    'initial_service_tier',
+                    req.service_tier,
+                )
             if event.event_type == 'arrival':
                 req.zero_load_ttft = event.zero_load_ttft
                 req.engine_arrival_time = event.timestamp
