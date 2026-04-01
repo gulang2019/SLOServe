@@ -5779,7 +5779,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--fast_sched_baseline_bsz',
         type=int,
-        default=None,
+        default=0,
         help=(
             'override the synthetic baseline batch size used by the ATFC fast '
             'scheduler floor; leave unset to use the server default'
