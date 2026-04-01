@@ -4653,8 +4653,8 @@ def build_problems(
                 'is_pd_disagg': True, 
                 'n_prefill_per_group': opt_n_prefill_devices,
             }
-        routing_kwargss = [{"enable_rerouting": True,
-                            "enable_rescheduling": False} | extra_kwargs]
+        routing_kwargss = [{"enable_rerouting": False,
+                            "enable_rescheduling": True} | extra_kwargs]
     elif 'llumnix_load' in routing_policy:
         _args = routing_policy.split('-')
         routing_policy = 'llumnix_load'
