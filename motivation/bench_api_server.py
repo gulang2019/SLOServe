@@ -78,6 +78,132 @@ def _maybe_suppress_stdout(suppress: bool):
         yield
 
 
+def _drop_empty_logging_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        cleaned: Dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = _drop_empty_logging_fields(item)
+            if normalized is None:
+                continue
+            if isinstance(normalized, (dict, list)) and not normalized:
+                continue
+            cleaned[key] = normalized
+        return cleaned
+    if isinstance(value, list):
+        cleaned_list = []
+        for item in value:
+            normalized = _drop_empty_logging_fields(item)
+            if normalized is None:
+                continue
+            if isinstance(normalized, (dict, list)) and not normalized:
+                continue
+            cleaned_list.append(normalized)
+        return cleaned_list
+    return value
+
+
+def _summary_stat(summary: Any, key: str) -> Any:
+    if not isinstance(summary, dict):
+        return None
+    return summary.get(key)
+
+
+def _compact_distribution_summary(
+    summary: Any,
+    *,
+    include_count: bool = False,
+    keys: Tuple[str, ...] = ("mean", "p50", "p90", "p99", "max"),
+) -> Dict[str, Any] | None:
+    if not isinstance(summary, dict):
+        return None
+
+    compact: Dict[str, Any] = {}
+    if include_count and summary.get("count") is not None:
+        compact["count"] = summary.get("count")
+    for key in keys:
+        value = summary.get(key)
+        if value is not None:
+            compact[key] = value
+    return compact or None
+
+
+def _compact_top_distribution_values(
+    values: Any,
+    *,
+    limit: int = 5,
+    value_key: str = "tokens",
+) -> List[Dict[str, Any]] | None:
+    if not isinstance(values, list):
+        return None
+
+    compact: List[Dict[str, Any]] = []
+    for entry in values[:limit]:
+        if not isinstance(entry, dict):
+            continue
+        row: Dict[str, Any] = {}
+        value = entry.get(value_key)
+        if value is not None:
+            row[value_key] = value
+        count = entry.get("count")
+        if count is not None:
+            row["count"] = count
+        pct = entry.get("pct")
+        if pct is not None:
+            row["pct"] = pct
+        if row:
+            compact.append(row)
+    return compact or None
+
+
+def _format_batch_token_summary_line(result: Dict[str, Any]) -> str | None:
+    batch_token_summary = result.get("batch_token_summary")
+    if not isinstance(batch_token_summary, dict):
+        return None
+
+    per_batch_request = batch_token_summary.get("per_batch_request", {})
+    if not isinstance(per_batch_request, dict):
+        per_batch_request = {}
+
+    current_tokens_summary = per_batch_request.get("current_tokens", {})
+    if not isinstance(current_tokens_summary, dict):
+        current_tokens_summary = {}
+
+    parts = [
+        f"avg_batch_size={result.get('average_batch_size')}",
+        f"avg_batch_total_past_tokens={result.get('average_batch_total_past_tokens')}",
+        f"avg_batch_total_current_tokens={result.get('average_batch_total_current_tokens')}",
+    ]
+
+    current_summary_parts = [
+        f"{key}={current_tokens_summary.get(key)}"
+        for key in ("mean", "p50", "p90", "p99", "max")
+        if current_tokens_summary.get(key) is not None
+    ]
+    if current_summary_parts:
+        parts.append(
+            "per_batch_request_current_tokens("
+            + ", ".join(current_summary_parts)
+            + ")"
+        )
+
+    top_current_tokens = _compact_top_distribution_values(
+        per_batch_request.get("current_tokens_top_values"),
+        limit=5,
+    )
+    if top_current_tokens:
+        parts.append(
+            "top_current_tokens=["
+            + ", ".join(
+                f"{entry['tokens']}:{entry['pct']:.2f}%"
+                for entry in top_current_tokens
+                if entry.get("tokens") is not None and entry.get("pct") is not None
+            )
+            + "]"
+        )
+
+    return "Batch token summary: " + ", ".join(parts)
+
+
 def _build_concise_result_row(
     result: Dict[str, Any],
     *,
@@ -122,44 +248,98 @@ def _build_concise_result_row(
     )
     if not isinstance(current_upper_bound_constants, dict):
         current_upper_bound_constants = {}
-    return {
-        "average_n_server": average_n_server,
-        "cache_hit_rate": cache_hit_rate,
-        "energy_consumption": result.get("energy_consumption"),
-        "fast_sched_baseline_bsz": result.get("fast_sched_baseline_bsz"),
-        "load_scale": load_scale,
-        "n_device": result.get("n_device", result.get("effective_n_device")),
-        "current_perf_model_upper_bound": {
-            "rate": current_upper_bound_metrics.get("upper_bound_rate"),
-            "constant_s": {
-                "p80": current_upper_bound_constants.get("p80"),
-                "p90": current_upper_bound_constants.get("p90"),
-                "p99": current_upper_bound_constants.get("p99"),
+    batch_token_summary = result.get("batch_token_summary")
+    if not isinstance(batch_token_summary, dict):
+        batch_token_summary = {}
+    per_batch_summary = batch_token_summary.get("per_batch", {})
+    if not isinstance(per_batch_summary, dict):
+        per_batch_summary = {}
+    per_batch_request_summary = batch_token_summary.get("per_batch_request", {})
+    if not isinstance(per_batch_request_summary, dict):
+        per_batch_request_summary = {}
+
+    concise_row = {
+        "trace": trace_used if trace_used is not None else result.get("trace_used"),
+        "workload": {
+            "load_scale": load_scale,
+            "n_device": result.get("n_device", result.get("effective_n_device")),
+            "average_n_server": average_n_server,
+            "fast_sched_baseline_bsz": result.get("fast_sched_baseline_bsz"),
+        },
+        "policy": {
+            "routing": result.get("routing_policy"),
+            "scheduling": result.get("scheduling_policy"),
+            "admission_output_length_mode": result.get(
+                "admission_output_length_mode"
+            ),
+            "admission_output_length": result.get("admission_output_length"),
+        },
+        "slo": {
+            "ttft": {
+                "constant": slo_ttft_constant,
+                "per_token": slo_ttft_per_token,
+                "routing_overhead": slo_routing_overhead,
+            },
+            "tpot": result.get("slo_tpot"),
+        },
+        "outcome": {
+            "slo_violation_rate": result.get("slo_violation_rate"),
+            "normal_slo_attainment_rate": result.get(
+                "normal_slo_attainment_rate"
+            ),
+            "rejection_rate": result.get("rejection_rate"),
+            "cache_hit_rate": cache_hit_rate,
+            "energy_consumption": result.get("energy_consumption"),
+        },
+        "batching": {
+            "average_batch_size": result.get(
+                "average_batch_size",
+                _summary_stat(per_batch_summary.get("batch_size"), "mean"),
+            ),
+            "average_batch_total_past_tokens": result.get(
+                "average_batch_total_past_tokens",
+                _summary_stat(per_batch_summary.get("total_past_tokens"), "mean"),
+            ),
+            "average_batch_total_current_tokens": result.get(
+                "average_batch_total_current_tokens",
+                _summary_stat(
+                    per_batch_summary.get("total_current_tokens"),
+                    "mean",
+                ),
+            ),
+            "per_batch_request_past_tokens": _compact_distribution_summary(
+                per_batch_request_summary.get("past_tokens"),
+                include_count=True,
+            ),
+            "per_batch_request_current_tokens": _compact_distribution_summary(
+                per_batch_request_summary.get("current_tokens"),
+                include_count=True,
+            ),
+            "top_current_token_values": _compact_top_distribution_values(
+                per_batch_request_summary.get("current_tokens_top_values"),
+                limit=5,
+            ),
+        },
+        "best_effort": {
+            "enabled": result.get("enable_best_effort_tier"),
+            "max_inflight": result.get("best_effort_max_inflight"),
+            "scheduled_token_throughput_tps": result.get(
+                "best_effort_scheduled_token_throughput_tps"
+            ),
+            "completed_requests": result.get("best_effort_completed_requests"),
+        },
+        "perf_model": {
+            "current_upper_bound": {
+                "rate": current_upper_bound_metrics.get("upper_bound_rate"),
+                "constant_s": {
+                    "p80": current_upper_bound_constants.get("p80"),
+                    "p90": current_upper_bound_constants.get("p90"),
+                    "p99": current_upper_bound_constants.get("p99"),
+                },
             },
         },
-        "rejection_rate": result.get("rejection_rate"),
-        "routing_policy": result.get("routing_policy"),
-        "scheduling_policy": result.get("scheduling_policy"),
-        "admission_output_length_mode": result.get("admission_output_length_mode"),
-        "admission_output_length": result.get("admission_output_length"),
-        "slo_routing_overhead": slo_routing_overhead,
-        "slo_tpot": result.get("slo_tpot"),
-        "slo_ttft": {
-            "constant": slo_ttft_constant,
-            "per_token": slo_ttft_per_token,
-        },
-        "slo_violation_rate": result.get("slo_violation_rate"),
-        "enable_best_effort_tier": result.get("enable_best_effort_tier"),
-        "best_effort_max_inflight": result.get("best_effort_max_inflight"),
-        "normal_slo_attainment_rate": result.get("normal_slo_attainment_rate"),
-        "best_effort_scheduled_token_throughput_tps": result.get(
-            "best_effort_scheduled_token_throughput_tps"
-        ),
-        "best_effort_completed_requests": result.get(
-            "best_effort_completed_requests"
-        ),
-        "trace_used": trace_used if trace_used is not None else result.get("trace_used"),
     }
+    return _drop_empty_logging_fields(concise_row)
 
 
 def _print_concise_result_row(
@@ -175,7 +355,6 @@ def _print_concise_result_row(
                 trace_used=trace_used,
                 problem=problem,
             ),
-            sort_keys=True,
         )
     )
 
@@ -459,6 +638,95 @@ def _summarize_distribution(values: List[float]) -> Dict[str, Any]:
     for key, percentile in percentiles.items():
         summary[key] = float(np.percentile(data, percentile))
     return summary
+
+
+def _summarize_top_integer_values(
+    values: List[int],
+    *,
+    top_k: int = 8,
+    value_key: str = "tokens",
+) -> List[Dict[str, Any]]:
+    if not values:
+        return []
+
+    counts = Counter(int(value) for value in values)
+    total = sum(counts.values())
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [
+        {
+            value_key: int(value),
+            "count": int(count),
+            "pct": float(100.0 * count / total) if total else 0.0,
+        }
+        for value, count in ranked[:top_k]
+    ]
+
+
+def _summarize_batch_token_metrics(
+    events: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    batch_rows: List[Dict[str, Any]] = []
+    per_batch_request_past_tokens: List[int] = []
+    per_batch_request_current_tokens: List[int] = []
+
+    for event in events:
+        sample = _extract_batch_perf_sample(event)
+        if sample is None:
+            continue
+        row, batch = sample
+        batch_rows.append(row)
+        per_batch_request_past_tokens.extend(
+            int(past_tokens) for past_tokens, _ in batch
+        )
+        per_batch_request_current_tokens.extend(
+            int(current_tokens) for _, current_tokens in batch
+        )
+
+    if not batch_rows:
+        return None
+
+    batch_sizes = [int(row["batch_size"]) for row in batch_rows]
+    batch_total_past_tokens = [int(row["total_past_tokens"]) for row in batch_rows]
+    batch_total_current_tokens = [
+        int(row["total_current_tokens"]) for row in batch_rows
+    ]
+
+    return {
+        "batch_count": len(batch_rows),
+        "batch_request_count": len(per_batch_request_current_tokens),
+        "average_batch_size": float(np.mean(batch_sizes)),
+        "average_batch_total_past_tokens": float(
+            np.mean(batch_total_past_tokens)
+        ),
+        "average_batch_total_current_tokens": float(
+            np.mean(batch_total_current_tokens)
+        ),
+        "average_per_batch_request_past_tokens": float(
+            np.mean(per_batch_request_past_tokens)
+        ) if per_batch_request_past_tokens else None,
+        "average_per_batch_request_current_tokens": float(
+            np.mean(per_batch_request_current_tokens)
+        ) if per_batch_request_current_tokens else None,
+        "per_batch": {
+            "batch_size": _summarize_distribution(batch_sizes),
+            "total_past_tokens": _summarize_distribution(batch_total_past_tokens),
+            "total_current_tokens": _summarize_distribution(
+                batch_total_current_tokens
+            ),
+        },
+        "per_batch_request": {
+            "past_tokens": _summarize_distribution(
+                per_batch_request_past_tokens
+            ),
+            "current_tokens": _summarize_distribution(
+                per_batch_request_current_tokens
+            ),
+            "current_tokens_top_values": _summarize_top_integer_values(
+                per_batch_request_current_tokens,
+                value_key="tokens",
+            ),
+        },
+    }
 
 
 def _write_jsonl(path: str | Path, rows: List[Dict[str, Any]]) -> Path:
@@ -3877,6 +4145,7 @@ async def main(
     empirical_scheduling_overhead_summary = _summarize_batch_scheduling_overhead(
         events
     )
+    batch_token_summary = _summarize_batch_token_metrics(events)
     events, reqs = analyze_events(filename, verbose = True)
     results = analyze_slo_violation(reqs, events, 
                                     model_name = problem.model_name, 
@@ -3975,6 +4244,23 @@ async def main(
         problem.n_devices,
         arrival_duration_s,
     )
+    if batch_token_summary is not None:
+        extra_metrics['batch_token_summary'] = batch_token_summary
+        extra_metrics['average_batch_size'] = batch_token_summary.get(
+            'average_batch_size'
+        )
+        extra_metrics['average_batch_total_past_tokens'] = (
+            batch_token_summary.get('average_batch_total_past_tokens')
+        )
+        extra_metrics['average_batch_total_current_tokens'] = (
+            batch_token_summary.get('average_batch_total_current_tokens')
+        )
+        extra_metrics['average_per_batch_request_past_tokens'] = (
+            batch_token_summary.get('average_per_batch_request_past_tokens')
+        )
+        extra_metrics['average_per_batch_request_current_tokens'] = (
+            batch_token_summary.get('average_per_batch_request_current_tokens')
+        )
     extra_metrics.update(_summarize_rr_disagg_power_metrics(
         n_devices=problem.n_devices,
         routing_policy=problem.routing_policy,
@@ -5454,6 +5740,9 @@ def run(
         if concise_logging:
             _print_concise_result_row(result, trace_used=trace)
         else:
+            batch_token_summary_line = _format_batch_token_summary_line(result)
+            if batch_token_summary_line is not None:
+                print(batch_token_summary_line)
             print('--Result--')
             pprint.pprint(result)
             print('--End of Result--')
