@@ -95,7 +95,6 @@ class BatchPlanner:
     _cpp_adm_ctrl_iterations: int = 0
     _cpp_schedule_iterations: int = 0
     _fast_sched_perf_mode: str = "full"
-    _fast_sched_baseline_bsz: int | None = None
     
     
     def __post_init__(self):
@@ -110,20 +109,6 @@ class BatchPlanner:
             )
             fast_sched_perf_mode = "full"
         self._fast_sched_perf_mode = fast_sched_perf_mode
-        if self._fast_sched_baseline_bsz is None:
-            raw_fast_sched_baseline_bsz = os.getenv(
-                "SLOSERVE_PY_FAST_SCHED_BASELINE_BSZ",
-                "1",
-            ).strip()
-            try:
-                self._fast_sched_baseline_bsz = int(raw_fast_sched_baseline_bsz)
-            except ValueError:
-                logger.warning(
-                    "[BatchPlanner] Unknown SLOSERVE_PY_FAST_SCHED_BASELINE_BSZ=%r; falling back to 1",
-                    raw_fast_sched_baseline_bsz,
-                )
-                self._fast_sched_baseline_bsz = 1
-        self._fast_sched_baseline_bsz = max(1, int(self._fast_sched_baseline_bsz))
         # Initialize C++ admission controller; TPOT is set lazily per request mix.
         self._adm_ctrler = SLOsServe_C.AdmCtrlScheduler("edf_sim", self._block_size, False, False)
         self._adm_ctrler_tpot = None
@@ -481,6 +466,46 @@ class BatchPlanner:
             self._last_infeasible_reason = None
         return must_admit or feasible
 
+    def _cpp_feasible(
+        self,
+        now: float,
+        num_free_blocks_override: int | None = None,
+    ) -> tuple[bool, set[str]]:
+        reqs = [
+            req for req in self._requests.values()
+            if req.service_tier != 'best_effort' 
+        ]
+        if not len(reqs): 
+            return True, set()
+        
+        tpot = min(r.slo_tpot for r in reqs)
+        self._ensure_cpp_planner(tpot)
+        c_reqs = [
+            self._to_cpp_request(r, is_new_req=False, now=now)
+            for r in reqs
+        ]
+        num_free_blocks = (
+            self._num_free_blocks
+            if num_free_blocks_override is None
+            else int(num_free_blocks_override)
+        )
+        if hasattr(self._adm_ctrler, "adm_ctrl_with_reason"):
+            is_feasible, is_accepteds, _reject_reason = self._adm_ctrler.adm_ctrl_with_reason(
+                c_reqs, num_free_blocks, 0.0
+            )
+        else:
+            is_feasible, is_accepteds = self._adm_ctrler.adm_ctrl(
+                c_reqs,
+                num_free_blocks,
+                0.0,
+            )
+        accepted_ids = {
+            req.request_id
+            for req, is_acc in zip(reqs, is_accepteds)
+            if is_acc
+        }
+        return bool(is_feasible), accepted_ids
+
     def get_last_infeasible_reason(self) -> str | None:
         return self._last_infeasible_reason
         
@@ -596,60 +621,56 @@ class BatchPlanner:
             x for x in load_ddls
             if self._requests[x[0]].service_tier != "best_effort"
         ]
-        in_deadline_regular_load_ddls = [
-            x for x in regular_load_ddls
-            if x[1] >= 0.0
-        ]
-        missed_deadline_regular_load_ddls = [
-            x for x in regular_load_ddls
-            if x[1] < 0.0
-        ]
         best_effort_load_ddls = [
             x for x in load_ddls
             if self._requests[x[0]].service_tier == "best_effort"
         ]
-        recovery_cutoff = 0.0
-        recovering_overdue_regular = bool(
-            missed_deadline_regular_load_ddls and not in_deadline_regular_load_ddls
-        )
-        baseline_batch_size = self._cap_batch_size(self._fast_sched_baseline_bsz)
-        baseline_batch_time = (
-            self._fast_sched_get_batch_time([(0, baseline_batch_size)])
-            if baseline_batch_size > 0
-            else 0.0
-        )
         batch_time_budget = 0.0
         batch_size = 0
         batch_size_source = "none"
+        regular_feasible = True
+        accepted_regular_ids: set[str] = set()
+        rejected_regular_count = 0
         selected_deadline_req_id = None
         selected_deadline_cumulative_load = 0
         selected_deadline_total_past_tokens = 0
         selected_deadline_num_reqs = 0
 
-        if in_deadline_regular_load_ddls:
-            selected_deadline_req_id = in_deadline_regular_load_ddls[0][0]
-            selected_deadline_cumulative_load = in_deadline_regular_load_ddls[0][2]
+        if regular_load_ddls:
+            cpp_feasible, accepted_regular_ids = self._cpp_feasible(now)
+            regular_feasible = (
+                cpp_feasible and len(accepted_regular_ids) == len(regular_load_ddls)
+            )
+            rejected_regular_count = len(regular_load_ddls) - len(accepted_regular_ids)
+        if regular_load_ddls and regular_feasible:
+            selected_deadline_req_id = regular_load_ddls[0][0]
+            selected_deadline_cumulative_load = regular_load_ddls[0][2]
             selected_deadline_total_past_tokens = self._requests[
                 selected_deadline_req_id
             ].num_computed_tokens
             selected_deadline_num_reqs = 1
-            batch_time_budget = max(
-                in_deadline_regular_load_ddls[0][1],
-                baseline_batch_time,
-            )
+            batch_time_budget = max(0.0, regular_load_ddls[0][1])
             batch_size = self._cap_batch_size(
                 self._fast_sched_get_bs(batch_time_budget, num_reqs=1)
             )
-            batch_size_source = "baseline_bsz_floor_in_deadline_regular"
-        elif missed_deadline_regular_load_ddls:
+            batch_size_source = "earliest_regular_deadline"
+        elif regular_load_ddls:
             batch_size = self._cap_batch_size(16384)
-            batch_time_budget = self._fast_sched_get_batch_time([(0, batch_size)])
-            batch_size_source = "overdue_regular_recovery"
+            batch_time_budget = (
+                self._fast_sched_get_batch_time([(0, batch_size)])
+                if batch_size > 0
+                else 0.0
+            )
+            batch_size_source = "regular_recovery"
         else:
             # If only downgraded work remains, let it use the leftover engine
             # capacity while still respecting the batch-size limit.
             batch_size = self._cap_batch_size(16384)
-            batch_time_budget = self._fast_sched_get_batch_time([(0, batch_size)])
+            batch_time_budget = (
+                self._fast_sched_get_batch_time([(0, batch_size)])
+                if batch_size > 0
+                else 0.0
+            )
             batch_size_source = "best_effort_only"
 
         if batch_size <= 0:
@@ -662,18 +683,15 @@ class BatchPlanner:
                         'load_ddls': load_ddls,
                         'sch': {},
                         'unsched_tokens': 0,
-                        'in_deadline_regular_count': len(in_deadline_regular_load_ddls),
-                        'missed_deadline_regular_count': len(missed_deadline_regular_load_ddls),
-                        'baseline_bsz': baseline_batch_size,
+                        'accepted_regular_count': len(accepted_regular_ids),
+                        'rejected_regular_count': rejected_regular_count,
                         'batch_size_source': batch_size_source,
-                        'cutoff': baseline_batch_time,
                         'batch_time_budget': batch_time_budget,
                         'selected_deadline_req_id': selected_deadline_req_id,
                         'selected_deadline_cumulative_load': selected_deadline_cumulative_load,
                         'selected_deadline_total_past_tokens': selected_deadline_total_past_tokens,
                         'selected_deadline_num_reqs': selected_deadline_num_reqs,
-                        'recovery_cutoff': recovery_cutoff,
-                        'recovering_overdue_regular': recovering_overdue_regular,
+                        'regular_feasible': regular_feasible,
                         'fast_sched_perf_mode': self._fast_sched_perf_mode,
                         'total_past_tokens': 0,
                         'total_scheduled_tokens': 0,
@@ -686,14 +704,7 @@ class BatchPlanner:
         total_scheduled_tokens = 0
         total_past_tokens = 0
         num_scheduled_reqs = 0
-        # Prioritize regular requests that can still meet their next deadline,
-        # then serve overdue regular traffic, and only then let downgraded
-        # best-effort requests consume any leftover capacity.
-        for req_id, _next_ddl, next_load in (
-            in_deadline_regular_load_ddls
-            + missed_deadline_regular_load_ddls
-            + best_effort_load_ddls
-        ):
+        for req_id, _next_ddl, next_load in (regular_load_ddls + best_effort_load_ddls):
             if b.unscheduled_tokens <= 0:
                 break
             req = self._requests[req_id]
@@ -725,18 +736,15 @@ class BatchPlanner:
                     'load_ddls': load_ddls,
                     'sch': b.n_scheduled_tokens,
                     'unsched_tokens': b.unscheduled_tokens,
-                    'in_deadline_regular_count': len(in_deadline_regular_load_ddls),
-                    'missed_deadline_regular_count': len(missed_deadline_regular_load_ddls),
-                    'baseline_bsz': baseline_batch_size,
+                    'accepted_regular_count': len(accepted_regular_ids),
+                    'rejected_regular_count': rejected_regular_count,
                     'batch_size_source': batch_size_source,
-                    'cutoff': baseline_batch_time,
                     'batch_time_budget': batch_time_budget,
                     'selected_deadline_req_id': selected_deadline_req_id,
                     'selected_deadline_cumulative_load': selected_deadline_cumulative_load,
                     'selected_deadline_total_past_tokens': selected_deadline_total_past_tokens,
                     'selected_deadline_num_reqs': selected_deadline_num_reqs,
-                    'recovery_cutoff': recovery_cutoff,
-                    'recovering_overdue_regular': recovering_overdue_regular,
+                    'regular_feasible': regular_feasible,
                     'fast_sched_perf_mode': self._fast_sched_perf_mode,
                     'total_past_tokens': total_past_tokens,
                     'total_scheduled_tokens': total_scheduled_tokens,
@@ -744,7 +752,7 @@ class BatchPlanner:
                 }
             })
         return True, [b], None
-            
+
 
     def _refresh_c(self) -> tuple[bool, list[Batch], str | None]:
         if not self._requests:

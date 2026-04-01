@@ -419,6 +419,7 @@ class EngineWorker:
                  mock_connector: bool,
                  output_queue: RayQueue,
                  mock_engine: bool = False,
+                 mock_engine_device_mem_bytes: int = 20_000_000_000,
                  device_id: int = -1,
                  tensor_parallel_size: int = 1,
                  worker_env: dict[str, str] | None = None,
@@ -471,6 +472,7 @@ class EngineWorker:
                 mock_connector,
                 device_id=device_id,
                 tensor_parallel_size=tensor_parallel_size,
+                device_mem=mock_engine_device_mem_bytes,
                 execplan_bus=execplan_bus,
             )
         self.device_id = device_id
@@ -4055,6 +4057,15 @@ def parse_args():
     )
     parser.add_argument("--stat_window", type=float, default=0.5, help="stat window for collecting load statistics from backend engine (used for load prediction)")
     parser.add_argument("--mock_engine", action="store_true", default=False, help="use mock engine to simulate the model inference")
+    parser.add_argument(
+        "--mock_engine_device_mem_bytes",
+        type=int,
+        default=20_000_000_000,
+        help=(
+            "mock-engine-only device memory budget in bytes; used to size the "
+            "mock KV cache"
+        ),
+    )
     parser.add_argument("--log_level", type=str, default=os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"), help="logging level (e.g., DEBUG, INFO, WARNING)")
     return parser.parse_args()
 
@@ -4093,6 +4104,7 @@ def start_engine(clients: list):
                 args.model_name,
                 args.mock_connector,
                 mock_engine=True,
+                mock_engine_device_mem_bytes=args.mock_engine_device_mem_bytes,
                 device_id=device_id,
                 tensor_parallel_size=args.tensor_parallel_size,
                 worker_env=worker_env,

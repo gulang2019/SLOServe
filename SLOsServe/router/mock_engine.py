@@ -5,6 +5,7 @@ import hashlib
 import time
 import random
 import json
+import gc
 import logging
 from typing import AsyncGenerator, Any
 import os 
@@ -213,7 +214,7 @@ class MockEngineCore:
                  model_name: str,
                  mock_connector: bool,
                  output_queue: RayQueue,
-                 device_mem: int = 20e9,
+                 device_mem: int = 20_000_000_000,
                  device_id: int = -1,
                  execplan_bus=None):
         self.model_name = model_name
@@ -399,17 +400,32 @@ class MockEngineCore:
                 scheduler_output = self.scheduler.schedule()
                 scheduling_overhead = time.time() - scheduling_start
                 publish_start = time.time()
+                publish_exec_plan_overhead = 0.0
+                publish_load_stats_overhead = 0.0
+                publish_remote_overhead = 0.0
+                publish_gc_counts_before = gc.get_count()
+                publish_gc_counts_after_snapshot = publish_gc_counts_before
+                publish_gc_counts_after_remote = publish_gc_counts_before
                 if self.execplan_bus is not None:
+                    exec_plan_start = time.time()
                     exec_plan = _get_scheduler_exec_plan_snapshot(self.scheduler)
+                    publish_exec_plan_overhead = time.time() - exec_plan_start
                     if exec_plan is not None:
                         exec_plan.batch_id = self.batch_id
+                    load_stats_start = time.time()
+                    load_stats = _get_scheduler_load_stats_snapshot(
+                        self.scheduler)
+                    publish_load_stats_overhead = time.time() - load_stats_start
+                    publish_gc_counts_after_snapshot = gc.get_count()
+                    publish_remote_start = time.time()
                     self.execplan_bus.publish.remote(
                         self.device_id,
                         time.time(),
                         exec_plan,
-                        load_stats=_get_scheduler_load_stats_snapshot(
-                            self.scheduler),
+                        load_stats=load_stats,
                     )
+                    publish_remote_overhead = time.time() - publish_remote_start
+                    publish_gc_counts_after_remote = gc.get_count()
                 publish_overhead = time.time() - publish_start
                 # print(f'[MockEngineCore] batch_id={self.batch_id}, number_scheduled_tokens: {scheduler_output.num_scheduled_tokens}')
                 rejs = []
@@ -541,7 +557,13 @@ class MockEngineCore:
                             'to_schedule': scheduling_start - start_time, 
                             'to_launch': launch_start - start_time, 
                             'to_finish': output_processing_start - start_time,
-                            'to_est_finish': launch_start + batch_time - start_time
+                            'to_est_finish': launch_start + batch_time - start_time,
+                            'publish_exec_plan_overhead': publish_exec_plan_overhead,
+                            'publish_load_stats_overhead': publish_load_stats_overhead,
+                            'publish_remote_overhead': publish_remote_overhead,
+                            'publish_gc_counts_before': list(publish_gc_counts_before),
+                            'publish_gc_counts_after_snapshot': list(publish_gc_counts_after_snapshot),
+                            'publish_gc_counts_after_remote': list(publish_gc_counts_after_remote),
                         }
                     })
         except Exception as e:
@@ -624,7 +646,7 @@ class MockEngineCore:
                 "event_type": "finish",
                 "request_id": request.request_id,
                 "timestamp": time.time(),
-                "finish_reason": "rejected-arrival",
+                "finish_reason": f"rejected-arrival-{request.stop_reason}",
                 "scheduling_overhead": scheduler_overhead,
             })
             return False
@@ -643,10 +665,15 @@ class MockEngine:
                  mock_connector: bool,
                  device_id: int = -1,
                  tensor_parallel_size: int = 1,
-                 device_mem: int = 20e9,
+                 device_mem: int = 20_000_000_000,
                  execplan_bus=None):
         self._shared_out_q = RayQueue(maxsize = 8192)
         self._local_queues: dict[str, asyncio.Queue] = {}
+        self.model_name = model_name
+        self.mock_connector = mock_connector
+        self.device_mem = int(device_mem)
+        self.execplan_bus = execplan_bus
+        self.engine_core = None
         self.tensor_parallel_size = tensor_parallel_size
         '''
         def __init__(self,
@@ -657,22 +684,34 @@ class MockEngine:
                  device_id: int = -1,
                  execplan_bus=None):
         '''
-        self.engine_core = MockEngineCore.remote(
-            model_name = model_name,
-            mock_connector=mock_connector,
-            output_queue = self._shared_out_q,
-            device_mem = device_mem,
-            device_id = device_id,
-            execplan_bus = execplan_bus,
-        )
         self.device_id = device_id
-        ray.get(self.engine_core.ping.remote())
-        logger.info(f'MockEngineCore created: {self.engine_core}')
-        ray.get(self.engine_core.start_loop.remote())
+        self._create_engine_core()
         self._demux_task = asyncio.create_task(self._demux_loop())
         self._demux_task.add_done_callback(_task_done)
         self._profile_events = []
         logger.info(f'MockEngine started: {self.engine_core}')
+
+    def _create_engine_core(self) -> None:
+        self.engine_core = MockEngineCore.remote(
+            model_name=self.model_name,
+            mock_connector=self.mock_connector,
+            output_queue=self._shared_out_q,
+            device_mem=self.device_mem,
+            device_id=self.device_id,
+            execplan_bus=self.execplan_bus,
+        )
+        ray.get(self.engine_core.ping.remote())
+        logger.info(
+            "MockEngineCore created: %s (device_mem=%s bytes)",
+            self.engine_core,
+            self.device_mem,
+        )
+        ray.get(self.engine_core.start_loop.remote())
+
+    async def _recreate_engine_core(self) -> None:
+        if self.engine_core is not None:
+            await self.engine_core.shutdown.remote()
+        self._create_engine_core()
     
     async def _demux_loop(self):
         while True:
@@ -816,6 +855,28 @@ class MockEngine:
 
     async def update_config(self, request_json: dict):
         self._profile_events.clear()
+        requested_device_mem = request_json.get("mock_engine_device_mem_bytes")
+        if requested_device_mem is not None:
+            requested_device_mem = int(requested_device_mem)
+            if requested_device_mem <= 0:
+                raise ValueError(
+                    "mock_engine_device_mem_bytes must be positive, "
+                    f"got {requested_device_mem}"
+                )
+            if requested_device_mem != self.device_mem:
+                if self._local_queues:
+                    logger.warning(
+                        "Reconfiguring mock engine memory with %s active local "
+                        "queues; outstanding streams may observe a reset.",
+                        len(self._local_queues),
+                    )
+                logger.info(
+                    "Reconfiguring mock engine device memory: %s -> %s bytes",
+                    self.device_mem,
+                    requested_device_mem,
+                )
+                self.device_mem = requested_device_mem
+                await self._recreate_engine_core()
         await self.engine_core.update_config.remote(request_json)
 
     async def dump_profile_events(self, path: str):

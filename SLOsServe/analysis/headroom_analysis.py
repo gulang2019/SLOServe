@@ -91,6 +91,7 @@ class Instance:
                  event_queue: EventQueue,
                  slo_ttft_scale: float, 
                  slo_tpot: float, 
+                 slo_ttft_constant: float = 0.0,
                  model_name = 'Qwen/Qwen2.5-7B-Instruct',
                  block_size = 16,
                  kv_cache_mem = 20e9,
@@ -101,6 +102,7 @@ class Instance:
         self.event_queue = event_queue
         self.perf_model = PerfModel.get_perf_model(model_name)
         self.slo_ttft_scale = slo_ttft_scale
+        self.slo_ttft_constant = slo_ttft_constant
         self.slo_tpot = slo_tpot
         self.mem_manager = MemManager(
             block_size = block_size,
@@ -168,10 +170,10 @@ class Instance:
         suc = self.batch_planner.add_request(request_id = req.req_id,
                                             num_prompt_tokens = req.req.input_length,
                                             num_computed_tokens = req.req.input_length if req.mode == 'decode_only' else 0,
-                                            prefill_ddl = now + zero_load_time * self.slo_ttft_scale,
+                                            prefill_ddl = now + zero_load_time * self.slo_ttft_scale + self.slo_ttft_constant,
                                             slo_tpot = self.slo_tpot,
                                             prefill_only = req.mode == 'prefill_only',
-                                            output_length=req.req.output_length)
+                                            output_length=req.req.output_length if self.batch_planner._is_oracle else None)
         if suc:
             self.active_requests[req.req_id] = req
             if len(self.active_requests) == 1:
@@ -242,6 +244,7 @@ def calc_avg_num_servers(
     slo_ttft_scale: float,
     slo_tpot: float,
     n_server: int,
+    slo_ttft_constant: float = 0.0,
     is_oracle: bool = False,
     n_req: int = -1,
     arrival_window_start: float | None = None,
@@ -273,6 +276,7 @@ def calc_avg_num_servers(
                           device_id = device_id,
                           event_queue = event_queue,
                           slo_ttft_scale=slo_ttft_scale,
+                          slo_ttft_constant=slo_ttft_constant,
                           slo_tpot = slo_tpot,
                           is_oracle = is_oracle,
                           enforce_batch_memory_budget = enforce_batch_memory_budget,
@@ -508,6 +512,7 @@ def _compute_dataset_windows(
     slo_ttft_scale: float,
     slo_tpot: float,
     n_server: int,
+    slo_ttft_constant: float = 0.0,
     is_oracle: bool = False,
     is_pd_disagg: bool = False,
     enforce_batch_memory_budget: bool = False,
@@ -549,6 +554,7 @@ def _compute_dataset_windows(
                     slo_ttft_scale,
                     slo_tpot,
                     n_server,
+                    slo_ttft_constant,
                     is_oracle,
                     is_pd_disagg,
                     enforce_batch_memory_budget,
@@ -595,6 +601,7 @@ def _compute_window_from_lists(
     slo_ttft_scale: float,
     slo_tpot: float,
     n_server: int,
+    slo_ttft_constant: float,
     is_oracle: bool,
     is_pd_disagg: bool,
     enforce_batch_memory_budget: bool,
@@ -618,6 +625,7 @@ def _compute_window_from_lists(
         length_pattern = length_pattern,
         model_name = model_name,
         slo_ttft_scale = slo_ttft_scale,
+        slo_ttft_constant = slo_ttft_constant,
         slo_tpot = slo_tpot,
         n_server = n_server,
         is_oracle = is_oracle,
@@ -672,6 +680,7 @@ def _compute_window(
     slo_ttft_scale: float,
     slo_tpot: float,
     n_server: int,
+    slo_ttft_constant: float = 0.0,
     is_oracle: bool = False,
     is_pd_disagg: bool = False,
     enforce_batch_memory_budget: bool = False,
@@ -700,6 +709,7 @@ def _compute_window(
         length_pattern = length_pattern,
         model_name = model_name,
         slo_ttft_scale = slo_ttft_scale,
+        slo_ttft_constant = slo_ttft_constant,
         slo_tpot = slo_tpot,
         n_server = n_server,
         is_oracle = is_oracle,
@@ -749,6 +759,10 @@ if __name__ == '__main__':
     parser.add_argument("--arrival-pattern", default="azure_chat_23")
     parser.add_argument("--length-pattern", default=None)
     parser.add_argument("--dataset-label", default=None)
+    parser.add_argument("--slo-ttft-scale", type=float, default=5.0)
+    parser.add_argument("--slo-ttft-constant", type=float, default=0.0)
+    parser.add_argument("--slo-tpot", type=float, default=0.05)
+    parser.add_argument("--n-server", type=int, default=100)
     parser.add_argument("--is-oracle", action="store_true")
     parser.add_argument("--is-pd-disagg", action="store_true")
     parser.add_argument("--enforce-batch-memory-budget", action="store_true")
@@ -762,6 +776,10 @@ if __name__ == '__main__':
     dataset_label = args.dataset_label or f"{arrival_pattern}:{length_pattern}"
     datasets = [dataset_label]
     window_minutes = args.window_minutes
+    slo_ttft_scale = args.slo_ttft_scale
+    slo_ttft_constant = args.slo_ttft_constant
+    slo_tpot = args.slo_tpot
+    n_server = args.n_server
     is_oracle = args.is_oracle
     is_pd_disagg = args.is_pd_disagg
     enforce_batch_memory_budget = args.enforce_batch_memory_budget
@@ -861,9 +879,10 @@ if __name__ == '__main__':
                         window_start,
                         window_end,
                         'Qwen/Qwen2.5-7B-Instruct',
-                        5,
-                        0.05,
-                        100,
+                        slo_ttft_scale,
+                        slo_tpot,
+                        n_server,
+                        slo_ttft_constant,
                         is_oracle,
                         is_pd_disagg,
                         enforce_batch_memory_budget,

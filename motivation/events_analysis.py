@@ -3809,14 +3809,37 @@ def analyze_energy_consumption():
     print("Saved requests_vs_energy_scatter.png, requests_vs_energy_agg.png, requests_vs_energy_box.png")
 
 
+def _count_active_devices_from_power_summary(
+    power_summary: dict[str, Any],
+    *,
+    idle_power: float = 70.0,
+) -> np.ndarray:
+    time = np.asarray(power_summary.get("time", []), dtype=np.float64)
+    if time.size == 0:
+        return np.array([], dtype=np.float64)
+
+    per_device_power = power_summary.get("per_device_power", {})
+    counts = np.zeros(time.size, dtype=np.float64)
+    for idx in range(time.size):
+        counts[idx] = sum(
+            idx < len(device_power) and float(device_power[idx]) > idle_power + 1e-9
+            for device_power in per_device_power.values()
+        )
+    return counts
+
+
 def draw_energy_comparison(
     event_files = [
         ('Baseline (8 Servers)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4500_anytime_0.0/vllm_round_robin_1.0_8_anytime_5.0_0.05.events.jsonl', 8),
         ('SLOsServe (4 Servers)', 'experiments_mock/Qwen-7B_constant_sharegpt_code:azure_code_23_3978:4600_anytime_0.0/slosserve-edf_auto_scaling_resch-all_chat-1.0_1.0_4_anytime_5.0_0.05.events.jsonl', 4)
     ],
     output_suffix = None,
-    line_styles = {}
+    line_styles: Dict[str, str] | None = None,
+    per_device: bool = False,
+    window_size: float = 1.0,
 ):
+    if line_styles is None:
+        line_styles = {}
 
     def _infer_slo_params(event_file: str) -> tuple[float, float]:
         stem = event_file.rsplit('/', 1)[-1].removesuffix('.events.jsonl')
@@ -3872,72 +3895,169 @@ def draw_energy_comparison(
         else:
             raise ValueError(f'Expected (label, file, n_device) for event_files, got {entry}')
 
-    fig, axes = plt.subplots(4, figsize = (16, 16), sharex = True, tight_layout = True)
-    cmap = plt.get_cmap('tab10', max(len(parsed_event_files), 1))
-    legend_handles = []
-    is_first = True
-    all_energies = {}
     arrival_window = 5
     violation_window = 5
     linewidth = 2
+    cmap = plt.get_cmap('tab10', max(len(parsed_event_files), 1))
+    legend_handles = []
+    trace_data = []
+    all_energies = {}
+    arrival_time_axis = np.array([], dtype=np.float64)
+    arrival_counts = np.array([], dtype=np.float64)
+    max_num_devices = 0
+
     for idx, (label, file, n_device) in enumerate(parsed_event_files):
         color = cmap(idx)
+        linestyle = line_styles.get(label, '-')
         legend_handles.append(
-            plt.Line2D([0], [0], color=color, linewidth=2.5, linestyle=line_styles.get(label, '-'), label=label)
+            plt.Line2D([0], [0], color=color, linewidth=2.5, linestyle=linestyle, label=label)
         )
         events, reqs = analyze_events(file)
-        if is_first:
+        if arrival_time_axis.size == 0:
             arrival_times = [e.timestamp for e in events if e.event_type == 'global_arrival']
-            is_first = False
             if arrival_times:
                 arrival_times = np.asarray(arrival_times, dtype=np.float64)
                 t0 = np.floor(arrival_times.min() / arrival_window) * arrival_window
-                idx = np.floor((arrival_times - t0) / arrival_window).astype(np.int64)
-                counts = np.bincount(idx)
-                time_axis = t0 + np.arange(counts.size, dtype=np.float64) * arrival_window
-                ax = axes[0]
-                ax.step(time_axis, counts, where="post", color='black', linewidth=linewidth)
-                ax.set_ylabel(f"# requests / {arrival_window:g}s")
-                ax.grid(True, alpha=0.3)
-                            
-                # arrival_times = np.asarray(arrival_times, dtype=np.float64)
-                # t0 = np.floor(arrival_times.min())
-                # second_idx = np.floor(arrival_times - t0).astype(np.int64)
-                # arrivals_per_sec = np.bincount(second_idx)
-                # time_axis = t0 + np.arange(arrivals_per_sec.size, dtype=np.float64)
-                # axes[0].step(time_axis, arrivals_per_sec, where="post", color="black", linewidth=2)
-                # axes[0].set_ylabel("# requests / 1s")
-                # axes[0].set_title("Request arrivals per 1s window")
-                # axes[0].grid(True, alpha=0.3)
-                
-        energies = calc_energy(events, n_device, ax = axes[2], n_device_ax = axes[1], label = label, color = color, window_size=1.0, linestyle = line_styles.get(label, '-'))
+                window_idx = np.floor((arrival_times - t0) / arrival_window).astype(np.int64)
+                arrival_counts = np.bincount(window_idx)
+                arrival_time_axis = t0 + np.arange(arrival_counts.size, dtype=np.float64) * arrival_window
+
+        power_summary = _compute_state_based_power_series(
+            events,
+            n_device=n_device,
+            window_size=window_size,
+        )
         violation_time_axis, violation_counts = _compute_slo_violations(reqs, file, violation_window)
-        if violation_time_axis.size:
-            axes[3].step(
-                violation_time_axis,
-                violation_counts,
+        active_devices = _count_active_devices_from_power_summary(power_summary)
+        all_energies[label] = power_summary["total_power"].tolist()
+        max_device_id = max(power_summary["per_device_power"], default=-1)
+        max_num_devices = max(max_num_devices, max_device_id + 1)
+        if n_device > 0:
+            max_num_devices = max(max_num_devices, n_device)
+        trace_data.append({
+            "label": label,
+            "file": file,
+            "color": color,
+            "linestyle": linestyle,
+            "events": events,
+            "reqs": reqs,
+            "power_summary": power_summary,
+            "active_devices": active_devices,
+            "violation_time_axis": violation_time_axis,
+            "violation_counts": violation_counts,
+        })
+
+    if per_device:
+        num_axes = 4 + max_num_devices
+        fig_height = max(14, 2.6 * max(num_axes, 1))
+        fig, axes = plt.subplots(
+            num_axes,
+            figsize=(18, fig_height),
+            sharex=True,
+            tight_layout=True,
+        )
+        axes = np.atleast_1d(axes)
+        arrival_ax = axes[0]
+        total_power_ax = axes[1]
+        device_power_axes = axes[2: 2 + max_num_devices]
+        active_ax = axes[2 + max_num_devices]
+        violation_ax = axes[3 + max_num_devices]
+    else:
+        fig, axes = plt.subplots(4, figsize=(16, 16), sharex=True, tight_layout=True)
+        axes = np.atleast_1d(axes)
+        arrival_ax = axes[0]
+        active_ax = axes[1]
+        total_power_ax = axes[2]
+        violation_ax = axes[3]
+        device_power_axes = []
+
+    if arrival_time_axis.size:
+        arrival_ax.step(arrival_time_axis, arrival_counts, where="post", color='black', linewidth=linewidth)
+    arrival_ax.set_title("")
+    arrival_ax.set_ylabel('#Req Per\nWindow', fontsize=30)
+    arrival_ax.grid(True, alpha=0.3)
+
+    shared_device_power_ymax = 1.0
+    if per_device and max_num_devices > 0:
+        max_device_power = max(
+            (
+                float(np.max(device_power))
+                for trace in trace_data
+                for device_power in trace["power_summary"]["per_device_power"].values()
+                if len(device_power)
+            ),
+            default=0.0,
+        )
+        shared_device_power_ymax = max(1.0, max_device_power * 1.05)
+
+    for trace in trace_data:
+        power_summary = trace["power_summary"]
+        _plot_step_series(
+            total_power_ax,
+            power_summary["time"],
+            power_summary["total_power"],
+            label=trace["label"],
+            color=trace["color"],
+            linewidth=2.5,
+            linestyle=trace["linestyle"],
+        )
+        _plot_step_series(
+            active_ax,
+            power_summary["time"],
+            trace["active_devices"],
+            label=trace["label"],
+            color=trace["color"],
+            linewidth=2.5,
+            linestyle=trace["linestyle"],
+        )
+        if trace["violation_time_axis"].size:
+            violation_ax.step(
+                trace["violation_time_axis"],
+                trace["violation_counts"],
                 where='post',
-                color=color,
+                color=trace["color"],
                 linewidth=linewidth,
-                linestyle=line_styles.get(label, '-'),
+                linestyle=trace["linestyle"],
             )
-        all_energies[label] = energies
+        if per_device:
+            for device_id, device_ax in enumerate(device_power_axes):
+                device_power = trace["power_summary"]["per_device_power"].get(device_id)
+                if device_power is None:
+                    continue
+                _plot_step_series(
+                    device_ax,
+                    power_summary["time"],
+                    np.asarray(device_power, dtype=np.float64),
+                    label=trace["label"],
+                    color=trace["color"],
+                    linewidth=2.2,
+                    linestyle=trace["linestyle"],
+                )
+
     print('all_energies', {label: np.mean(value) for label, value in all_energies.items()})
-    
-    axes[0].set_title("")
-    axes[0].set_ylabel('#Req Per\nWindow', fontsize = 30)
-    axes[1].set_ylabel('Average\n#Active GPU', fontsize = 30)
-    axes[1].set_ylim(0,10)
-    axes[1].set_xlabel("")
-    axes[2].set_ylabel('GPU Power\n(W)', fontsize = 30)
-    axes[2].set_ylim(0, 1500)
-    axes[2].set_xlabel("")
-    axes[3].set_ylabel('SLO Viol.\nPer Window', fontsize = 30)
-    axes[3].set_xlabel('Time (s)', fontsize = 30)
-    # for ax in axes:
-        # axes[0].set_xlim(350, 650)
-    axes[1].set_ylim(0)
-    axes[3].set_ylim(0)
+
+    total_power_ax.set_ylabel('GPU Power\n(W)', fontsize=30)
+    total_power_ax.set_ylim(0, 1500)
+    total_power_ax.set_xlabel("")
+    total_power_ax.grid(True, alpha=0.3)
+
+    if per_device:
+        for device_id, device_ax in enumerate(device_power_axes):
+            device_ax.set_ylabel(f'Device {device_id}\nPower (W)')
+            device_ax.set_ylim(0, shared_device_power_ymax)
+            device_ax.set_title(f'Device {device_id} Power')
+            device_ax.grid(True, alpha=0.3)
+
+    active_ax.set_ylabel('Average\n#Active GPU', fontsize=30)
+    active_ax.set_ylim(0)
+    active_ax.set_xlabel("")
+    active_ax.grid(True, alpha=0.3)
+
+    violation_ax.set_ylabel('SLO Viol.\nPer Window', fontsize=30)
+    violation_ax.set_xlabel('Time (s)', fontsize=30)
+    violation_ax.set_ylim(0)
+    violation_ax.grid(True, alpha=0.3)
+
     fig.legend(
         handles=legend_handles,
         loc='upper center',

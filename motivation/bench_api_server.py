@@ -43,11 +43,12 @@ logger.setLevel(logging.DEBUG)
 
 FRONTEND_DELAY=0.03
 FRONTEND_HEALTH_CHECK_INTERVAL_S = 5.0
-REQUEST_TIMEOUT_S = 60.0
+REQUEST_TIMEOUT_S = 600.0
 REQUEST_CANCEL_GRACE_S = 5.0
 BENCHMARK_METRIC_WINDOW_S = 1.0
 BENCHMARK_IDLE_POWER_PER_GPU_W = 70.0
 BENCHMARK_BATCH_POWER_MATCH_TOLERANCE_S = 0.2
+BENCHMARK_ENERGY_WINDOW_OFFSET_S = 10.0
 DEFAULT_REPORT_TTFT_SLO_SCALES = (2.0, 3.0, 5.0, 7.0, 10.0)
 DEFAULT_REPORT_SLO_TPOTS = (0.015, 0.025, 0.05, 0.10, 0.2)
 
@@ -870,6 +871,7 @@ class Problem:
     frontend_dedicated_client_per_request: bool = False
     enable_best_effort_tier: bool = False
     best_effort_max_inflight: int = 0
+    mock_engine_device_mem_bytes: int | None = None
     fast_sched_baseline_bsz: int | None = None
      
     # profit model 
@@ -2333,6 +2335,24 @@ def _resolve_benchmark_window_bounds(
     *,
     window_size: float,
 ) -> tuple[float, float]:
+    arrival_times: list[float] = []
+    for req in reqs.values():
+        arrival_time = getattr(req, "engine_arrival_time", -1.0)
+        if arrival_time is None or arrival_time < 0:
+            arrival_time = getattr(req, "arrival_time", -1.0)
+        if arrival_time is not None and arrival_time >= 0:
+            arrival_times.append(float(arrival_time))
+
+    if arrival_times:
+        first_arrival = min(arrival_times)
+        last_arrival = max(arrival_times)
+        # Measure benchmark energy in the requested arrival-anchored window.
+        return (
+            first_arrival + BENCHMARK_ENERGY_WINDOW_OFFSET_S,
+            last_arrival + BENCHMARK_ENERGY_WINDOW_OFFSET_S,
+        )
+
+    # Fallback: keep previous event-derived behavior when request arrivals are missing.
     start_candidates: list[float] = []
     end_candidates: list[float] = []
 
@@ -4176,6 +4196,17 @@ def _fast_sched_baseline_bsz_suffix(
     return f"_fbsz{int(fast_sched_baseline_bsz)}"
 
 
+def _mock_engine_device_mem_suffix(
+    mock_engine_device_mem_bytes: int | None,
+) -> str:
+    if mock_engine_device_mem_bytes is None:
+        return ""
+    device_mem_bytes = int(mock_engine_device_mem_bytes)
+    if device_mem_bytes % 1_000_000_000 == 0:
+        return f"_mockmem{device_mem_bytes // 1_000_000_000}gb"
+    return f"_mockmem{device_mem_bytes}b"
+
+
 def _normalize_admission_output_length_mode(mode: str) -> str:
     normalized = str(mode).strip().lower()
     if normalized == "max":
@@ -4267,6 +4298,7 @@ def build_problems(
     perf_model_piecewise_breakpoints: list[int] | None = None,
     baseline_decode_cap: int | None = None,
     fast_sched_baseline_bsz: int | None = None,
+    mock_engine_device_mem_bytes: int | None = None,
     admission_output_length_mode: str = "max",
     frontend_httpx_max_connections: int | None = None,
     frontend_httpx_max_keepalive_connections: int | None = None,
@@ -4277,6 +4309,13 @@ def build_problems(
     admission_output_length_mode = _normalize_admission_output_length_mode(
         admission_output_length_mode
     )
+    if mock_engine_device_mem_bytes is not None:
+        mock_engine_device_mem_bytes = int(mock_engine_device_mem_bytes)
+        if mock_engine_device_mem_bytes <= 0:
+            raise ValueError(
+                "mock_engine_device_mem_bytes must be positive, "
+                f"got {mock_engine_device_mem_bytes}"
+            )
     session_replay_suffix = _session_replay_suffix(
         enable_session_replay,
         session_pause_s,
@@ -4284,6 +4323,9 @@ def build_problems(
     baseline_cap_suffix = _baseline_cap_suffix(baseline_decode_cap)
     fast_sched_baseline_bsz_suffix = _fast_sched_baseline_bsz_suffix(
         fast_sched_baseline_bsz
+    )
+    mock_engine_device_mem_suffix = _mock_engine_device_mem_suffix(
+        mock_engine_device_mem_bytes
     )
     display_scheduling_policy = _policy_name_with_admission_output_length(
         scheduling_policy,
@@ -4317,6 +4359,7 @@ def build_problems(
         f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
         f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
         f'{session_replay_suffix}{baseline_cap_suffix}{fast_sched_baseline_bsz_suffix}'
+        f'{mock_engine_device_mem_suffix}'
         f'{perf_model_regression_suffix}{frontend_httpx_suffix}{best_effort_suffix}')
     requests_trace = trace
     arrival_times_trace = trace
@@ -4508,7 +4551,7 @@ def build_problems(
             "max_num_batched_tokens": 16384
         })
         
-    elif scheduling_policy == 'atfc':
+    elif 'atfc' in scheduling_policy:
         scheduling_kwargss.append({
             'scheduling_policy': 'atfc',
             'enable_admission': True,
@@ -4545,7 +4588,7 @@ def build_problems(
     if routing_policy == 'round_robin_session':
         admission_mode = "off" # w/ round robin, we let each request ends
         routing_kwargss = [{
-            "enable_rerouting": False,
+            "enable_rerouting": True,
             "enable_rescheduling": False,
             "sticky_sessions": True,
         }]
@@ -4565,7 +4608,7 @@ def build_problems(
                 'is_pd_disagg': True, 
                 'n_prefill_per_group': opt_n_prefill_devices,
             }
-        routing_kwargss = [{"enable_rerouting": False,
+        routing_kwargss = [{"enable_rerouting": True,
                             "enable_rescheduling": False} | extra_kwargs]
     elif 'llumnix_load' in routing_policy:
         _args = routing_policy.split('-')
@@ -4748,10 +4791,10 @@ def build_problems(
             # 'routing_overhead': slo_routing_overhead
         } | extra_kwargs)
 
-    if scheduling_policy == 'atfc':
+    if 'atfc' in scheduling_policy:
         for sch_kwargs in scheduling_kwargss:
             sch_kwargs['ablation_no_local'] = ablation_no_local
-            sch_kwargs['oracle_mem'] = oracle_mem
+            sch_kwargs['oracle_mem'] = oracle_mem or ('oracle_mem' in scheduling_policy)
 
     for routing_kwargs in routing_kwargss:
         if isinstance(routing_kwargs, dict):
@@ -4814,6 +4857,7 @@ def build_problems(
         ),
         enable_best_effort_tier = enable_best_effort_tier,
         best_effort_max_inflight = resolved_best_effort_max_inflight,
+        mock_engine_device_mem_bytes = mock_engine_device_mem_bytes,
     ) for (scheduling_kwargs, routing_kwargs) in product(
         scheduling_kwargss, routing_kwargss)]
 
@@ -4855,6 +4899,7 @@ def run(
     perf_model_piecewise_breakpoints: list[int] | None,
     baseline_decode_cap: int | None,
     fast_sched_baseline_bsz: int | None,
+    mock_engine_device_mem_bytes: int | None,
     admission_output_length_mode: str,
     frontend_httpx_max_connections: int | None,
     frontend_httpx_max_keepalive_connections: int | None,
@@ -4936,6 +4981,7 @@ def run(
     )
     print(f'baseline_decode_cap: {baseline_decode_cap}')
     print(f'fast_sched_baseline_bsz: {fast_sched_baseline_bsz}')
+    print(f'mock_engine_device_mem_bytes: {mock_engine_device_mem_bytes}')
     print(
         'admission_output_length_mode: '
         f'{admission_output_length_mode}'
@@ -4982,6 +5028,7 @@ def run(
                     r['perf_model_err'],
                     r.get('baseline_decode_cap'),
                     r.get('fast_sched_baseline_bsz'),
+                    r.get('mock_engine_device_mem_bytes'),
                     r.get('admission_output_length_mode', 'max'),
                     r.get('enable_piecewise_perf_model_regression', False),
                     tuple(r.get('perf_model_piecewise_breakpoints') or ()),
@@ -5038,6 +5085,7 @@ def run(
             perf_model_err,
             baseline_decode_cap,
             fast_sched_baseline_bsz,
+            mock_engine_device_mem_bytes,
             admission_output_length_mode,
             enable_piecewise_perf_model_regression,
             tuple(perf_model_piecewise_breakpoints or ()),
@@ -5085,6 +5133,7 @@ def run(
                         perf_model_piecewise_breakpoints=perf_model_piecewise_breakpoints,
                         baseline_decode_cap=baseline_decode_cap,
                         fast_sched_baseline_bsz=fast_sched_baseline_bsz,
+                        mock_engine_device_mem_bytes=mock_engine_device_mem_bytes,
                         admission_output_length_mode=admission_output_length_mode,
                         frontend_httpx_max_connections=frontend_httpx_max_connections,
                         frontend_httpx_max_keepalive_connections=(
@@ -5164,6 +5213,7 @@ def run(
             perf_model_piecewise_breakpoints=perf_model_piecewise_breakpoints,
             baseline_decode_cap=baseline_decode_cap,
             fast_sched_baseline_bsz=fast_sched_baseline_bsz,
+            mock_engine_device_mem_bytes=mock_engine_device_mem_bytes,
             admission_output_length_mode=admission_output_length_mode,
             frontend_httpx_max_connections=frontend_httpx_max_connections,
             frontend_httpx_max_keepalive_connections=(
@@ -5244,6 +5294,7 @@ def run(
             ),
             'baseline_decode_cap': baseline_decode_cap,
             'fast_sched_baseline_bsz': fast_sched_baseline_bsz,
+            'mock_engine_device_mem_bytes': mock_engine_device_mem_bytes,
             'admission_output_length_mode': admission_output_length_mode,
             'admission_output_length': problems[0].admission_output_length,
             'enable_session_replay': enable_session_replay,
@@ -5681,6 +5732,16 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        '--mock_engine_device_mem_bytes',
+        type=int,
+        default=None,
+        help=(
+            'mock-engine-only device memory budget in bytes. This is passed '
+            'through benchmark update_config and does not affect router-side '
+            'device_mem block counts.'
+        ),
+    )
+    parser.add_argument(
         '--admission_output_length_mode',
         type=str,
         default='max',
@@ -5802,6 +5863,9 @@ if __name__ == '__main__':
                 ),
                 baseline_decode_cap = args.baseline_decode_cap,
                 fast_sched_baseline_bsz = args.fast_sched_baseline_bsz,
+                mock_engine_device_mem_bytes = (
+                    args.mock_engine_device_mem_bytes
+                ),
                 admission_output_length_mode = (
                     args.admission_output_length_mode
                 ),
@@ -5896,6 +5960,9 @@ if __name__ == '__main__':
                 ),
                 'baseline_decode_cap': args.baseline_decode_cap,
                 'fast_sched_baseline_bsz': args.fast_sched_baseline_bsz,
+                'mock_engine_device_mem_bytes': (
+                    args.mock_engine_device_mem_bytes
+                ),
                 'admission_output_length_mode': (
                     args.admission_output_length_mode
                 ),

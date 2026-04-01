@@ -22,6 +22,7 @@ def run_scaling(
     length_pattern: str,
     model_name: str,
     slo_ttft_scale: float,
+    slo_ttft_constant: float,
     slo_tpot: float,
     server_counts: list[int],
     enforce_batch_memory_budget: bool,
@@ -46,6 +47,7 @@ def run_scaling(
                 length_pattern=length_pattern,
                 model_name=model_name,
                 slo_ttft_scale=slo_ttft_scale,
+                slo_ttft_constant=slo_ttft_constant,
                 slo_tpot=slo_tpot,
                 n_server=n_server,
                 is_oracle=is_oracle,
@@ -195,6 +197,7 @@ def main() -> None:
     parser.add_argument("--length-pattern", default="reasoning")
     parser.add_argument("--model-name", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--slo-ttft-scale", type=float, default=5.0)
+    parser.add_argument("--slo-ttft-constant", type=float, default=0.0)
     parser.add_argument("--slo-tpot", type=float, default=0.1)
     parser.add_argument("--server-counts", type=int, nargs="+", default=[1, 2, 3, 4, 5, 6, 7, 8])
     parser.add_argument("--output-name", default="rejection_scaling")
@@ -212,6 +215,7 @@ def main() -> None:
         length_pattern=args.length_pattern,
         model_name=args.model_name,
         slo_ttft_scale=args.slo_ttft_scale,
+        slo_ttft_constant=args.slo_ttft_constant,
         slo_tpot=args.slo_tpot,
         server_counts=sorted(set(args.server_counts)),
         enforce_batch_memory_budget=args.enforce_batch_memory_budget,
