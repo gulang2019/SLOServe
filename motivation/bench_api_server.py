@@ -12,6 +12,7 @@ import pprint
 import json
 import io
 import math
+import re
 from itertools import product
 import logging
 import uuid
@@ -4237,6 +4238,46 @@ def _policy_name_with_admission_output_length(
     return f"{policy_name}{_admission_output_length_suffix(mode)}"
 
 
+def _split_policy_admission_output_length_suffix(
+    policy_name: str,
+) -> tuple[str, str | None]:
+    policy_name = str(policy_name).strip()
+    match = re.search(r"(?i)(?:[-_])mem(?:[-_])(max|p\d+)$", policy_name)
+    if match is None:
+        return policy_name, None
+    mode = _normalize_admission_output_length_mode(match.group(1))
+    return policy_name[: match.start()], mode
+
+
+def _resolve_policy_admission_output_length_mode(
+    scheduling_policy: str,
+    routing_policy: str,
+    default_mode: str,
+) -> tuple[str, str, str]:
+    normalized_default_mode = _normalize_admission_output_length_mode(default_mode)
+    scheduling_policy, scheduling_mode = _split_policy_admission_output_length_suffix(
+        scheduling_policy
+    )
+    routing_policy, routing_mode = _split_policy_admission_output_length_suffix(
+        routing_policy
+    )
+    suffix_modes = [
+        mode for mode in (scheduling_mode, routing_mode) if mode is not None
+    ]
+    if suffix_modes and len(set(suffix_modes)) > 1:
+        raise ValueError(
+            "Conflicting admission memory suffixes in policy names: "
+            f"{scheduling_policy=} {routing_policy=} {suffix_modes=}"
+        )
+    if suffix_modes and normalized_default_mode != "max" and suffix_modes[0] != normalized_default_mode:
+        raise ValueError(
+            "Conflicting admission_output_length_mode sources: "
+            f"default_mode={normalized_default_mode}, suffix_mode={suffix_modes[0]}"
+        )
+    resolved_mode = suffix_modes[0] if suffix_modes else normalized_default_mode
+    return scheduling_policy, routing_policy, resolved_mode
+
+
 def _base_policy_name_from_result(
     result: dict[str, Any],
     *,
@@ -4306,8 +4347,12 @@ def build_problems(
     enable_best_effort_tier: bool = False,
     best_effort_max_inflight: int = 0,
 ):
-    admission_output_length_mode = _normalize_admission_output_length_mode(
-        admission_output_length_mode
+    scheduling_policy, routing_policy, admission_output_length_mode = (
+        _resolve_policy_admission_output_length_mode(
+            scheduling_policy,
+            routing_policy,
+            admission_output_length_mode,
+        )
     )
     if mock_engine_device_mem_bytes is not None:
         mock_engine_device_mem_bytes = int(mock_engine_device_mem_bytes)
@@ -5051,13 +5096,22 @@ def run(
         else:
             scheduling_policy = policy
             routing_policy = 'round_robin'
+        (
+            scheduling_policy,
+            routing_policy,
+            resolved_admission_output_length_mode,
+        ) = _resolve_policy_admission_output_length_mode(
+            scheduling_policy,
+            routing_policy,
+            admission_output_length_mode,
+        )
         display_scheduling_policy = _policy_name_with_admission_output_length(
             scheduling_policy,
-            admission_output_length_mode,
+            resolved_admission_output_length_mode,
         )
         display_routing_policy = _policy_name_with_admission_output_length(
             routing_policy,
-            admission_output_length_mode,
+            resolved_admission_output_length_mode,
         )
         if n_device == 1 and 'disaggregated' in routing_policy:
             print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot} because n_device is 1 and routing policy is disaggregated')
@@ -5086,7 +5140,7 @@ def run(
             baseline_decode_cap,
             fast_sched_baseline_bsz,
             mock_engine_device_mem_bytes,
-            admission_output_length_mode,
+            resolved_admission_output_length_mode,
             enable_piecewise_perf_model_regression,
             tuple(perf_model_piecewise_breakpoints or ()),
             enable_session_replay,
@@ -5134,7 +5188,7 @@ def run(
                         baseline_decode_cap=baseline_decode_cap,
                         fast_sched_baseline_bsz=fast_sched_baseline_bsz,
                         mock_engine_device_mem_bytes=mock_engine_device_mem_bytes,
-                        admission_output_length_mode=admission_output_length_mode,
+                        admission_output_length_mode=resolved_admission_output_length_mode,
                         frontend_httpx_max_connections=frontend_httpx_max_connections,
                         frontend_httpx_max_keepalive_connections=(
                             frontend_httpx_max_keepalive_connections
@@ -5214,7 +5268,7 @@ def run(
             baseline_decode_cap=baseline_decode_cap,
             fast_sched_baseline_bsz=fast_sched_baseline_bsz,
             mock_engine_device_mem_bytes=mock_engine_device_mem_bytes,
-            admission_output_length_mode=admission_output_length_mode,
+            admission_output_length_mode=resolved_admission_output_length_mode,
             frontend_httpx_max_connections=frontend_httpx_max_connections,
             frontend_httpx_max_keepalive_connections=(
                 frontend_httpx_max_keepalive_connections
@@ -5295,7 +5349,7 @@ def run(
             'baseline_decode_cap': baseline_decode_cap,
             'fast_sched_baseline_bsz': fast_sched_baseline_bsz,
             'mock_engine_device_mem_bytes': mock_engine_device_mem_bytes,
-            'admission_output_length_mode': admission_output_length_mode,
+            'admission_output_length_mode': resolved_admission_output_length_mode,
             'admission_output_length': problems[0].admission_output_length,
             'enable_session_replay': enable_session_replay,
             'session_pause_s': session_pause_s,
