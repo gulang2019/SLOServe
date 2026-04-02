@@ -16,6 +16,10 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 
 
+from SLOsServe.decode_length_predictor import (
+    BucketedQuantileDecodeLengthPredictor,
+    DecodeLengthPredictorPlugin,
+)
 from SLOsServe.router.adm_ctrl import BatchPlanner
 from SLOsServe.perf_model import PerfModel
 
@@ -41,6 +45,69 @@ class EventQueue:
     def __len__(self):
         return len(self._events)
 
+
+def normalize_prediction_mode(
+    prediction_mode: str,
+    *,
+    is_oracle: bool = False,
+) -> str:
+    if is_oracle:
+        return "oracle"
+    normalized = str(prediction_mode).strip().lower().replace("-", "_")
+    aliases = {
+        "baseline": "fixed",
+        "cap": "fixed",
+        "fixed_cap": "fixed",
+        "oracle_mem": "oracle",
+        "p90": "q90",
+        "p95": "q95",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"fixed", "oracle", "mean", "q90", "q95"}:
+        raise ValueError(f"Unsupported prediction_mode={prediction_mode!r}")
+    return normalized
+
+
+def normalize_admission_policy(admission_policy: str) -> str:
+    normalized = str(admission_policy).strip().lower().replace("-", "_")
+    aliases = {
+        "baseline": "slopacker",
+        "oracle_mem": "slopacker",
+        "conservative": "conservative_arrival_reservation",
+        "car": "conservative_arrival_reservation",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"slopacker", "conservative_arrival_reservation"}:
+        raise ValueError(f"Unsupported admission_policy={admission_policy!r}")
+    return normalized
+
+
+def build_decode_length_predictor_plugin(
+    requests: list[Request],
+    *,
+    prediction_mode: str,
+    fixed_length: int,
+    workload_type: str = "default",
+    prompt_bucket_uppers: tuple[int, ...] | list[int] | None = None,
+) -> DecodeLengthPredictorPlugin:
+    normalized_mode = normalize_prediction_mode(prediction_mode)
+    if normalized_mode == "fixed":
+        return DecodeLengthPredictorPlugin.fixed(int(fixed_length))
+    if normalized_mode == "oracle":
+        return DecodeLengthPredictorPlugin.oracle()
+    predictor = BucketedQuantileDecodeLengthPredictor.fit_from_requests(
+        requests,
+        workload_type=workload_type,
+        prompt_bucket_uppers=prompt_bucket_uppers,
+    )
+    if normalized_mode == "mean":
+        return DecodeLengthPredictorPlugin.mean(predictor)
+    if normalized_mode == "q90":
+        return DecodeLengthPredictorPlugin.quantile_plugin(predictor, 0.90)
+    if normalized_mode == "q95":
+        return DecodeLengthPredictorPlugin.quantile_plugin(predictor, 0.95)
+    raise ValueError(f"Unsupported prediction_mode={prediction_mode!r}")
+
 @dataclass 
 class RequestInstance:
     req: Request
@@ -48,6 +115,11 @@ class RequestInstance:
     mode: str # prefill_only, decode_only, normal
     device_id: int = -1
     n_computed_tokens: int = 0
+    arrival_time: float | None = None
+    prefill_deadline: float | None = None
+    completion_deadline: float | None = None
+    predicted_decode_length: int | None = None
+    finished_time: float | None = None
     
     def commit(self, n):
         self.n_computed_tokens += n
@@ -62,9 +134,11 @@ class MemManager:
     block_size: int
     total_free_blocks: int
     num_free_blocks: int = field(init = False)
+    peak_used_blocks: int = field(init=False, default=0)
     
     def __post_init__(self):
         self.num_free_blocks = self.total_free_blocks
+        self.peak_used_blocks = 0
     
     def _get_n_block(self, n_tokens: int):
         return math.ceil(n_tokens / self.block_size)
@@ -76,8 +150,16 @@ class MemManager:
         if to_alloc > 0:
             if self.num_free_blocks >= to_alloc:
                 self.num_free_blocks -= to_alloc
+                self.peak_used_blocks = max(
+                    self.peak_used_blocks,
+                    self.total_free_blocks - self.num_free_blocks,
+                )
                 return True
             return False 
+        self.peak_used_blocks = max(
+            self.peak_used_blocks,
+            self.total_free_blocks - self.num_free_blocks,
+        )
         return True 
         
     def free(self, req: RequestInstance):
@@ -97,13 +179,16 @@ class Instance:
                  kv_cache_mem = 20e9,
                  max_decode_length = None,
                  is_oracle: bool = False,
-                 enforce_batch_memory_budget: bool = False):
+                 enforce_batch_memory_budget: bool = False,
+                 admission_policy: str = 'slopacker',
+                 decode_length_predictor: DecodeLengthPredictorPlugin | None = None):
         self.device_id = device_id
         self.event_queue = event_queue
         self.perf_model = PerfModel.get_perf_model(model_name)
         self.slo_ttft_scale = slo_ttft_scale
         self.slo_ttft_constant = slo_ttft_constant
         self.slo_tpot = slo_tpot
+        self.admission_policy = normalize_admission_policy(admission_policy)
         self.mem_manager = MemManager(
             block_size = block_size,
             total_free_blocks = math.floor(kv_cache_mem / (block_size * self.perf_model.get_kv_mem_per_token()))
@@ -120,11 +205,25 @@ class Instance:
                 f"token_capacity={self.mem_manager.total_free_blocks * block_size}"
             )
             Instance._printed_kv_cache_info = True
+        default_max_decode_length = (
+            self.perf_model.get_max_decode_length()
+            if max_decode_length is None else int(max_decode_length)
+        )
+        self.decode_length_predictor = (
+            decode_length_predictor
+            if decode_length_predictor is not None else (
+                DecodeLengthPredictorPlugin.oracle()
+                if is_oracle else DecodeLengthPredictorPlugin.fixed(default_max_decode_length)
+            )
+        )
+        self.oracle_decode_length_predictor = DecodeLengthPredictorPlugin.oracle()
+        planner_is_oracle = self.decode_length_predictor.mode == "oracle"
         self.batch_planner = BatchPlanner(
             _perf_model = self.perf_model,
             _block_size = block_size,
-            _max_decode_length = self.perf_model.get_max_decode_length() if max_decode_length is None else max_decode_length,
-            _is_oracle = is_oracle,
+            _max_decode_length = default_max_decode_length,
+            _decode_length_predictor = self.decode_length_predictor,
+            _is_oracle = planner_is_oracle,
             _enforce_batch_memory_budget = enforce_batch_memory_budget,
             _num_free_blocks = self.mem_manager.total_free_blocks,
         )
@@ -132,6 +231,170 @@ class Instance:
         self.active_requests: dict[str, RequestInstance] = {}
         self.active_times: tuple[(float, float)] = []
         self.failure_reasons: dict = defaultdict(int)
+        self.request_metrics: dict[str, dict] = {}
+        self._reservation_blocks: dict[str, int] = {}
+
+    def _num_computed_tokens_on_arrival(self, req: RequestInstance) -> int:
+        return req.req.input_length if req.mode == 'decode_only' else 0
+
+    def _ensure_request_deadlines(self, now: float, req: RequestInstance) -> None:
+        if req.arrival_time is None:
+            req.arrival_time = now
+        if req.prefill_deadline is None:
+            zero_load_time = self.perf_model.get_batch_time([(0, req.req.input_length)])
+            req.prefill_deadline = (
+                now + zero_load_time * self.slo_ttft_scale + self.slo_ttft_constant
+            )
+        if req.completion_deadline is None:
+            req.completion_deadline = (
+                req.prefill_deadline + self.slo_tpot * req.req.output_length
+            )
+
+    def _get_predicted_decode_length(self, req: RequestInstance) -> int:
+        return int(self.decode_length_predictor.predict_length(req.req))
+
+    def _get_reserved_blocks_for(
+        self,
+        req: RequestInstance,
+        predicted_decode_length: int,
+    ) -> int:
+        num_computed_tokens = self._num_computed_tokens_on_arrival(req)
+        remaining_prompt_tokens = max(req.req.input_length - num_computed_tokens, 0)
+        return math.ceil(
+            (remaining_prompt_tokens + int(predicted_decode_length))
+            / self.mem_manager.block_size
+        )
+
+    def _get_request_record(
+        self,
+        req: RequestInstance,
+        *,
+        predicted_decode_length: int,
+        oracle_admit: bool,
+    ) -> dict:
+        record = self.request_metrics.get(req.req_id)
+        if record is None:
+            record = {
+                "request_id": req.req_id,
+                "actual_final_decode_length": int(req.req.output_length),
+                "predicted_length": int(predicted_decode_length),
+                "accepted_once": False,
+                "terminal_state": None,
+                "false_reject": False,
+                "false_admit": False,
+                "oracle_admit": bool(oracle_admit),
+                "slo_violated": False,
+                "arrival_time": req.arrival_time,
+                "finish_time": None,
+            }
+            self.request_metrics[req.req_id] = record
+        else:
+            record["oracle_admit"] = bool(record["oracle_admit"] or oracle_admit)
+            if record.get("predicted_length") is None:
+                record["predicted_length"] = int(predicted_decode_length)
+        return record
+
+    def _oracle_admits_request(self, now: float, req: RequestInstance) -> bool:
+        if self.admission_policy == "conservative_arrival_reservation":
+            oracle_reserved_blocks = sum(
+                self._get_reserved_blocks_for(active_req, active_req.req.output_length)
+                for active_req in self.active_requests.values()
+            )
+            new_reserved_blocks = self._get_reserved_blocks_for(
+                req,
+                req.req.output_length,
+            )
+            return (
+                oracle_reserved_blocks + new_reserved_blocks
+                <= self.mem_manager.total_free_blocks
+            )
+        feasible, _reject_reason, _new_req = self.batch_planner.probe_request(
+            request_id=req.req_id,
+            num_prompt_tokens=req.req.input_length,
+            num_computed_tokens=self._num_computed_tokens_on_arrival(req),
+            prefill_ddl=req.prefill_deadline,
+            slo_tpot=self.slo_tpot,
+            prefill_only=req.mode == 'prefill_only',
+            output_length=req.req.output_length,
+            predictor_override=self.oracle_decode_length_predictor,
+        )
+        return bool(feasible)
+
+    def get_metrics(self) -> dict[str, float | int | str]:
+        records = list(self.request_metrics.values())
+        total_requests = len(records)
+        predicted_lengths = [
+            int(record["predicted_length"])
+            for record in records
+            if record.get("predicted_length") is not None
+        ]
+        actual_lengths = [
+            int(record["actual_final_decode_length"])
+            for record in records
+            if record.get("actual_final_decode_length") is not None
+        ]
+        admitted_requests = sum(1 for record in records if record["accepted_once"])
+        rejected_requests = sum(
+            1 for record in records
+            if record["terminal_state"] == "rejected"
+        )
+        finished_requests = sum(
+            1 for record in records
+            if record["terminal_state"] == "finished"
+        )
+        false_rejects = sum(1 for record in records if record["false_reject"])
+        false_admits = sum(1 for record in records if record["false_admit"])
+        slo_violations = sum(
+            1 for record in records
+            if record["terminal_state"] == "rejected" or record["slo_violated"]
+        )
+        goodput_requests = sum(
+            1 for record in records
+            if record["terminal_state"] == "finished" and not record["slo_violated"]
+        )
+        peak_kv_used_blocks = int(self.mem_manager.peak_used_blocks)
+        peak_kv_usage_ratio = (
+            peak_kv_used_blocks / self.mem_manager.total_free_blocks
+            if self.mem_manager.total_free_blocks > 0 else 0.0
+        )
+        return {
+            "admission_policy": self.admission_policy,
+            "prediction_mode": self.decode_length_predictor.label,
+            "total_requests": total_requests,
+            "admitted_requests": admitted_requests,
+            "rejected_requests": rejected_requests,
+            "finished_requests": finished_requests,
+            "false_rejects": false_rejects,
+            "false_reject_rate": (
+                false_rejects / total_requests if total_requests > 0 else 0.0
+            ),
+            "false_admits": false_admits,
+            "false_admit_rate": (
+                false_admits / total_requests if total_requests > 0 else 0.0
+            ),
+            "predicted_length_mean": (
+                float(np.mean(predicted_lengths)) if predicted_lengths else 0.0
+            ),
+            "predicted_length_p95": (
+                float(np.percentile(predicted_lengths, 95))
+                if predicted_lengths else 0.0
+            ),
+            "actual_decode_length_mean": (
+                float(np.mean(actual_lengths)) if actual_lengths else 0.0
+            ),
+            "actual_decode_length_p95": (
+                float(np.percentile(actual_lengths, 95))
+                if actual_lengths else 0.0
+            ),
+            "peak_kv_used_blocks": peak_kv_used_blocks,
+            "peak_kv_usage_ratio": float(peak_kv_usage_ratio),
+            "peak_kv_tokens": int(peak_kv_used_blocks * self.mem_manager.block_size),
+            "slo_violations": slo_violations,
+            "slo_violation_rate": (
+                slo_violations / total_requests if total_requests > 0 else 0.0
+            ),
+            "goodput_requests": goodput_requests,
+        }
 
     def _begin_next_batch(self, now):
         if not len(self.active_requests): return
@@ -143,6 +406,7 @@ class Instance:
                 print('[Error] Memory allocation failed')
                 self.failure_reasons['oom'] += 1
                 req = self.active_requests.pop(req_id)
+                self._reservation_blocks.pop(req_id, None)
                 self.batch_planner.finish_request(req_id)
                 req.n_computed_tokens = 0
                 # Avoid a tight retry loop when memory conditions don't change.
@@ -166,19 +430,60 @@ class Instance:
 
     def add_request(self, now: float, req: RequestInstance) -> bool:
         self.batch_planner._now = lambda : now
-        zero_load_time = self.perf_model.get_batch_time([(0, req.req.input_length)])
-        suc = self.batch_planner.add_request(request_id = req.req_id,
-                                            num_prompt_tokens = req.req.input_length,
-                                            num_computed_tokens = req.req.input_length if req.mode == 'decode_only' else 0,
-                                            prefill_ddl = now + zero_load_time * self.slo_ttft_scale + self.slo_ttft_constant,
-                                            slo_tpot = self.slo_tpot,
-                                            prefill_only = req.mode == 'prefill_only',
-                                            output_length=req.req.output_length if self.batch_planner._is_oracle else None)
+        self._ensure_request_deadlines(now, req)
+        predicted_decode_length = self._get_predicted_decode_length(req)
+        if req.predicted_decode_length is None:
+            req.predicted_decode_length = predicted_decode_length
+        oracle_admit = self._oracle_admits_request(now, req)
+        record = self._get_request_record(
+            req,
+            predicted_decode_length=predicted_decode_length,
+            oracle_admit=oracle_admit,
+        )
+        if self.admission_policy == "conservative_arrival_reservation":
+            reserved_blocks = self._get_reserved_blocks_for(
+                req,
+                predicted_decode_length,
+            )
+            currently_reserved_blocks = sum(self._reservation_blocks.values())
+            suc = (
+                currently_reserved_blocks + reserved_blocks
+                <= self.mem_manager.total_free_blocks
+            )
+            self.batch_planner._last_infeasible_reason = None if suc else "MEM"
+            if suc:
+                self._reservation_blocks[req.req_id] = reserved_blocks
+                self.batch_planner.register_request(
+                    request_id=req.req_id,
+                    num_prompt_tokens=req.req.input_length,
+                    num_computed_tokens=self._num_computed_tokens_on_arrival(req),
+                    prefill_ddl=req.prefill_deadline,
+                    slo_tpot=self.slo_tpot,
+                    prefill_only=req.mode == 'prefill_only',
+                    output_length=req.req.output_length,
+                )
+        else:
+            suc = self.batch_planner.add_request(
+                request_id=req.req_id,
+                num_prompt_tokens=req.req.input_length,
+                num_computed_tokens=self._num_computed_tokens_on_arrival(req),
+                prefill_ddl=req.prefill_deadline,
+                slo_tpot=self.slo_tpot,
+                prefill_only=req.mode == 'prefill_only',
+                output_length=req.req.output_length,
+            )
         if suc:
+            record["accepted_once"] = True
+            if not oracle_admit:
+                record["false_admit"] = True
             self.active_requests[req.req_id] = req
             if len(self.active_requests) == 1:
                 self._begin_next_batch(now)
         else:
+            if oracle_admit:
+                record["false_reject"] = True
+            if record["terminal_state"] is None:
+                record["terminal_state"] = "rejected"
             if self.batch_planner._last_infeasible_reason == 'MEM':
                 self.failure_reasons['mem'] += 1
             elif self.batch_planner._last_infeasible_reason == 'CMP':
@@ -195,6 +500,7 @@ class Instance:
             req.commit(n_scheduled_token)
             if req.is_finished():
                 self.active_requests.pop(req_id)
+                self._reservation_blocks.pop(req_id, None)
                 self.mem_manager.free(req)
                 finished_reqs.add(req_id)
                 if req.mode == 'prefill_only':
@@ -208,6 +514,15 @@ class Instance:
                         t = now + 1e-6, event_type = 'request_finish', 
                         device_id = self.device_id, obj = req
                     )
+                    req.finished_time = now
+                    record = self.request_metrics.get(req.req_id)
+                    if record is not None:
+                        record["terminal_state"] = "finished"
+                        record["finish_time"] = now
+                        record["slo_violated"] = bool(
+                            req.completion_deadline is not None
+                            and now > req.completion_deadline
+                        )
         self.batch_planner.commit_batch(n_scheduled_tokens, finished_reqs, self.mem_manager.num_free_blocks)
         if len(self.active_requests):
             self._begin_next_batch(now)
@@ -254,6 +569,9 @@ def calc_avg_num_servers(
     is_pd_disagg: bool = False,
     verbose: bool = True,
     enforce_batch_memory_budget: bool = False,
+    prediction_mode: str = "fixed",
+    admission_policy: str = "slopacker",
+    prompt_bucket_uppers: tuple[int, ...] | list[int] | None = None,
 ):
     if arrival_times_list is not None and requests_list is not None:
         arrival_times = ArrivalTimes(arrival_pattern, arrival_times_list)
@@ -272,15 +590,35 @@ def calc_avg_num_servers(
             arrival_times = ArrivalTimes.load(arrival_pattern, window_end = window_end)
         lengths = Requests.load(length_pattern, window_start = 0, window_end = len(arrival_times.arrival_times))
     event_queue: EventQueue = EventQueue()
-    instances = [Instance(model_name = model_name, 
-                          device_id = device_id,
-                          event_queue = event_queue,
-                          slo_ttft_scale=slo_ttft_scale,
-                          slo_ttft_constant=slo_ttft_constant,
-                          slo_tpot = slo_tpot,
-                          is_oracle = is_oracle,
-                          enforce_batch_memory_budget = enforce_batch_memory_budget,
-                          max_decode_length = int(np.percentile([r.output_length for r in lengths.requests], 80))) for device_id in range(n_server)]
+    fixed_max_decode_length = int(
+        np.percentile([r.output_length for r in lengths.requests], 80)
+    )
+    decode_length_predictor = build_decode_length_predictor_plugin(
+        lengths.requests,
+        prediction_mode=normalize_prediction_mode(
+            prediction_mode,
+            is_oracle=is_oracle,
+        ),
+        fixed_length=fixed_max_decode_length,
+        workload_type=length_pattern,
+        prompt_bucket_uppers=prompt_bucket_uppers,
+    )
+    instances = [
+        Instance(
+            model_name=model_name,
+            device_id=device_id,
+            event_queue=event_queue,
+            slo_ttft_scale=slo_ttft_scale,
+            slo_ttft_constant=slo_ttft_constant,
+            slo_tpot=slo_tpot,
+            is_oracle=is_oracle,
+            enforce_batch_memory_budget=enforce_batch_memory_budget,
+            max_decode_length=fixed_max_decode_length,
+            admission_policy=admission_policy,
+            decode_length_predictor=decode_length_predictor,
+        )
+        for device_id in range(n_server)
+    ]
     for i, (t, req) in enumerate(zip(arrival_times.arrival_times, lengths.requests)):
         event_queue.push(t = t, event_type = "arrival", device_id = -1, obj = RequestInstance(req, f'req-{i}',mode = 'prefill_only' if is_pd_disagg else 'normal'))
     

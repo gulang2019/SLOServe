@@ -257,6 +257,15 @@ def _build_concise_result_row(
     per_batch_request_summary = batch_token_summary.get("per_batch_request", {})
     if not isinstance(per_batch_request_summary, dict):
         per_batch_request_summary = {}
+    clock_monitor_recommendation = result.get("vllm_clock_monitor_recommendation")
+    if not isinstance(clock_monitor_recommendation, dict):
+        clock_monitor_recommendation = {}
+    recommended_threshold_stats = clock_monitor_recommendation.get(
+        "recommended_threshold_stats",
+        {},
+    )
+    if not isinstance(recommended_threshold_stats, dict):
+        recommended_threshold_stats = {}
 
     concise_row = {
         "trace": trace_used if trace_used is not None else result.get("trace_used"),
@@ -337,6 +346,28 @@ def _build_concise_result_row(
                     "p99": current_upper_bound_constants.get("p99"),
                 },
             },
+        },
+        "clock_monitor": {
+            "enabled": result.get("vllm_clock_monitor_enabled"),
+            "configured_low_mhz": result.get("vllm_clock_monitor_low_mhz"),
+            "recommended_low_mhz": clock_monitor_recommendation.get(
+                "recommended_low_mhz"
+            ),
+            "recommended_low_mhz_ratio": clock_monitor_recommendation.get(
+                "recommended_low_mhz_ratio"
+            ),
+            "target_positive_recall_unreachable": (
+                clock_monitor_recommendation.get(
+                    "target_positive_recall_unreachable"
+                )
+            ),
+            "first_tpot_miss_batch_count": clock_monitor_recommendation.get(
+                "first_tpot_miss_batch_count"
+            ),
+            "positive_recall": recommended_threshold_stats.get("positive_recall"),
+            "flagged_batch_rate": recommended_threshold_stats.get(
+                "flagged_batch_rate"
+            ),
         },
     }
     return _drop_empty_logging_fields(concise_row)
@@ -1161,6 +1192,7 @@ class Problem:
     
     scheduling_policy: str = 'vllm'
     scheduling_kwargs: dict = field(default_factory=lambda: {'max_num_seqs': 128, 'max_num_batched_tokens': 512, 'long_prefill_token_threshold': 256, 'enable_chunked_prefill': False, 'enable_admission': True, 'allow_rejection': True})
+    clock_monitor_kwargs: dict = field(default_factory=dict)
     
     # store_prefix
     store_prefix: str = 'problem'
@@ -1269,6 +1301,24 @@ def _load_saved_request_rows(reqs_file: str | Path) -> List[Dict[str, Any]]:
         ]
     if not isinstance(rows, list):
         raise ValueError(f"expected a list of requests in {path}")
+    return rows
+
+
+def _load_json_rows(path_like: str | Path) -> List[Dict[str, Any]]:
+    path = Path(path_like)
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return []
+    if raw.lstrip().startswith("["):
+        rows = json.loads(raw)
+    else:
+        rows = [
+            json.loads(line)
+            for line in raw.splitlines()
+            if line.strip()
+        ]
+    if not isinstance(rows, list):
+        raise ValueError(f"expected a list of JSON rows in {path}")
     return rows
 
 
@@ -2807,6 +2857,363 @@ def _match_batch_power_rows(
             "power": float(best_power),
         })
     return rows
+
+
+def _build_replica_energy_snapshot_series(
+    events: List[Dict[str, Any] | Any],
+) -> Dict[int, Dict[str, List[float]]]:
+    # In TP runs the dumped energy events are emitted per local GPU and later
+    # rewritten to the replica id. Aggregate by (replica, timestamp) and use
+    # the slowest shard clock as the effective replica clock.
+    grouped: Dict[int, Dict[float, Dict[str, List[float]]]] = defaultdict(
+        lambda: defaultdict(lambda: {"mhz": [], "power": []})
+    )
+    for event in events:
+        if _event_value(event, "event_type") != "energy":
+            continue
+        try:
+            device_id = int(_event_value(event, "device_id", -1))
+            timestamp = float(_event_value(event, "timestamp", 0.0))
+            mhz = float(_event_value(event, "mhz", 0.0) or 0.0)
+            power = float(_event_value(event, "power", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if device_id < 0:
+            continue
+        snapshot = grouped[device_id][timestamp]
+        snapshot["mhz"].append(mhz)
+        snapshot["power"].append(power)
+
+    series: Dict[int, Dict[str, List[float]]] = {}
+    for device_id, by_timestamp in grouped.items():
+        timestamps = sorted(by_timestamp)
+        min_mhz: List[float] = []
+        avg_mhz: List[float] = []
+        total_power_w: List[float] = []
+        sample_count: List[int] = []
+        for timestamp in timestamps:
+            mhz_samples = by_timestamp[timestamp]["mhz"]
+            power_samples = by_timestamp[timestamp]["power"]
+            if not mhz_samples:
+                continue
+            min_mhz.append(float(min(mhz_samples)))
+            avg_mhz.append(float(sum(mhz_samples) / len(mhz_samples)))
+            total_power_w.append(float(sum(power_samples)))
+            sample_count.append(int(len(mhz_samples)))
+        if not min_mhz:
+            continue
+        series[device_id] = {
+            "timestamps": [float(ts) for ts in timestamps[:len(min_mhz)]],
+            "min_mhz": min_mhz,
+            "avg_mhz": avg_mhz,
+            "total_power_w": total_power_w,
+            "sample_count": sample_count,
+        }
+    return series
+
+
+def _nearest_replica_energy_snapshot(
+    series: Dict[int, Dict[str, List[float]]],
+    *,
+    device_id: int,
+    timestamp: float,
+    tolerance_s: float = BENCHMARK_BATCH_POWER_MATCH_TOLERANCE_S,
+) -> Dict[str, float | int] | None:
+    device_series = series.get(int(device_id))
+    if not device_series:
+        return None
+    timestamps = device_series.get("timestamps", [])
+    if not timestamps:
+        return None
+    idx = bisect.bisect_left(timestamps, float(timestamp))
+    best_idx: int | None = None
+    best_delta: float | None = None
+    for probe_idx in (idx - 1, idx):
+        if not 0 <= probe_idx < len(timestamps):
+            continue
+        delta = abs(float(timestamps[probe_idx]) - float(timestamp))
+        if best_delta is None or delta < best_delta:
+            best_idx = probe_idx
+            best_delta = delta
+    if best_idx is None or best_delta is None or best_delta > float(tolerance_s):
+        return None
+    return {
+        "timestamp": float(timestamps[best_idx]),
+        "delta_s": float(best_delta),
+        "min_mhz": float(device_series["min_mhz"][best_idx]),
+        "avg_mhz": float(device_series["avg_mhz"][best_idx]),
+        "total_power_w": float(device_series["total_power_w"][best_idx]),
+        "sample_count": int(device_series["sample_count"][best_idx]),
+    }
+
+
+def _find_first_positive_index(values: Any) -> int | None:
+    if not isinstance(values, list):
+        return None
+    for idx, value in enumerate(values):
+        try:
+            if float(value) > 0.0:
+                return idx
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _recommend_clock_monitor_low_mhz_from_trace(
+    *,
+    reqs_file: str | Path,
+    events_file: str | Path,
+    target_positive_recall: float = 0.80,
+    tolerance_s: float = BENCHMARK_BATCH_POWER_MATCH_TOLERANCE_S,
+) -> Dict[str, Any] | None:
+    req_rows = _load_saved_request_rows(reqs_file)
+    events = _load_json_rows(events_file)
+    if not req_rows or not events:
+        return None
+
+    replica_energy_series = _build_replica_energy_snapshot_series(events)
+    if not replica_energy_series:
+        return None
+
+    batch_events_by_key: Dict[tuple[int, int], Dict[str, Any]] = {}
+    all_batches: List[Dict[str, Any]] = []
+    for event in events:
+        if _event_value(event, "event_type") != "batch":
+            continue
+        try:
+            device_id = int(_event_value(event, "device_id", -1))
+            batch_id = int(_event_value(event, "batch_id", -1))
+        except (TypeError, ValueError):
+            continue
+        if device_id < 0 or batch_id < 0:
+            continue
+        batch_events_by_key[(device_id, batch_id)] = dict(event)
+        snapshot = _nearest_replica_energy_snapshot(
+            replica_energy_series,
+            device_id=device_id,
+            timestamp=float(_event_value(event, "timestamp", 0.0)),
+            tolerance_s=tolerance_s,
+        )
+        if snapshot is None:
+            continue
+        all_batches.append({
+            "device_id": device_id,
+            "batch_id": batch_id,
+            "timestamp": float(_event_value(event, "timestamp", 0.0)),
+            "min_mhz": float(snapshot["min_mhz"]),
+            "avg_mhz": float(snapshot["avg_mhz"]),
+            "total_power_w": float(snapshot["total_power_w"]),
+            "estimated_time_s": float(
+                _event_value(
+                    event,
+                    "estimated_time",
+                    _event_value(event, "control_estimated_time", 0.0),
+                ) or 0.0
+            ),
+            "measured_time_s": float(_event_value(event, "elapsed", 0.0) or 0.0),
+        })
+    if not all_batches:
+        return None
+
+    positive_batches: Dict[tuple[int, int], Dict[str, Any]] = {}
+    first_tpot_miss_request_count = 0
+    for req_row in req_rows:
+        violation = str(req_row.get("slo_violation", "") or "")
+        if violation and violation != "tpot":
+            continue
+        schedules = req_row.get("schedules") or []
+        if not isinstance(schedules, list) or len(schedules) < 2:
+            continue
+        first_positive_idx = _find_first_positive_index(req_row.get("tpot_laxities"))
+        if first_positive_idx is None:
+            continue
+        schedule_idx = first_positive_idx + 1
+        if schedule_idx >= len(schedules):
+            continue
+        schedule = schedules[schedule_idx]
+        try:
+            device_id = int(schedule.get("device_id", -1))
+            batch_id = int(schedule.get("batch_id", -1))
+            batch_timestamp = float(schedule.get("timestamp", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if device_id < 0 or batch_id < 0:
+            continue
+        batch_event = batch_events_by_key.get((device_id, batch_id))
+        snapshot = _nearest_replica_energy_snapshot(
+            replica_energy_series,
+            device_id=device_id,
+            timestamp=batch_timestamp,
+            tolerance_s=tolerance_s,
+        )
+        if snapshot is None:
+            continue
+        first_tpot_miss_request_count += 1
+        entry = positive_batches.setdefault(
+            (device_id, batch_id),
+            {
+                "device_id": device_id,
+                "batch_id": batch_id,
+                "timestamp": batch_timestamp,
+                "min_mhz": float(snapshot["min_mhz"]),
+                "avg_mhz": float(snapshot["avg_mhz"]),
+                "total_power_w": float(snapshot["total_power_w"]),
+                "matched_energy_delta_s": float(snapshot["delta_s"]),
+                "request_ids": [],
+                "first_positive_tpot_laxity_s": [],
+                "estimated_time_s": float(
+                    _event_value(
+                        batch_event or {},
+                        "estimated_time",
+                        _event_value(batch_event or {}, "control_estimated_time", 0.0),
+                    ) or 0.0
+                ),
+                "measured_time_s": float(
+                    _event_value(batch_event or {}, "elapsed", 0.0) or 0.0
+                ),
+            },
+        )
+        entry["request_ids"].append(str(req_row.get("req_id")))
+        try:
+            entry["first_positive_tpot_laxity_s"].append(
+                float(req_row["tpot_laxities"][first_positive_idx])
+            )
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    positive_rows = list(positive_batches.values())
+    if not positive_rows:
+        return None
+
+    all_mhz_values = [
+        float(row["min_mhz"])
+        for row in all_batches
+        if row.get("min_mhz") is not None
+    ]
+    positive_mhz_values = [
+        float(row["min_mhz"])
+        for row in positive_rows
+        if row.get("min_mhz") is not None
+    ]
+    if not all_mhz_values or not positive_mhz_values:
+        return None
+
+    observed_nominal_mhz = float(max(all_mhz_values))
+    candidate_thresholds = sorted(set(all_mhz_values))
+    baseline_positive_rate = float(len(positive_rows) / len(all_batches))
+    threshold_tradeoffs: List[Dict[str, Any]] = []
+    for threshold_mhz in candidate_thresholds:
+        flagged_batches = [
+            row for row in all_batches
+            if float(row["min_mhz"]) < float(threshold_mhz)
+        ]
+        flagged_positive_batches = [
+            row for row in positive_rows
+            if float(row["min_mhz"]) < float(threshold_mhz)
+        ]
+        flagged_count = len(flagged_batches)
+        positive_flagged_count = len(flagged_positive_batches)
+        precision = (
+            float(positive_flagged_count / flagged_count)
+            if flagged_count else None
+        )
+        threshold_tradeoffs.append({
+            "threshold_mhz": float(threshold_mhz),
+            "positive_recall": float(positive_flagged_count / len(positive_rows)),
+            "flagged_batch_rate": float(flagged_count / len(all_batches)),
+            "flagged_batch_count": int(flagged_count),
+            "flagged_positive_batch_count": int(positive_flagged_count),
+            "precision": precision,
+            "lift_vs_base": (
+                float(precision / baseline_positive_rate)
+                if precision is not None and baseline_positive_rate > 0.0
+                else None
+            ),
+        })
+
+    max_positive_recall = max(
+        float(row["positive_recall"])
+        for row in threshold_tradeoffs
+    )
+    effective_target_recall = float(min(target_positive_recall, max_positive_recall))
+    eligible_tradeoffs = [
+        row for row in threshold_tradeoffs
+        if float(row["positive_recall"]) + 1e-12 >= effective_target_recall
+    ]
+    recommended_tradeoff = None
+    if eligible_tradeoffs:
+        recommended_tradeoff = min(
+            eligible_tradeoffs,
+            key=lambda row: (
+                float(row["flagged_batch_rate"]),
+                -float(row["positive_recall"]),
+                float(row["threshold_mhz"]),
+            ),
+        )
+    else:
+        non_zero_tradeoffs = [
+            row for row in threshold_tradeoffs
+            if float(row["positive_recall"]) > 0.0
+        ]
+        if non_zero_tradeoffs:
+            recommended_tradeoff = max(
+                non_zero_tradeoffs,
+                key=lambda row: (
+                    float(row.get("lift_vs_base") or 0.0),
+                    float(row["positive_recall"]),
+                    -float(row["flagged_batch_rate"]),
+                ),
+            )
+    if recommended_tradeoff is None:
+        return None
+
+    positive_min_mhz_hist = Counter(
+        round(float(value), 6)
+        for value in positive_mhz_values
+    )
+    report = {
+        "method": (
+            "replica_min_mhz_threshold_from_first_tpot_miss_batches;"
+            " threshold triggers when observed replica min_mhz < low_mhz"
+        ),
+        "reqs_file": str(reqs_file),
+        "events_file": str(events_file),
+        "match_tolerance_s": float(tolerance_s),
+        "observed_nominal_mhz": observed_nominal_mhz,
+        "recommended_low_mhz": float(recommended_tradeoff["threshold_mhz"]),
+        "recommended_low_mhz_ratio": float(
+            recommended_tradeoff["threshold_mhz"] / observed_nominal_mhz
+        ) if observed_nominal_mhz > 0.0 else None,
+        "target_positive_recall": float(target_positive_recall),
+        "effective_target_positive_recall": effective_target_recall,
+        "max_positive_recall": float(max_positive_recall),
+        "target_positive_recall_unreachable": bool(
+            target_positive_recall > max_positive_recall + 1e-12
+        ),
+        "recommended_threshold_stats": recommended_tradeoff,
+        "all_batch_count": int(len(all_batches)),
+        "first_tpot_miss_request_count": int(first_tpot_miss_request_count),
+        "first_tpot_miss_batch_count": int(len(positive_rows)),
+        "first_tpot_miss_underpredicted_batch_count": int(sum(
+            1 for row in positive_rows
+            if float(row["measured_time_s"]) > float(row["estimated_time_s"])
+        )),
+        "baseline_positive_batch_rate": baseline_positive_rate,
+        "positive_min_mhz_histogram": [
+            {
+                "mhz": float(mhz),
+                "count": int(count),
+            }
+            for mhz, count in sorted(positive_min_mhz_hist.items())
+        ],
+        "threshold_tradeoffs": threshold_tradeoffs,
+        "note": (
+            "If recommended_low_mhz equals observed_nominal_mhz, clock alone is a weak "
+            "separator in this run and the recommended policy is effectively to trigger "
+            "on any drop below nominal."
+        ),
+    }
+    return report
 
 
 def _build_token_bins(tokens: List[int]) -> Dict[str, Any]:
@@ -4494,6 +4901,143 @@ def _mock_engine_device_mem_suffix(
     return f"_mockmem{device_mem_bytes}b"
 
 
+def _normalize_clock_monitor_device_ids(
+    device_ids: list[int] | tuple[int, ...] | None,
+) -> list[int] | None:
+    if device_ids is None:
+        return None
+    normalized = [int(device_id) for device_id in device_ids]
+    if not normalized:
+        return []
+    return normalized
+
+
+def _compact_suffix_number(value: float | int) -> str:
+    text = f"{value:g}"
+    return text.replace("-", "m").replace(".", "p")
+
+
+def _build_vllm_clock_monitor_kwargs(
+    *,
+    enabled: bool,
+    interval_s: float | None,
+    window_s: float | None,
+    slack_ms: float | None,
+    low_mhz: float | None,
+    low_mhz_ratio: float | None,
+    device_ids: list[int] | None,
+    use_prefill_estimate: bool,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    has_override = any(
+        value is not None
+        for value in (
+            interval_s,
+            window_s,
+            slack_ms,
+            low_mhz,
+            low_mhz_ratio,
+            device_ids,
+        )
+    ) or not use_prefill_estimate
+    if enabled or has_override:
+        kwargs["clock_monitor_enabled"] = bool(enabled)
+    if interval_s is not None:
+        kwargs["clock_monitor_interval_s"] = float(interval_s)
+    if window_s is not None:
+        kwargs["clock_monitor_window_s"] = float(window_s)
+    if slack_ms is not None:
+        kwargs["clock_monitor_slack_s"] = float(slack_ms) / 1000.0
+    if low_mhz is not None:
+        kwargs["clock_monitor_low_mhz"] = float(low_mhz)
+    if low_mhz_ratio is not None:
+        kwargs["clock_monitor_low_mhz_ratio"] = float(low_mhz_ratio)
+    normalized_device_ids = _normalize_clock_monitor_device_ids(device_ids)
+    if normalized_device_ids is not None:
+        kwargs["clock_monitor_device_ids"] = normalized_device_ids
+    if enabled or has_override or not use_prefill_estimate:
+        kwargs["clock_monitor_use_prefill_estimate"] = bool(
+            use_prefill_estimate)
+    return kwargs
+
+
+def _clock_monitor_suffix(clock_monitor_kwargs: dict[str, Any]) -> str:
+    if not clock_monitor_kwargs:
+        return ""
+    parts = [
+        "clkm1"
+        if bool(clock_monitor_kwargs.get("clock_monitor_enabled", False))
+        else "clkm0"
+    ]
+    if clock_monitor_kwargs.get("clock_monitor_slack_s") is not None:
+        parts.append(
+            f"sl{_compact_suffix_number(float(clock_monitor_kwargs['clock_monitor_slack_s']) * 1000.0)}ms"
+        )
+    if clock_monitor_kwargs.get("clock_monitor_low_mhz") is not None:
+        parts.append(
+            f"mhz{_compact_suffix_number(clock_monitor_kwargs['clock_monitor_low_mhz'])}"
+        )
+    if clock_monitor_kwargs.get("clock_monitor_low_mhz_ratio") is not None:
+        parts.append(
+            f"rat{_compact_suffix_number(clock_monitor_kwargs['clock_monitor_low_mhz_ratio'])}"
+        )
+    if clock_monitor_kwargs.get("clock_monitor_window_s") is not None:
+        parts.append(
+            f"win{_compact_suffix_number(clock_monitor_kwargs['clock_monitor_window_s'])}s"
+        )
+    if clock_monitor_kwargs.get("clock_monitor_interval_s") is not None:
+        parts.append(
+            f"int{_compact_suffix_number(clock_monitor_kwargs['clock_monitor_interval_s'])}s"
+        )
+    if "clock_monitor_use_prefill_estimate" in clock_monitor_kwargs:
+        parts.append(
+            "prefill1"
+            if bool(clock_monitor_kwargs["clock_monitor_use_prefill_estimate"])
+            else "prefill0"
+        )
+    device_ids = clock_monitor_kwargs.get("clock_monitor_device_ids")
+    if device_ids:
+        parts.append("dev" + "-".join(str(int(device_id)) for device_id in device_ids))
+    return "_" + "_".join(parts)
+
+
+def _clock_monitor_result_fields(
+    clock_monitor_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    normalized_device_ids = _normalize_clock_monitor_device_ids(
+        clock_monitor_kwargs.get("clock_monitor_device_ids")
+    )
+    slack_s = clock_monitor_kwargs.get("clock_monitor_slack_s")
+    return {
+        "vllm_clock_monitor_enabled": bool(
+            clock_monitor_kwargs.get("clock_monitor_enabled", False)),
+        "vllm_clock_monitor_interval_s": (
+            None if clock_monitor_kwargs.get("clock_monitor_interval_s") is None
+            else float(clock_monitor_kwargs["clock_monitor_interval_s"])
+        ),
+        "vllm_clock_monitor_window_s": (
+            None if clock_monitor_kwargs.get("clock_monitor_window_s") is None
+            else float(clock_monitor_kwargs["clock_monitor_window_s"])
+        ),
+        "vllm_clock_monitor_slack_ms": (
+            None if slack_s is None else float(slack_s) * 1000.0
+        ),
+        "vllm_clock_monitor_low_mhz": (
+            None if clock_monitor_kwargs.get("clock_monitor_low_mhz") is None
+            else float(clock_monitor_kwargs["clock_monitor_low_mhz"])
+        ),
+        "vllm_clock_monitor_low_mhz_ratio": (
+            None
+            if clock_monitor_kwargs.get("clock_monitor_low_mhz_ratio") is None
+            else float(clock_monitor_kwargs["clock_monitor_low_mhz_ratio"])
+        ),
+        "vllm_clock_monitor_device_ids": normalized_device_ids,
+        "vllm_clock_monitor_use_prefill_estimate": bool(
+            clock_monitor_kwargs.get("clock_monitor_use_prefill_estimate", True)
+        ),
+    }
+
+
 def _normalize_admission_output_length_mode(mode: str) -> str:
     normalized = str(mode).strip().lower()
     if normalized == "max":
@@ -4626,6 +5170,14 @@ def build_problems(
     baseline_decode_cap: int | None = None,
     fast_sched_baseline_bsz: int | None = None,
     mock_engine_device_mem_bytes: int | None = None,
+    vllm_clock_monitor: bool = False,
+    vllm_clock_monitor_interval_s: float | None = None,
+    vllm_clock_monitor_window_s: float | None = None,
+    vllm_clock_monitor_slack_ms: float | None = None,
+    vllm_clock_monitor_low_mhz: float | None = None,
+    vllm_clock_monitor_low_mhz_ratio: float | None = None,
+    vllm_clock_monitor_device_ids: list[int] | None = None,
+    vllm_clock_monitor_use_prefill_estimate: bool = True,
     admission_output_length_mode: str = "max",
     frontend_httpx_max_connections: int | None = None,
     frontend_httpx_max_keepalive_connections: int | None = None,
@@ -4658,6 +5210,17 @@ def build_problems(
     mock_engine_device_mem_suffix = _mock_engine_device_mem_suffix(
         mock_engine_device_mem_bytes
     )
+    clock_monitor_kwargs = _build_vllm_clock_monitor_kwargs(
+        enabled=vllm_clock_monitor,
+        interval_s=vllm_clock_monitor_interval_s,
+        window_s=vllm_clock_monitor_window_s,
+        slack_ms=vllm_clock_monitor_slack_ms,
+        low_mhz=vllm_clock_monitor_low_mhz,
+        low_mhz_ratio=vllm_clock_monitor_low_mhz_ratio,
+        device_ids=vllm_clock_monitor_device_ids,
+        use_prefill_estimate=vllm_clock_monitor_use_prefill_estimate,
+    )
+    clock_monitor_suffix = _clock_monitor_suffix(clock_monitor_kwargs)
     display_scheduling_policy = _policy_name_with_admission_output_length(
         scheduling_policy,
         admission_output_length_mode,
@@ -4690,7 +5253,7 @@ def build_problems(
         f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
         f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
         f'{session_replay_suffix}{baseline_cap_suffix}{fast_sched_baseline_bsz_suffix}'
-        f'{mock_engine_device_mem_suffix}'
+        f'{mock_engine_device_mem_suffix}{clock_monitor_suffix}'
         f'{perf_model_regression_suffix}{frontend_httpx_suffix}{best_effort_suffix}')
     requests_trace = trace
     arrival_times_trace = trace
@@ -5155,6 +5718,7 @@ def build_problems(
         routing_kwargs = routing_kwargs,
         scheduling_policy = scheduling_policy,
         scheduling_kwargs = scheduling_kwargs,
+        clock_monitor_kwargs = clock_monitor_kwargs,
         store_prefix = store_prefix,
         admission_mode = admission_mode,
         admission_output_length_mode = admission_output_length_mode,
@@ -5231,6 +5795,14 @@ def run(
     baseline_decode_cap: int | None,
     fast_sched_baseline_bsz: int | None,
     mock_engine_device_mem_bytes: int | None,
+    vllm_clock_monitor: bool,
+    vllm_clock_monitor_interval_s: float | None,
+    vllm_clock_monitor_window_s: float | None,
+    vllm_clock_monitor_slack_ms: float | None,
+    vllm_clock_monitor_low_mhz: float | None,
+    vllm_clock_monitor_low_mhz_ratio: float | None,
+    vllm_clock_monitor_device_ids: list[int] | None,
+    vllm_clock_monitor_use_prefill_estimate: bool,
     admission_output_length_mode: str,
     frontend_httpx_max_connections: int | None,
     frontend_httpx_max_keepalive_connections: int | None,
@@ -5314,6 +5886,17 @@ def run(
     print(f'fast_sched_baseline_bsz: {fast_sched_baseline_bsz}')
     print(f'mock_engine_device_mem_bytes: {mock_engine_device_mem_bytes}')
     print(
+        'vllm_clock_monitor: '
+        f'enabled={vllm_clock_monitor}, '
+        f'interval_s={vllm_clock_monitor_interval_s}, '
+        f'window_s={vllm_clock_monitor_window_s}, '
+        f'slack_ms={vllm_clock_monitor_slack_ms}, '
+        f'low_mhz={vllm_clock_monitor_low_mhz}, '
+        f'low_mhz_ratio={vllm_clock_monitor_low_mhz_ratio}, '
+        f'device_ids={vllm_clock_monitor_device_ids}, '
+        f'use_prefill_estimate={vllm_clock_monitor_use_prefill_estimate}'
+    )
+    print(
         'admission_output_length_mode: '
         f'{admission_output_length_mode}'
     )
@@ -5360,6 +5943,14 @@ def run(
                     r.get('baseline_decode_cap'),
                     r.get('fast_sched_baseline_bsz'),
                     r.get('mock_engine_device_mem_bytes'),
+                    r.get('vllm_clock_monitor_enabled', False),
+                    r.get('vllm_clock_monitor_interval_s'),
+                    r.get('vllm_clock_monitor_window_s'),
+                    r.get('vllm_clock_monitor_slack_ms'),
+                    r.get('vllm_clock_monitor_low_mhz'),
+                    r.get('vllm_clock_monitor_low_mhz_ratio'),
+                    tuple(r.get('vllm_clock_monitor_device_ids') or ()),
+                    r.get('vllm_clock_monitor_use_prefill_estimate', True),
                     r.get('admission_output_length_mode', 'max'),
                     r.get('enable_piecewise_perf_model_regression', False),
                     tuple(r.get('perf_model_piecewise_breakpoints') or ()),
@@ -5426,6 +6017,14 @@ def run(
             baseline_decode_cap,
             fast_sched_baseline_bsz,
             mock_engine_device_mem_bytes,
+            vllm_clock_monitor,
+            vllm_clock_monitor_interval_s,
+            vllm_clock_monitor_window_s,
+            vllm_clock_monitor_slack_ms,
+            vllm_clock_monitor_low_mhz,
+            vllm_clock_monitor_low_mhz_ratio,
+            tuple(vllm_clock_monitor_device_ids or ()),
+            vllm_clock_monitor_use_prefill_estimate,
             resolved_admission_output_length_mode,
             enable_piecewise_perf_model_regression,
             tuple(perf_model_piecewise_breakpoints or ()),
@@ -5474,6 +6073,28 @@ def run(
                         baseline_decode_cap=baseline_decode_cap,
                         fast_sched_baseline_bsz=fast_sched_baseline_bsz,
                         mock_engine_device_mem_bytes=mock_engine_device_mem_bytes,
+                        vllm_clock_monitor=vllm_clock_monitor,
+                        vllm_clock_monitor_interval_s=(
+                            vllm_clock_monitor_interval_s
+                        ),
+                        vllm_clock_monitor_window_s=(
+                            vllm_clock_monitor_window_s
+                        ),
+                        vllm_clock_monitor_slack_ms=(
+                            vllm_clock_monitor_slack_ms
+                        ),
+                        vllm_clock_monitor_low_mhz=(
+                            vllm_clock_monitor_low_mhz
+                        ),
+                        vllm_clock_monitor_low_mhz_ratio=(
+                            vllm_clock_monitor_low_mhz_ratio
+                        ),
+                        vllm_clock_monitor_device_ids=(
+                            vllm_clock_monitor_device_ids
+                        ),
+                        vllm_clock_monitor_use_prefill_estimate=(
+                            vllm_clock_monitor_use_prefill_estimate
+                        ),
                         admission_output_length_mode=resolved_admission_output_length_mode,
                         frontend_httpx_max_connections=frontend_httpx_max_connections,
                         frontend_httpx_max_keepalive_connections=(
@@ -5554,6 +6175,16 @@ def run(
             baseline_decode_cap=baseline_decode_cap,
             fast_sched_baseline_bsz=fast_sched_baseline_bsz,
             mock_engine_device_mem_bytes=mock_engine_device_mem_bytes,
+            vllm_clock_monitor=vllm_clock_monitor,
+            vllm_clock_monitor_interval_s=vllm_clock_monitor_interval_s,
+            vllm_clock_monitor_window_s=vllm_clock_monitor_window_s,
+            vllm_clock_monitor_slack_ms=vllm_clock_monitor_slack_ms,
+            vllm_clock_monitor_low_mhz=vllm_clock_monitor_low_mhz,
+            vllm_clock_monitor_low_mhz_ratio=vllm_clock_monitor_low_mhz_ratio,
+            vllm_clock_monitor_device_ids=vllm_clock_monitor_device_ids,
+            vllm_clock_monitor_use_prefill_estimate=(
+                vllm_clock_monitor_use_prefill_estimate
+            ),
             admission_output_length_mode=resolved_admission_output_length_mode,
             frontend_httpx_max_connections=frontend_httpx_max_connections,
             frontend_httpx_max_keepalive_connections=(
@@ -5635,6 +6266,21 @@ def run(
             'baseline_decode_cap': baseline_decode_cap,
             'fast_sched_baseline_bsz': fast_sched_baseline_bsz,
             'mock_engine_device_mem_bytes': mock_engine_device_mem_bytes,
+            'vllm_clock_monitor_enabled': vllm_clock_monitor,
+            'vllm_clock_monitor_interval_s': vllm_clock_monitor_interval_s,
+            'vllm_clock_monitor_window_s': vllm_clock_monitor_window_s,
+            'vllm_clock_monitor_slack_ms': vllm_clock_monitor_slack_ms,
+            'vllm_clock_monitor_low_mhz': vllm_clock_monitor_low_mhz,
+            'vllm_clock_monitor_low_mhz_ratio': (
+                vllm_clock_monitor_low_mhz_ratio
+            ),
+            'vllm_clock_monitor_device_ids': (
+                None if vllm_clock_monitor_device_ids is None
+                else [int(device_id) for device_id in vllm_clock_monitor_device_ids]
+            ),
+            'vllm_clock_monitor_use_prefill_estimate': (
+                vllm_clock_monitor_use_prefill_estimate
+            ),
             'admission_output_length_mode': resolved_admission_output_length_mode,
             'admission_output_length': problems[0].admission_output_length,
             'enable_session_replay': enable_session_replay,
@@ -5737,20 +6383,56 @@ def run(
         if 'empirical_scheduling_overhead_summary' in best_result.results:
             result['empirical_scheduling_overhead_summary'] = (
                 best_result.results['empirical_scheduling_overhead_summary'])
+
+        best_result_reqs_file = _reqs_file_from_event_prefix(
+            best_result.event_file
+        )
+        canonical_reqs_file = Path(f'{problems[0].store_prefix}.reqs.jsonl')
+        clock_monitor_recommendation = None
+        if best_result_reqs_file.exists() and os.path.exists(best_result.event_file):
+            try:
+                clock_monitor_recommendation = (
+                    _recommend_clock_monitor_low_mhz_from_trace(
+                        reqs_file=best_result_reqs_file,
+                        events_file=best_result.event_file,
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to compute clock-monitor recommendation for %s: %r",
+                    best_result.event_file,
+                    exc,
+                )
+        if clock_monitor_recommendation is not None:
+            result['vllm_clock_monitor_recommendation'] = (
+                clock_monitor_recommendation
+            )
+            result['vllm_clock_monitor_recommendation_file'] = (
+                f'{problems[0].store_prefix}.clock_monitor_recommendation.json'
+            )
         if concise_logging:
             _print_concise_result_row(result, trace_used=trace)
         else:
             batch_token_summary_line = _format_batch_token_summary_line(result)
             if batch_token_summary_line is not None:
                 print(batch_token_summary_line)
+            if clock_monitor_recommendation is not None:
+                recommended_low_mhz = clock_monitor_recommendation.get(
+                    'recommended_low_mhz')
+                threshold_stats = clock_monitor_recommendation.get(
+                    'recommended_threshold_stats',
+                    {},
+                )
+                print(
+                    'Clock-monitor recommendation:',
+                    f"low_mhz={recommended_low_mhz}",
+                    f"positive_recall={threshold_stats.get('positive_recall')}",
+                    f"flagged_batch_rate={threshold_stats.get('flagged_batch_rate')}",
+                    f"nominal_mhz={clock_monitor_recommendation.get('observed_nominal_mhz')}",
+                )
             print('--Result--')
             pprint.pprint(result)
             print('--End of Result--')
-
-        best_result_reqs_file = _reqs_file_from_event_prefix(
-            best_result.event_file
-        )
-        canonical_reqs_file = Path(f'{problems[0].store_prefix}.reqs.jsonl')
 
         for surfix in [
             'events',
@@ -5791,6 +6473,22 @@ def run(
             dst = f'{problems[0].store_prefix}.{figure_suffix}'
             if os.path.exists(src):
                 os.system(f'cp {src} {dst}')
+        if clock_monitor_recommendation is not None:
+            clock_monitor_recommendation = dict(clock_monitor_recommendation)
+            clock_monitor_recommendation['reqs_file'] = str(canonical_reqs_file)
+            clock_monitor_recommendation['events_file'] = (
+                f'{problems[0].store_prefix}.events.jsonl'
+            )
+            result['vllm_clock_monitor_recommendation'] = (
+                clock_monitor_recommendation
+            )
+            recommendation_path = Path(
+                f'{problems[0].store_prefix}.clock_monitor_recommendation.json'
+            )
+            recommendation_path.write_text(
+                json.dumps(clock_monitor_recommendation, indent=2, sort_keys=True),
+                encoding='utf-8',
+            )
 
         report_slo_grid_summary = None
         if not disable_independent_slo_grid_report:
@@ -6085,6 +6783,66 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
+        '--vllm_clock_monitor',
+        dest='vllm_clock_monitor',
+        action='store_true',
+        help=(
+            'enable the scheduler-side GPU clock monitor for vLLM policies; '
+            'when throttling is detected it applies additive slack to the '
+            'control perf model'
+        ),
+    )
+    parser.add_argument(
+        '--disable_vllm_clock_monitor',
+        dest='vllm_clock_monitor',
+        action='store_false',
+        help='disable the scheduler-side GPU clock monitor for vLLM policies',
+    )
+    parser.set_defaults(vllm_clock_monitor=False)
+    parser.add_argument(
+        '--vllm_clock_monitor_interval_s',
+        type=float,
+        default=None,
+        help='override the clock-monitor polling interval in seconds',
+    )
+    parser.add_argument(
+        '--vllm_clock_monitor_window_s',
+        type=float,
+        default=None,
+        help='override the clock-monitor rolling averaging window in seconds',
+    )
+    parser.add_argument(
+        '--vllm_clock_monitor_slack_ms',
+        type=float,
+        default=None,
+        help='override the additive slack applied while throttled, in milliseconds',
+    )
+    parser.add_argument(
+        '--vllm_clock_monitor_low_mhz',
+        type=float,
+        default=None,
+        help='absolute SM clock threshold in MHz used to mark throttling',
+    )
+    parser.add_argument(
+        '--vllm_clock_monitor_low_mhz_ratio',
+        type=float,
+        default=None,
+        help='ratio of nominal SM clock used to derive the throttling threshold',
+    )
+    parser.add_argument(
+        '--vllm_clock_monitor_device_ids',
+        type=int,
+        nargs='+',
+        default=None,
+        help='visible CUDA device ids to monitor; defaults to all visible devices',
+    )
+    parser.add_argument(
+        '--disable_vllm_clock_monitor_prefill_estimate',
+        action='store_true',
+        default=False,
+        help='leave the attainability gate on pure deadline checks even when the clock monitor is enabled',
+    )
+    parser.add_argument(
         '--admission_output_length_mode',
         type=str,
         default='max',
@@ -6209,6 +6967,28 @@ if __name__ == '__main__':
                 mock_engine_device_mem_bytes = (
                     args.mock_engine_device_mem_bytes
                 ),
+                vllm_clock_monitor = args.vllm_clock_monitor,
+                vllm_clock_monitor_interval_s = (
+                    args.vllm_clock_monitor_interval_s
+                ),
+                vllm_clock_monitor_window_s = (
+                    args.vllm_clock_monitor_window_s
+                ),
+                vllm_clock_monitor_slack_ms = (
+                    args.vllm_clock_monitor_slack_ms
+                ),
+                vllm_clock_monitor_low_mhz = (
+                    args.vllm_clock_monitor_low_mhz
+                ),
+                vllm_clock_monitor_low_mhz_ratio = (
+                    args.vllm_clock_monitor_low_mhz_ratio
+                ),
+                vllm_clock_monitor_device_ids = (
+                    args.vllm_clock_monitor_device_ids
+                ),
+                vllm_clock_monitor_use_prefill_estimate = (
+                    not args.disable_vllm_clock_monitor_prefill_estimate
+                ),
                 admission_output_length_mode = (
                     args.admission_output_length_mode
                 ),
@@ -6305,6 +7085,28 @@ if __name__ == '__main__':
                 'fast_sched_baseline_bsz': args.fast_sched_baseline_bsz,
                 'mock_engine_device_mem_bytes': (
                     args.mock_engine_device_mem_bytes
+                ),
+                'vllm_clock_monitor': args.vllm_clock_monitor,
+                'vllm_clock_monitor_interval_s': (
+                    args.vllm_clock_monitor_interval_s
+                ),
+                'vllm_clock_monitor_window_s': (
+                    args.vllm_clock_monitor_window_s
+                ),
+                'vllm_clock_monitor_slack_ms': (
+                    args.vllm_clock_monitor_slack_ms
+                ),
+                'vllm_clock_monitor_low_mhz': (
+                    args.vllm_clock_monitor_low_mhz
+                ),
+                'vllm_clock_monitor_low_mhz_ratio': (
+                    args.vllm_clock_monitor_low_mhz_ratio
+                ),
+                'vllm_clock_monitor_device_ids': (
+                    args.vllm_clock_monitor_device_ids
+                ),
+                'vllm_clock_monitor_use_prefill_estimate': (
+                    not args.disable_vllm_clock_monitor_prefill_estimate
                 ),
                 'admission_output_length_mode': (
                     args.admission_output_length_mode

@@ -7,6 +7,7 @@ import copy
 import math
 import SLOsServe_C
 
+from SLOsServe.decode_length_predictor import DecodeLengthPredictorPlugin
 from SLOsServe.perf_model import PerfModel
 from SLOsServe.router.execplan_bus import ExecPlan
 from SLOsServe.router.macro import DUMP_SCHS, DUMP_ADM
@@ -76,6 +77,7 @@ class BatchPlanner:
     _max_lookahead: int = 5000
     _block_size: int
     _max_decode_length: int
+    _decode_length_predictor: DecodeLengthPredictorPlugin | None = None
     _max_batch_size: int | None = None
     _profile_events: list = field(default_factory=list)
     _is_oracle: bool = False
@@ -237,6 +239,85 @@ class BatchPlanner:
         batch.unscheduled_tokens += reclaimed_tokens
         return batch, memory_limited
 
+    def _get_decode_length_upper_bound(
+        self,
+        req: Request,
+        *,
+        predictor_override: DecodeLengthPredictorPlugin | None = None,
+    ) -> int:
+        if req.prefill_only:
+            return 0
+        predictor = (
+            self._decode_length_predictor
+            if predictor_override is None else predictor_override
+        )
+        if predictor is not None:
+            return max(0, int(predictor.predict_length(req)))
+        if self._is_oracle:
+            assert req.output_length is not None
+            return int(req.output_length)
+        return int(self._max_decode_length)
+
+    def _build_request(
+        self,
+        *,
+        request_id: str,
+        num_prompt_tokens: int,
+        num_computed_tokens: int,
+        prefill_ddl: float,
+        slo_tpot: float,
+        prefill_only: bool = False,
+        kv_ready_time: float | None = None,
+        service_tier: str | None = None,
+        output_length: int | None = None,
+    ) -> Request:
+        assert not self._is_oracle or output_length is not None
+        if service_tier is None:
+            service_tier = "default"
+        return Request(
+            request_id=request_id,
+            num_prompt_tokens=num_prompt_tokens,
+            num_computed_tokens=num_computed_tokens,
+            prefill_ddl=prefill_ddl,
+            slo_tpot=slo_tpot,
+            prefill_only=prefill_only,
+            kv_ready_time=kv_ready_time,
+            service_tier=service_tier,
+            output_length=output_length,
+        )
+
+    def _register_request_obj(self, new_req: Request) -> None:
+        self._requests[new_req.request_id] = new_req
+        self._admitted_requests.append(new_req.request_id)
+        self._last_infeasible_reason = None
+
+    def register_request(
+        self,
+        *,
+        request_id: str,
+        num_prompt_tokens: int,
+        num_computed_tokens: int,
+        prefill_ddl: float,
+        slo_tpot: float,
+        prefill_only: bool = False,
+        kv_ready_time: float | None = None,
+        service_tier: str | None = None,
+        output_length: int | None = None,
+    ) -> Request:
+        new_req = self._build_request(
+            request_id=request_id,
+            num_prompt_tokens=num_prompt_tokens,
+            num_computed_tokens=num_computed_tokens,
+            prefill_ddl=prefill_ddl,
+            slo_tpot=slo_tpot,
+            prefill_only=prefill_only,
+            kv_ready_time=kv_ready_time,
+            service_tier=service_tier,
+            output_length=output_length,
+        )
+        self._register_request_obj(new_req)
+        return new_req
+
     def _ensure_cpp_planner(self, tpot: float):
         if self._adm_ctrler_tpot is not None and abs(self._adm_ctrler_tpot - tpot) < 1e-9:
             return
@@ -327,12 +408,19 @@ class BatchPlanner:
         except Exception:
             logger.exception("Failed to dump anomalous cpp schedule inputs")
 
-    def _to_cpp_request(self, req: Request, *, is_new_req: bool, now: float):
+    def _to_cpp_request(
+        self,
+        req: Request,
+        *,
+        is_new_req: bool,
+        now: float,
+        predictor_override: DecodeLengthPredictorPlugin | None = None,
+    ):
         # Keep the same memory model as Python _refresh.
-        if req.prefill_only:
-            max_decode_length = 0
-        else:
-            max_decode_length = self._max_decode_length if not self._is_oracle else req.output_length
+        max_decode_length = self._get_decode_length_upper_bound(
+            req,
+            predictor_override=predictor_override,
+        )
         assert max_decode_length is not None
         mem = math.ceil((max_decode_length + req.num_prompt_tokens - req.num_computed_tokens) / self._block_size)
         prefill_mem = math.ceil(req.num_prompt_tokens / self._block_size)
@@ -358,6 +446,7 @@ class BatchPlanner:
         new_req: Request,
         now: float,
         num_free_blocks_override: int | None = None,
+        predictor_override: DecodeLengthPredictorPlugin | None = None,
     ) -> tuple[bool, str | None]:
         start = time.time()
         existing_reqs = list(self._requests.values())
@@ -370,10 +459,22 @@ class BatchPlanner:
         tpot = min(r.slo_tpot for r in reqs) if reqs else new_req.slo_tpot
         self._ensure_cpp_planner(tpot)
         c_reqs = [
-            self._to_cpp_request(r, is_new_req=False, now=now)
+            self._to_cpp_request(
+                r,
+                is_new_req=False,
+                now=now,
+                predictor_override=predictor_override,
+            )
             for r in existing_reqs
         ]
-        c_reqs.append(self._to_cpp_request(new_req, is_new_req=True, now=now))
+        c_reqs.append(
+            self._to_cpp_request(
+                new_req,
+                is_new_req=True,
+                now=now,
+                predictor_override=predictor_override,
+            )
+        )
         num_free_blocks = (
             self._num_free_blocks
             if num_free_blocks_override is None
@@ -424,6 +525,41 @@ class BatchPlanner:
         if reject_reason not in {"MEM", "CMP", "UNKNOWN"}:
             reject_reason = "UNKNOWN"
         return False, reject_reason
+
+    def probe_request(
+        self,
+        *,
+        request_id: str,
+        num_prompt_tokens: int,
+        num_computed_tokens: int,
+        prefill_ddl: float,
+        slo_tpot: float,
+        prefill_only: bool = False,
+        kv_ready_time: float | None = None,
+        service_tier: str | None = None,
+        output_length: int | None = None,
+        num_free_blocks_override: int | None = None,
+        predictor_override: DecodeLengthPredictorPlugin | None = None,
+    ) -> tuple[bool, str | None, Request]:
+        new_req = self._build_request(
+            request_id=request_id,
+            num_prompt_tokens=num_prompt_tokens,
+            num_computed_tokens=num_computed_tokens,
+            prefill_ddl=prefill_ddl,
+            slo_tpot=slo_tpot,
+            prefill_only=prefill_only,
+            kv_ready_time=kv_ready_time,
+            service_tier=service_tier,
+            output_length=output_length,
+        )
+        now = self._next_batch_time if self._next_batch_time is not None else self._now()
+        feasible, reject_reason = self._cpp_feasible_with_new(
+            new_req,
+            now,
+            num_free_blocks_override=num_free_blocks_override,
+            predictor_override=predictor_override,
+        )
+        return feasible, reject_reason, new_req
     
     def add_request(self, 
                         *,
@@ -438,38 +574,33 @@ class BatchPlanner:
                         service_tier: str | None = None,
                         output_length: int | None = None,
                         num_free_blocks_override: int | None = None):
-        assert not self._is_oracle or output_length is not None
         if service_tier is None:
             service_tier = "best_effort" if must_admit else "default"
-        new_req = Request(request_id = request_id, 
-                          num_prompt_tokens=num_prompt_tokens,
-                          num_computed_tokens=num_computed_tokens,
-                          prefill_ddl = prefill_ddl, 
-                          slo_tpot = slo_tpot, 
-                          prefill_only = prefill_only,
-                          kv_ready_time = kv_ready_time,
-                          service_tier = service_tier,
-                          output_length = output_length)
-        now = self._next_batch_time if self._next_batch_time is not None else self._now()
-        feasible, reject_reason = self._cpp_feasible_with_new(
-            new_req,
-            now,
+        feasible, reject_reason, new_req = self.probe_request(
+            request_id=request_id,
+            num_prompt_tokens=num_prompt_tokens,
+            num_computed_tokens=num_computed_tokens,
+            prefill_ddl=prefill_ddl,
+            slo_tpot=slo_tpot,
+            prefill_only=prefill_only,
+            kv_ready_time=kv_ready_time,
+            service_tier=service_tier,
+            output_length=output_length,
             num_free_blocks_override=num_free_blocks_override,
         )
         if (not feasible) and (not must_admit):
             self._last_infeasible_reason = reject_reason or "UNKNOWN"
         else:
-            self._requests[request_id] = new_req
+            self._register_request_obj(new_req)
             if not feasible:
                 logger.info(f'[BatchPlanner] Forced admission of {request_id}')
-            self._admitted_requests.append(request_id)
-            self._last_infeasible_reason = None
         return must_admit or feasible
 
     def _cpp_feasible(
         self,
         now: float,
         num_free_blocks_override: int | None = None,
+        predictor_override: DecodeLengthPredictorPlugin | None = None,
     ) -> tuple[bool, set[str]]:
         reqs = [
             req for req in self._requests.values()
@@ -481,7 +612,12 @@ class BatchPlanner:
         tpot = min(r.slo_tpot for r in reqs)
         self._ensure_cpp_planner(tpot)
         c_reqs = [
-            self._to_cpp_request(r, is_new_req=False, now=now)
+            self._to_cpp_request(
+                r,
+                is_new_req=False,
+                now=now,
+                predictor_override=predictor_override,
+            )
             for r in reqs
         ]
         num_free_blocks = (
@@ -829,10 +965,7 @@ class BatchPlanner:
         # TODO: Optimize the memory check, the current logic is that _num_free_blocks should be greator than the per-request overprovision for remained blocks and the new_request's size
         mem_ub = 0
         for req in self._requests.values():
-            if req.prefill_only:
-                max_decode_length = 0
-            else:
-                max_decode_length = self._max_decode_length if not self._is_oracle else req.output_length
+            max_decode_length = self._get_decode_length_upper_bound(req)
             assert max_decode_length is not None
             mem_ub += math.ceil((max_decode_length + req.num_prompt_tokens - req.num_computed_tokens) / self._block_size)
                 

@@ -12,7 +12,14 @@ except ModuleNotFoundError:
     sys.modules["dotenv"] = types.ModuleType("dotenv")
 
 from Dataset.dataset import ArrivalTimes, Request, Requests
-from SLOsServe.analysis.headroom_analysis import EventQueue, Instance, RequestInstance
+from SLOsServe.analysis.headroom_analysis import (
+    EventQueue,
+    Instance,
+    RequestInstance,
+    build_decode_length_predictor_plugin,
+    normalize_admission_policy,
+    normalize_prediction_mode,
+)
 
 
 def _load_requests(
@@ -60,7 +67,8 @@ def _run_once(
     n_req: int,
     load_scale: float,
     kv_cache_mem_gb: float,
-    is_oracle: bool,
+    admission_policy: str,
+    prediction_mode: str,
     include_thinking_in_output: bool,
 ) -> dict:
     arrival_times, requests, base_rps = _load_requests(
@@ -75,6 +83,13 @@ def _run_once(
 
     kv_cache_mem = kv_cache_mem_gb * 1e9
     max_decode_length = max(req.output_length for req in requests)
+    normalized_prediction_mode = normalize_prediction_mode(prediction_mode)
+    decode_length_predictor = build_decode_length_predictor_plugin(
+        requests,
+        prediction_mode=normalized_prediction_mode,
+        fixed_length=max_decode_length,
+        workload_type=length_pattern,
+    )
 
     event_queue = EventQueue()
     instance = Instance(
@@ -86,7 +101,9 @@ def _run_once(
         model_name=model_name,
         kv_cache_mem=kv_cache_mem,
         max_decode_length=max_decode_length,
-        is_oracle=is_oracle,
+        is_oracle=(normalized_prediction_mode == "oracle"),
+        admission_policy=normalize_admission_policy(admission_policy),
+        decode_length_predictor=decode_length_predictor,
     )
     for i, (t, req) in enumerate(zip(arrival_times, requests)):
         event_queue.push(
@@ -96,23 +113,27 @@ def _run_once(
             obj=RequestInstance(req, f"req-{i}", mode="normal"),
         )
 
-    rejected = 0
-    finished = 0
     while len(event_queue):
         now, event_type, device_id, obj = event_queue.pop()
         if event_type == "arrival":
-            if not instance.add_request(now, obj):
-                rejected += 1
+            instance.add_request(now, obj)
         elif event_type == "batch_finish":
             instance.on_batch_finish(now, obj)
         elif event_type == "request_finish":
-            finished += 1
+            pass
         else:
             raise RuntimeError(f"Unsupported event_type={event_type}")
 
     offered_rps = base_rps * load_scale
+    metrics = instance.get_metrics()
+    goodput_rps = (
+        metrics["goodput_requests"] / len(requests) * offered_rps
+        if requests else 0.0
+    )
     row = {
-        "policy": "oracle_mem" if is_oracle else "baseline",
+        "policy": f"{normalize_admission_policy(admission_policy)}-{decode_length_predictor.label}",
+        "admission_policy": normalize_admission_policy(admission_policy),
+        "prediction_mode": decode_length_predictor.label,
         "arrival_pattern": arrival_pattern,
         "length_pattern": length_pattern,
         "model_name": model_name,
@@ -124,10 +145,23 @@ def _run_once(
         "offered_rps": offered_rps,
         "kv_cache_mem_gb": kv_cache_mem_gb,
         "include_thinking_in_output": int(include_thinking_in_output),
-        "rejected": rejected,
-        "finished": finished,
-        "violation_rate": rejected / len(requests),
-        "goodput_rps": finished / len(requests) * offered_rps,
+        "admitted": int(metrics["admitted_requests"]),
+        "rejected": int(metrics["rejected_requests"]),
+        "finished": int(metrics["finished_requests"]),
+        "predicted_length_mean": float(metrics["predicted_length_mean"]),
+        "predicted_length_p95": float(metrics["predicted_length_p95"]),
+        "actual_decode_length_mean": float(metrics["actual_decode_length_mean"]),
+        "actual_decode_length_p95": float(metrics["actual_decode_length_p95"]),
+        "false_rejects": int(metrics["false_rejects"]),
+        "false_reject_rate": float(metrics["false_reject_rate"]),
+        "false_admits": int(metrics["false_admits"]),
+        "false_admit_rate": float(metrics["false_admit_rate"]),
+        "peak_kv_used_blocks": int(metrics["peak_kv_used_blocks"]),
+        "peak_kv_usage_ratio": float(metrics["peak_kv_usage_ratio"]),
+        "slo_violations": int(metrics["slo_violations"]),
+        "violation_rate": float(metrics["slo_violation_rate"]),
+        "goodput_requests": int(metrics["goodput_requests"]),
+        "goodput_rps": goodput_rps,
         "fail_comp": int(instance.failure_reasons.get("comp", 0)),
         "fail_mem": int(instance.failure_reasons.get("mem", 0)),
         "fail_oom": int(instance.failure_reasons.get("oom", 0)),
@@ -146,6 +180,9 @@ def _print_rows(rows: list[dict]) -> None:
             f"goodput={row['goodput_rps']:.6f}rps "
             f"rej={row['rejected']} "
             f"fin={row['finished']} "
+            f"fr={row['false_reject_rate']:.3f} "
+            f"fa={row['false_admit_rate']:.3f} "
+            f"peak_kv={row['peak_kv_usage_ratio']:.3f} "
             f"fail(comp={row['fail_comp']},mem={row['fail_mem']},oom={row['fail_oom']})"
         )
 
@@ -161,7 +198,7 @@ def _write_csv(rows: list[dict], csv_path: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run a baseline vs oracle admission probe on a paired arrival/length trace."
+        description="Run memory-feasibility admission probes on a paired arrival/length trace."
     )
     parser.add_argument("--arrival-pattern", default="azure_chat_23")
     parser.add_argument("--length-pattern", default="deepseek-r1")
@@ -172,6 +209,18 @@ def main() -> None:
     parser.add_argument("--n-req", type=int, default=1000)
     parser.add_argument("--load-scales", type=float, nargs="+", default=[0.05])
     parser.add_argument("--kv-cache-mem-gb", type=float, nargs="+", default=[20.0, 60.0])
+    parser.add_argument(
+        "--admission-policies",
+        nargs="+",
+        default=["slopacker"],
+        help="Supported: slopacker, conservative_arrival_reservation",
+    )
+    parser.add_argument(
+        "--prediction-modes",
+        nargs="+",
+        default=["fixed", "oracle"],
+        help="Supported: fixed, oracle, mean, q90, q95",
+    )
     parser.add_argument("--include-thinking-in-output", action="store_true")
     parser.add_argument("--csv-path", default="")
     args = parser.parse_args()
@@ -183,22 +232,24 @@ def main() -> None:
     rows: list[dict] = []
     for kv_cache_mem_gb in args.kv_cache_mem_gb:
         for load_scale in args.load_scales:
-            for is_oracle in (False, True):
-                Instance._printed_kv_cache_info = False
-                row = _run_once(
-                    arrival_pattern=args.arrival_pattern,
-                    length_pattern=args.length_pattern,
-                    model_name=args.model_name,
-                    slo_ttft_scale=args.slo_ttft_scale,
-                    slo_ttft_constant=args.slo_ttft_constant,
-                    slo_tpot=args.slo_tpot,
-                    n_req=args.n_req,
-                    load_scale=load_scale,
-                    kv_cache_mem_gb=kv_cache_mem_gb,
-                    is_oracle=is_oracle,
-                    include_thinking_in_output=include_thinking_in_output,
-                )
-                rows.append(row)
+            for admission_policy in args.admission_policies:
+                for prediction_mode in args.prediction_modes:
+                    Instance._printed_kv_cache_info = False
+                    row = _run_once(
+                        arrival_pattern=args.arrival_pattern,
+                        length_pattern=args.length_pattern,
+                        model_name=args.model_name,
+                        slo_ttft_scale=args.slo_ttft_scale,
+                        slo_ttft_constant=args.slo_ttft_constant,
+                        slo_tpot=args.slo_tpot,
+                        n_req=args.n_req,
+                        load_scale=load_scale,
+                        kv_cache_mem_gb=kv_cache_mem_gb,
+                        admission_policy=admission_policy,
+                        prediction_mode=prediction_mode,
+                        include_thinking_in_output=include_thinking_in_output,
+                    )
+                    rows.append(row)
 
     _print_rows(rows)
     if args.csv_path:
