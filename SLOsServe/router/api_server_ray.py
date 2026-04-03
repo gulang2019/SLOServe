@@ -2735,7 +2735,7 @@ def create_router(t: str, n_devices: int, router_kwargs: str | dict[str, Any]) -
         router_kwargs = json.loads(router_kwargs)
     if t == 'round_robin':
         return RoundRobinRouter(n_devices, router_kwargs)
-    elif t == 'round_robin_session':
+    elif t == 'round_robin_session' or t.startswith('round_robin_session-'):
         return RoundRobinRouter(
             n_devices,
             dict(router_kwargs) | {'sticky_sessions': True},

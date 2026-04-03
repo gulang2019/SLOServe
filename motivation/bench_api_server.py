@@ -4027,7 +4027,11 @@ def _get_rr_disagg_server_roles(
     routing_policy: str,
     routing_kwargs: Dict[str, Any] | str | None,
 ) -> Dict[str, List[int]] | None:
-    if routing_policy != "round_robin":
+    if routing_policy not in {
+        "round_robin",
+        "round_robin_session",
+        "round_robin_session-disagg",
+    }:
         return None
 
     routing_kwargs_dict = _routing_kwargs_to_dict(routing_kwargs)
@@ -5233,7 +5237,12 @@ def _supports_rr_workload_slicing(
     routing_policy: str,
     routing_kwargs: dict[str, Any] | str | None,
 ) -> bool:
-    if routing_policy not in {"round_robin", "round_robin_retry", "round_robin_session"}:
+    if routing_policy not in {
+        "round_robin",
+        "round_robin_retry",
+        "round_robin_session",
+        "round_robin_session-disagg",
+    }:
         return False
     return not _routing_kwargs_to_dict(routing_kwargs).get("is_pd_disagg", False)
 
@@ -5929,13 +5938,26 @@ def build_problems(
         sch_kwargs['admission_max_decoding_length'] = admission_output_length
     
     routing_kwargss = []
-    if routing_policy == 'round_robin_session':
+    if routing_policy.startswith('round_robin_session'):
+        _args = routing_policy.split('-')
         admission_mode = "off" # w/ round robin, we let each request ends
+        extra_kwargs = {}
+        if len(_args) >= 2:
+            assert _args[1] == 'disagg'
+            group_size = n_device
+            opt_n_prefill_devices = int(optimal_prefill_ratio * group_size)
+            opt_n_prefill_devices = min(max(opt_n_prefill_devices, 1), n_device - 1)
+            print(f'opt_n_prefill_devices: {opt_n_prefill_devices}')
+            extra_kwargs = {
+                'group_size': group_size,
+                'is_pd_disagg': True,
+                'n_prefill_per_group': opt_n_prefill_devices,
+            }
         routing_kwargss = [{
             "enable_rerouting": True,
             "enable_rescheduling": False,
             "sticky_sessions": True,
-        }]
+        } | extra_kwargs]
     elif 'round_robin' in routing_policy:
         _args = routing_policy.split('-')
         routing_policy = 'round_robin'
@@ -6209,7 +6231,7 @@ def build_problems(
 
 
 SCHEDULING_POLICIES = ['vllm-no_rejection', 'vllm-fcfs', 'vllm-edf', 'slosserve-edf', 'slosserve-dp']
-ROUTING_POLICIES = ['round_robin', 'round_robin_session', 'disaggregated', 'disaggregated-edf', 'slosserve', 'renaming']
+ROUTING_POLICIES = ['round_robin', 'round_robin_session', 'round_robin_session-disagg', 'disaggregated', 'disaggregated-edf', 'slosserve', 'renaming']
 
 def run(
     model_name: str,

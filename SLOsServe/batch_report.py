@@ -21,7 +21,7 @@ def count_clients_spec(spec: str) -> int:
 
 def policy_supports_partial_rr(policy: str) -> bool:
     routing = policy.split(":", 1)[0]
-    return routing in {"round_robin", "round_robin_retry"}
+    return routing in {"round_robin", "round_robin_retry", "round_robin_session"}
 
 
 def parse_window_seconds(window: str) -> float:
