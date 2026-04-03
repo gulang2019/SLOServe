@@ -15,7 +15,8 @@ from SLOsServe.router.mock_engine import (_get_scheduler_exec_plan_snapshot,
 
 
 def _make_router_request(request_id: str, *, session_id: str | None = None,
-                         cached_tokens: int = 0):
+                         cached_tokens: int = 0,
+                         service_tier: str = "default"):
     payload = {
         "model": "test-model",
         "prompt": [1, 2, 3],
@@ -28,6 +29,8 @@ def _make_router_request(request_id: str, *, session_id: str | None = None,
             "profit": 1.0,
             "slo_tpot": 0.05,
             "cached_tokens": cached_tokens,
+            "service_tier": service_tier,
+            "initial_service_tier": service_tier,
         },
     }
     if session_id is not None:
@@ -50,8 +53,13 @@ def test_make_engine_state_entry_defaults_load_stats():
     assert entry["exec_plan"] is plan
     assert entry["load_stats"] == {
         "num_free_blocks": 0,
+        "effective_num_free_blocks": 0,
         "n_waitings": 0,
         "n_running": 0,
+        "n_regular_waitings": 0,
+        "n_regular_running": 0,
+        "n_best_effort_waitings": 0,
+        "n_best_effort_running": 0,
     }
 
 
@@ -95,8 +103,26 @@ def test_extract_load_statistics_requires_load_stats_for_all_devices():
     )
 
     assert extract_load_statistics(states, 2) == [
-        {"num_free_blocks": 7, "n_waitings": 2, "n_running": 1},
-        {"num_free_blocks": 5, "n_waitings": 0, "n_running": 4},
+        {
+            "num_free_blocks": 7,
+            "effective_num_free_blocks": 0,
+            "n_waitings": 2,
+            "n_running": 1,
+            "n_regular_waitings": 0,
+            "n_regular_running": 0,
+            "n_best_effort_waitings": 0,
+            "n_best_effort_running": 0,
+        },
+        {
+            "num_free_blocks": 5,
+            "effective_num_free_blocks": 0,
+            "n_waitings": 0,
+            "n_running": 4,
+            "n_regular_waitings": 0,
+            "n_regular_running": 0,
+            "n_best_effort_waitings": 0,
+            "n_best_effort_running": 0,
+        },
     ]
 
 
@@ -112,8 +138,13 @@ def test_mock_engine_scheduler_snapshots_have_safe_defaults():
     assert _get_scheduler_exec_plan_snapshot(scheduler) is plan
     assert _get_scheduler_load_stats_snapshot(scheduler) == {
         "num_free_blocks": 11,
+        "effective_num_free_blocks": 0,
         "n_waitings": 2,
         "n_running": 1,
+        "n_regular_waitings": 0,
+        "n_regular_running": 0,
+        "n_best_effort_waitings": 0,
+        "n_best_effort_running": 0,
     }
 
 
@@ -127,9 +158,25 @@ def test_mock_engine_scheduler_snapshot_prefers_explicit_method():
 
     assert _get_scheduler_load_stats_snapshot(scheduler) == {
         "num_free_blocks": 9,
+        "effective_num_free_blocks": 0,
         "n_waitings": 4,
         "n_running": 3,
+        "n_regular_waitings": 0,
+        "n_regular_running": 0,
+        "n_best_effort_waitings": 0,
+        "n_best_effort_running": 0,
     }
+
+
+def test_mock_engine_scheduler_snapshot_prefers_router_exec_plan():
+    regular_plan = ExecPlan(batch_times=[3.0], num_free_blocks=9)
+    mixed_plan = ExecPlan(batch_times=[1.0], num_free_blocks=2)
+    scheduler = SimpleNamespace(
+        get_router_exec_plan=lambda: regular_plan,
+        get_exec_plan=lambda: mixed_plan,
+    )
+
+    assert _get_scheduler_exec_plan_snapshot(scheduler) is regular_plan
 
 
 @pytest.mark.asyncio
@@ -156,8 +203,26 @@ async def test_request_pool_get_load_statistics_prefers_bus_state():
     stats = await api_server_ray.RequestPool.get_load_statistics(pool)
 
     assert stats == [
-        {"num_free_blocks": 8, "n_waitings": 1, "n_running": 2},
-        {"num_free_blocks": 6, "n_waitings": 0, "n_running": 3},
+        {
+            "num_free_blocks": 8,
+            "effective_num_free_blocks": 0,
+            "n_waitings": 1,
+            "n_running": 2,
+            "n_regular_waitings": 0,
+            "n_regular_running": 0,
+            "n_best_effort_waitings": 0,
+            "n_best_effort_running": 0,
+        },
+        {
+            "num_free_blocks": 6,
+            "effective_num_free_blocks": 0,
+            "n_waitings": 0,
+            "n_running": 3,
+            "n_regular_waitings": 0,
+            "n_regular_running": 0,
+            "n_best_effort_waitings": 0,
+            "n_best_effort_running": 0,
+        },
     ]
 
 
@@ -167,15 +232,51 @@ async def test_request_pool_get_load_statistics_falls_back_to_rpc():
     pool.n_devices = 2
     pool._get_engine_states = AsyncMock(return_value={})
     pool._get_load_statistics_from_engines = AsyncMock(return_value=[
-        {"num_free_blocks": 3, "n_waitings": 2, "n_running": 1},
-        {"num_free_blocks": 4, "n_waitings": 1, "n_running": 0},
+        {
+            "num_free_blocks": 3,
+            "effective_num_free_blocks": 3,
+            "n_waitings": 2,
+            "n_running": 1,
+            "n_regular_waitings": 2,
+            "n_regular_running": 1,
+            "n_best_effort_waitings": 0,
+            "n_best_effort_running": 0,
+        },
+        {
+            "num_free_blocks": 4,
+            "effective_num_free_blocks": 4,
+            "n_waitings": 1,
+            "n_running": 0,
+            "n_regular_waitings": 1,
+            "n_regular_running": 0,
+            "n_best_effort_waitings": 0,
+            "n_best_effort_running": 0,
+        },
     ])
 
     stats = await api_server_ray.RequestPool.get_load_statistics(pool)
 
     assert stats == [
-        {"num_free_blocks": 3, "n_waitings": 2, "n_running": 1},
-        {"num_free_blocks": 4, "n_waitings": 1, "n_running": 0},
+        {
+            "num_free_blocks": 3,
+            "effective_num_free_blocks": 3,
+            "n_waitings": 2,
+            "n_running": 1,
+            "n_regular_waitings": 2,
+            "n_regular_running": 1,
+            "n_best_effort_waitings": 0,
+            "n_best_effort_running": 0,
+        },
+        {
+            "num_free_blocks": 4,
+            "effective_num_free_blocks": 4,
+            "n_waitings": 1,
+            "n_running": 0,
+            "n_regular_waitings": 1,
+            "n_regular_running": 0,
+            "n_best_effort_waitings": 0,
+            "n_best_effort_running": 0,
+        },
     ]
     pool._get_load_statistics_from_engines.assert_awaited_once()
 
@@ -218,6 +319,38 @@ def test_slosserve_router_get_engine_states_handles_bus_dict(monkeypatch):
     assert states[1].next_batch_time == 10.0
 
 
+def test_slosserve_router_get_engine_states_prefers_effective_free_blocks(
+    monkeypatch,
+):
+    router = api_server_ray.SLOsServeRouter.__new__(api_server_ray.SLOsServeRouter)
+    router.n_devices = 1
+    router.n_block = 16
+
+    now = 10.0
+    bus_state = {
+        0: make_engine_state_entry(
+            0,
+            now,
+            None,
+            {
+                "num_free_blocks": 3,
+                "effective_num_free_blocks": 9,
+                "n_waitings": 1,
+                "n_running": 2,
+            },
+        ),
+    }
+    fake_bus = SimpleNamespace(get_all=SimpleNamespace(remote=lambda: bus_state))
+
+    monkeypatch.setattr(api_server_ray, "execplan_bus_actor", fake_bus)
+    monkeypatch.setattr(api_server_ray.ray, "get", lambda x: x)
+    monkeypatch.setattr(api_server_ray.time, "time", lambda: now)
+
+    states = api_server_ray.SLOsServeRouter.get_engine_states(router)
+
+    assert states[0].num_free_blocks == 9
+
+
 def test_slosserve_router_run_with_planner_passes_engine_state():
     router = api_server_ray.SLOsServeRouter.__new__(api_server_ray.SLOsServeRouter)
     router.n_devices = 1
@@ -225,6 +358,8 @@ def test_slosserve_router_run_with_planner_passes_engine_state():
     router.group_size = 1
     router.is_pd_disagg = False
     router.group_idx = 0
+    router.n_lb = 1
+    router.lb_indices_per_group = [0]
 
     engine_state = api_server_ray.EngineState(next_batch_time=1.0,
                                               num_free_blocks=5)
@@ -252,6 +387,15 @@ def test_slosserve_router_run_with_planner_passes_engine_state():
     assert captured["waiting_requests"] == [waiting_request]
     assert captured["engine_state"] is engine_state
     assert captured["mode"] == "normal"
+
+
+def test_request_pool_filters_best_effort_from_regular_running_requests():
+    pool = api_server_ray.RequestPool.__new__(api_server_ray.RequestPool)
+    regular = _make_router_request("req-regular")
+    best_effort = _make_router_request("req-be", service_tier="best_effort")
+    pool.running_pool = [regular, best_effort]
+
+    assert pool._get_regular_running_requests() == [regular]
 
 
 def test_slosserve_router_applies_perf_model_err_to_control_model(monkeypatch):
@@ -368,6 +512,30 @@ def test_slosserve_router_select_asap_server_reuses_last_pd_devices():
     assert router.select_asap_server(None, request=placed_request) == (4, 7)
 
 
+def test_request_pool_routes_best_effort_to_emptiest_server():
+    pool = api_server_ray.RequestPool.__new__(api_server_ray.RequestPool)
+    pool.router = SimpleNamespace(
+        select_asap_server=lambda load_stat, request=None: (2, 2)
+    )
+    pool.load_stat = SimpleNamespace()
+
+    best_effort_request = _make_router_request(
+        "req-best-effort",
+        service_tier="best_effort",
+    )
+
+    api_server_ray.RequestPool._route_best_effort_requests(
+        pool,
+        [best_effort_request],
+    )
+
+    assert best_effort_request.admitted is True
+    assert best_effort_request.prefill_device_id == 2
+    assert best_effort_request.decode_device_id == 2
+    assert best_effort_request.payload["vllm_xargs"]["must_admit"] is True
+    assert best_effort_request.payload["vllm_xargs"]["service_tier"] == "best_effort"
+
+
 def test_slosserve_router_pre_adm_planner_uses_cached_tokens_on_home_device(
     monkeypatch,
 ):
@@ -376,6 +544,7 @@ def test_slosserve_router_pre_adm_planner_uses_cached_tokens_on_home_device(
     router.kv_xfer_delay = 0.05
     router.block_size = 16
     router.max_decode_length = 32
+    router.admission_max_decode_length = 32
     router.oracle_mem = False
     router.is_pd_disagg = False
     router._session_prefill_device_map = {"session-hit": 1}

@@ -55,6 +55,15 @@ DEBUG = False
 MOCK_REJECTION_REASON = "mock_rejected"
 
 
+def _normalize_rejection_reason(reason: Any) -> str | None:
+    if reason is None:
+        return None
+    raw = str(reason).strip()
+    if not raw:
+        return None
+    return raw
+
+
 def _fit_mock_prompt_token_ids(
     token_ids: list[int],
     target_length: int,
@@ -255,12 +264,15 @@ class MockEngineCore:
             kv_cache_configs = pickle.load(f)
             model_config = get_model_config(model_name)
             per_token_cache_mem = model_config.get_token_cache_mem()
-            self.num_blocks = int(math.floor(device_mem / (per_token_cache_mem * block_size)))
+            self.bytes_per_block = int(per_token_cache_mem * block_size)
+            self.num_blocks = int(math.floor(device_mem / self.bytes_per_block))
             kv_cache_config = KVCacheConfig(
                 num_blocks=self.num_blocks,
                 kv_cache_tensors=[],
                 kv_cache_groups=kv_cache_configs['kv_cache_groups'],
             )
+        self.block_size = int(block_size)
+        self.total_kv_memory_bytes = int(self.num_blocks * self.bytes_per_block)
         
         vllm_config.model_config.model_name = model_name
         
@@ -430,17 +442,23 @@ class MockEngineCore:
                 # print(f'[MockEngineCore] batch_id={self.batch_id}, number_scheduled_tokens: {scheduler_output.num_scheduled_tokens}')
                 rejs = []
                 for req in self.scheduler.get_rejected_requests():
+                    rejection_reason = _normalize_rejection_reason(
+                        getattr(req, "stop_reason", None)
+                    )
                     self._profile_events.append({
                         "event_type": "finish",
                         "request_id": req.request_id,
                         "timestamp": time.time(),
                         "finish_reason": "rejected",
+                        "rejection_reason": rejection_reason,
                         "scheduling_overhead": scheduling_overhead,
                     })
                     
                     rejs.append({
                         'request_id': req.request_id, 
-                        'finish_reason': 'rejected'
+                        'finish_reason': 'rejected',
+                        'stop_reason': rejection_reason,
+                        'rejection_reason': rejection_reason,
                     })
                     
                     self.n_finished_reqs += 1 
@@ -524,6 +542,9 @@ class MockEngineCore:
                                 "request_id": req_output.request_id,
                                 "timestamp": time.time(),
                                 "finish_reason": str(req_output.finish_reason),
+                                "rejection_reason": _normalize_rejection_reason(
+                                    req_output.stop_reason
+                                ),
                             })
                             # print(f"Request {req_output.request_id} finished {req_output.finish_reason}. Closing output queue.")
                             # self.output_queues.pop(req_output.request_id)
@@ -538,6 +559,16 @@ class MockEngineCore:
                 output_processing_elapsed = time.time() - output_processing_start
                 # print(f'waiting {batch_time} seconds, batch takes {elapsed} seconds')
                 if scheduler_output.total_num_scheduled_tokens > 0:
+                    batch_load_stats = _get_scheduler_load_stats_snapshot(self.scheduler)
+                    num_free_blocks = int(batch_load_stats.get("num_free_blocks", 0))
+                    effective_num_free_blocks = int(
+                        batch_load_stats.get("effective_num_free_blocks", num_free_blocks)
+                    )
+                    used_blocks = max(0, self.num_blocks - num_free_blocks)
+                    effective_used_blocks = max(
+                        0,
+                        self.num_blocks - effective_num_free_blocks,
+                    )
                     self._profile_events.append({
                         "event_type": "batch",
                         "batch_id": self.batch_id,
@@ -553,6 +584,31 @@ class MockEngineCore:
                         "control_estimated_time": control_estimated_time,
                         "rejected_reqs": [r['request_id'] for r in rejs],
                         "publish_overhead": publish_overhead,
+                        "total_blocks": self.num_blocks,
+                        "num_free_blocks": num_free_blocks,
+                        "effective_num_free_blocks": effective_num_free_blocks,
+                        "used_blocks": used_blocks,
+                        "effective_used_blocks": effective_used_blocks,
+                        "block_size": self.block_size,
+                        "bytes_per_block": self.bytes_per_block,
+                        "total_kv_tokens": self.num_blocks * self.block_size,
+                        "free_kv_tokens": num_free_blocks * self.block_size,
+                        "effective_free_kv_tokens": (
+                            effective_num_free_blocks * self.block_size
+                        ),
+                        "used_kv_tokens": used_blocks * self.block_size,
+                        "effective_used_kv_tokens": (
+                            effective_used_blocks * self.block_size
+                        ),
+                        "total_kv_memory_bytes": self.total_kv_memory_bytes,
+                        "free_kv_memory_bytes": num_free_blocks * self.bytes_per_block,
+                        "effective_free_kv_memory_bytes": (
+                            effective_num_free_blocks * self.bytes_per_block
+                        ),
+                        "used_kv_memory_bytes": used_blocks * self.bytes_per_block,
+                        "effective_used_kv_memory_bytes": (
+                            effective_used_blocks * self.bytes_per_block
+                        ),
                         "extra_args": {
                             'to_schedule': scheduling_start - start_time, 
                             'to_launch': launch_start - start_time, 
@@ -641,20 +697,24 @@ class MockEngineCore:
             self.n_finished_reqs += 1
             self.n_rejected_reqs += 1
             scheduler_overhead = time.time() - current_time
+            rejection_reason = _normalize_rejection_reason(
+                getattr(request, "stop_reason", None)
+            )
             logger.info(f"Request {request.request_id} rejected.")
             self._profile_events.append({
                 "event_type": "finish",
                 "request_id": request.request_id,
                 "timestamp": time.time(),
                 "finish_reason": f"rejected-arrival-{request.stop_reason}",
+                "rejection_reason": rejection_reason,
                 "scheduling_overhead": scheduler_overhead,
             })
-            return False
+            return False, rejection_reason
         
         logger.debug(f"Request {request.request_id} added to scheduler.")
 
         # self.output_queues[request.request_id] = out_q
-        return True
+        return True, None
 
     def get_num_blocks(self) -> int:
         return self.num_blocks
@@ -745,14 +805,17 @@ class MockEngine:
     ) -> tuple[bool, AsyncGenerator[RequestOutput, None] | None, str | None]:
         _q = asyncio.Queue(maxsize = 512)
         self._local_queues[request_id] = _q
-        admitted = await self.engine_core.add_request.remote(
+        admitted, rejection_reason = await self.engine_core.add_request.remote(
             prompt,
             request_id,
             sampling_params,
         )
         if not admitted:
             self._local_queues.pop(request_id, None)
-            return False, None, MOCK_REJECTION_REASON
+            return False, None, (
+                _normalize_rejection_reason(rejection_reason)
+                or MOCK_REJECTION_REASON
+            )
         
         async def generate_stream():
             while True:
@@ -798,7 +861,7 @@ class MockEngine:
             print('dispatch', request_id, time.time(), 'mockengine')
             _q = asyncio.Queue(maxsize = 512)
             self._local_queues[request_id] = _q
-            admitted = await self.engine_core.add_request.remote(
+            admitted, rejection_reason = await self.engine_core.add_request.remote(
                 prompt,
                 request_id,
                 sampling_params,
@@ -820,7 +883,9 @@ class MockEngine:
                             cumulative_logprob=None,
                             logprobs=None,
                             finish_reason="rejected",
-                            stop_reason=None,
+                            stop_reason=_normalize_rejection_reason(
+                                rejection_reason
+                            ),
                         )
                     ],
                     finished=True,

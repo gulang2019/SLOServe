@@ -232,6 +232,41 @@ def test_normalize_batch_config_extracts_server_launch_overrides():
         "block_size": 16,
         "device_mem": 1024,
         "model_name": "Qwen/Test-30B",
+        "perf_model_err": 1.0,
+        "scheduling_overhead": 0.003,
+        "tpot": 0.05,
+    }
+
+
+def test_normalize_batch_config_omits_router_tpot_and_perf_when_sweeping():
+    normalized = normalize_batch_config(
+        {
+            "server_router_kwargs": {
+                "device_mem": 1024,
+                "block_size": 16,
+                "tpot": 0.05,
+                "scheduling_overhead": 0.005,
+            },
+            "policies": ["round_robin:atfc"],
+            "configs": {
+                "azure_chat:azure_chat": {
+                    "window": "t10:20",
+                    "n_devices": [2],
+                    "slo_tpots": [0.025, 0.05],
+                    "perf_model_errs": [0.8, 1.2],
+                }
+            },
+        }
+    )
+
+    router_kwargs = json.loads(
+        normalized["trace_server_router_kwargs"]["azure_chat:azure_chat"]
+    )
+    assert router_kwargs == {
+        "block_size": 16,
+        "device_mem": 1024,
+        "model_name": "Qwen/Qwen2.5-7B-Instruct",
+        "scheduling_overhead": 0.003,
     }
 
 

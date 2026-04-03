@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -69,3 +70,28 @@ def test_run_batch_make_run_key_preserves_simple_and_compound_traces():
         "emulation_0316|sharegpt_code:azure_code_23+azure_chat_23:azure_chat_23|"
         "sharegpt_code:azure_code_23+azure_chat_23:azure_chat_23|round_robin:atfc|"
     )
+
+
+def test_run_batch_render_runtime_server_router_kwargs_applies_current_sweep_values():
+    result = _run_bash(
+        """
+        set -euo pipefail
+        export RUN_BATCH_SOURCE_ONLY=1
+        source ./run_batch.sh >/dev/null
+        render_runtime_server_router_kwargs \
+          '{"block_size":16,"device_mem":1024,"tpot":0.05,"scheduling_overhead":0.005}' \
+          'Qwen/Test-30B' \
+          '0.003' \
+          '0.015' \
+          '1.2'
+        """
+    )
+
+    assert json.loads(result.stdout) == {
+        "block_size": 16,
+        "device_mem": 1024,
+        "model_name": "Qwen/Test-30B",
+        "perf_model_err": 1.2,
+        "scheduling_overhead": 0.003,
+        "tpot": 0.015,
+    }

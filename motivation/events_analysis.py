@@ -77,6 +77,23 @@ class Batch(Event):
     output_processing_elapsed: Optional[float] = None
     rejected_reqs: List[str] = None
     publish_overhead: Optional[float] = None
+    total_blocks: Optional[int] = None
+    num_free_blocks: Optional[int] = None
+    effective_num_free_blocks: Optional[int] = None
+    used_blocks: Optional[int] = None
+    effective_used_blocks: Optional[int] = None
+    block_size: Optional[int] = None
+    bytes_per_block: Optional[int] = None
+    total_kv_tokens: Optional[int] = None
+    free_kv_tokens: Optional[int] = None
+    effective_free_kv_tokens: Optional[int] = None
+    used_kv_tokens: Optional[int] = None
+    effective_used_kv_tokens: Optional[int] = None
+    total_kv_memory_bytes: Optional[int] = None
+    free_kv_memory_bytes: Optional[int] = None
+    effective_free_kv_memory_bytes: Optional[int] = None
+    used_kv_memory_bytes: Optional[int] = None
+    effective_used_kv_memory_bytes: Optional[int] = None
     
     
     @property
@@ -182,6 +199,7 @@ class Rescheduling(Event):
 class Finish(Event):
     request_id: str
     finish_reason: str
+    rejection_reason: str | None = None
     scheduling_overhead: float = 0.0
 
 @dataclass(kw_only=True)

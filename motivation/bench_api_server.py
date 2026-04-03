@@ -236,6 +236,9 @@ def _build_concise_result_row(
     perf_model_error_summary = result.get("perf_model_error_summary")
     if not isinstance(perf_model_error_summary, dict):
         perf_model_error_summary = {}
+    rejection_reason_counts = result.get("rejection_reason_counts")
+    if not isinstance(rejection_reason_counts, dict):
+        rejection_reason_counts = {}
     current_upper_bound_metrics = perf_model_error_summary.get(
         "current_estimator_upper_bound_metrics",
         {},
@@ -297,6 +300,7 @@ def _build_concise_result_row(
                 "normal_slo_attainment_rate"
             ),
             "rejection_rate": result.get("rejection_rate"),
+            "rejection_reason_counts": rejection_reason_counts,
             "cache_hit_rate": cache_hit_rate,
             "energy_consumption": result.get("energy_consumption"),
         },
@@ -2180,7 +2184,15 @@ def _make_overload_run_result(
             "run_status": "overloaded",
             "overloaded": True,
             "rejection_reason_counts": {},
+            "rejection_reason_rates": {},
+            "rejection_reason_shares": {},
             "rejected_request_reasons": {},
+            "compute_rejection_count": 0,
+            "memory_rejection_count": 0,
+            "compute_rejection_rate": 0.0,
+            "memory_rejection_rate": 0.0,
+            "compute_rejection_share": 0.0,
+            "memory_rejection_share": 0.0,
             "overload_reason": "server_unhealthy",
             "overload_error_type": type(error).__name__,
             "overload_error": str(error),
@@ -2190,6 +2202,27 @@ def _make_overload_run_result(
                 "per_server_energy_consumption": zero_metrics.copy(),
                 "per_server_power": zero_metrics.copy(),
                 "per_server_rps": zero_metrics.copy(),
+                "per_server_memory": [
+                    {
+                        "device_id": device_id,
+                        "total_memory_bytes": None,
+                        "bytes_per_block": None,
+                        "total_blocks": None,
+                        "used_memory_bytes": {"count": 0},
+                        "effective_used_memory_bytes": {"count": 0},
+                        "memory_utilization": {"count": 0},
+                        "effective_memory_utilization": {"count": 0},
+                    }
+                    for device_id in range(max(0, int(problem.n_devices)))
+                ],
+                "per_server_average_used_memory_bytes": zero_metrics.copy(),
+                "per_server_peak_used_memory_bytes": zero_metrics.copy(),
+                "per_server_average_memory_utilization": zero_metrics.copy(),
+                "per_server_peak_memory_utilization": zero_metrics.copy(),
+                "per_server_average_effective_used_memory_bytes": zero_metrics.copy(),
+                "per_server_peak_effective_used_memory_bytes": zero_metrics.copy(),
+                "per_server_average_effective_memory_utilization": zero_metrics.copy(),
+                "per_server_peak_effective_memory_utilization": zero_metrics.copy(),
                 "benchmark_figure_replay": {},
                 "window_time_pct_vs_active_requests_figure": None,
                 "window_time_pct_vs_active_requests_figure_pdf": None,
@@ -2632,6 +2665,205 @@ def _summarize_per_server_energy_metrics(
     return {
         "per_server_energy_consumption": per_server_energy,
         "per_server_power": per_server_power,
+    }
+
+
+def _summarize_per_server_memory_metrics(
+    events: List[Dict[str, Any] | Any],
+    n_devices: int,
+) -> Dict[str, Any]:
+    per_server_used_memory_bytes: list[list[float]] = [
+        [] for _ in range(max(0, int(n_devices)))
+    ]
+    per_server_effective_used_memory_bytes: list[list[float]] = [
+        [] for _ in range(len(per_server_used_memory_bytes))
+    ]
+    per_server_memory_utilization: list[list[float]] = [
+        [] for _ in range(len(per_server_used_memory_bytes))
+    ]
+    per_server_effective_memory_utilization: list[list[float]] = [
+        [] for _ in range(len(per_server_used_memory_bytes))
+    ]
+    total_memory_bytes: list[int | None] = [None for _ in range(len(per_server_used_memory_bytes))]
+    bytes_per_block: list[int | None] = [None for _ in range(len(per_server_used_memory_bytes))]
+    total_blocks: list[int | None] = [None for _ in range(len(per_server_used_memory_bytes))]
+
+    for event in events:
+        if _event_value(event, "event_type") != "batch":
+            continue
+        try:
+            device_id = int(_event_value(event, "device_id", -1))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= device_id < len(per_server_used_memory_bytes):
+            continue
+
+        try:
+            used_memory_bytes = float(
+                _event_value(event, "used_kv_memory_bytes", 0.0) or 0.0
+            )
+            effective_used_memory_bytes = float(
+                _event_value(
+                    event,
+                    "effective_used_kv_memory_bytes",
+                    used_memory_bytes,
+                ) or 0.0
+            )
+        except (TypeError, ValueError):
+            continue
+
+        try:
+            total_memory = int(
+                _event_value(event, "total_kv_memory_bytes", 0) or 0
+            )
+        except (TypeError, ValueError):
+            total_memory = 0
+        try:
+            per_block_bytes = int(_event_value(event, "bytes_per_block", 0) or 0)
+        except (TypeError, ValueError):
+            per_block_bytes = 0
+        try:
+            n_total_blocks = int(_event_value(event, "total_blocks", 0) or 0)
+        except (TypeError, ValueError):
+            n_total_blocks = 0
+
+        if total_memory > 0:
+            total_memory_bytes[device_id] = total_memory
+            per_server_memory_utilization[device_id].append(
+                max(0.0, min(1.0, used_memory_bytes / total_memory))
+            )
+            per_server_effective_memory_utilization[device_id].append(
+                max(0.0, min(1.0, effective_used_memory_bytes / total_memory))
+            )
+        if per_block_bytes > 0:
+            bytes_per_block[device_id] = per_block_bytes
+        if n_total_blocks > 0:
+            total_blocks[device_id] = n_total_blocks
+
+        per_server_used_memory_bytes[device_id].append(max(0.0, used_memory_bytes))
+        per_server_effective_used_memory_bytes[device_id].append(
+            max(0.0, effective_used_memory_bytes)
+        )
+
+    detailed: list[dict[str, Any]] = []
+    per_server_average_used_memory_bytes: list[float] = []
+    per_server_peak_used_memory_bytes: list[float] = []
+    per_server_average_memory_utilization: list[float] = []
+    per_server_peak_memory_utilization: list[float] = []
+    per_server_average_effective_used_memory_bytes: list[float] = []
+    per_server_peak_effective_used_memory_bytes: list[float] = []
+    per_server_average_effective_memory_utilization: list[float] = []
+    per_server_peak_effective_memory_utilization: list[float] = []
+
+    for device_id in range(len(per_server_used_memory_bytes)):
+        used_summary = _summarize_distribution(
+            per_server_used_memory_bytes[device_id]
+        )
+        effective_used_summary = _summarize_distribution(
+            per_server_effective_used_memory_bytes[device_id]
+        )
+        utilization_summary = _summarize_distribution(
+            per_server_memory_utilization[device_id]
+        )
+        effective_utilization_summary = _summarize_distribution(
+            per_server_effective_memory_utilization[device_id]
+        )
+        detailed.append({
+            "device_id": device_id,
+            "total_memory_bytes": total_memory_bytes[device_id],
+            "bytes_per_block": bytes_per_block[device_id],
+            "total_blocks": total_blocks[device_id],
+            "used_memory_bytes": used_summary,
+            "effective_used_memory_bytes": effective_used_summary,
+            "memory_utilization": utilization_summary,
+            "effective_memory_utilization": effective_utilization_summary,
+        })
+        per_server_average_used_memory_bytes.append(
+            float(used_summary.get("mean", 0.0) or 0.0)
+        )
+        per_server_peak_used_memory_bytes.append(
+            float(used_summary.get("max", 0.0) or 0.0)
+        )
+        per_server_average_memory_utilization.append(
+            float(utilization_summary.get("mean", 0.0) or 0.0)
+        )
+        per_server_peak_memory_utilization.append(
+            float(utilization_summary.get("max", 0.0) or 0.0)
+        )
+        per_server_average_effective_used_memory_bytes.append(
+            float(effective_used_summary.get("mean", 0.0) or 0.0)
+        )
+        per_server_peak_effective_used_memory_bytes.append(
+            float(effective_used_summary.get("max", 0.0) or 0.0)
+        )
+        per_server_average_effective_memory_utilization.append(
+            float(effective_utilization_summary.get("mean", 0.0) or 0.0)
+        )
+        per_server_peak_effective_memory_utilization.append(
+            float(effective_utilization_summary.get("max", 0.0) or 0.0)
+        )
+
+    return {
+        "per_server_memory": detailed,
+        "per_server_average_used_memory_bytes": (
+            per_server_average_used_memory_bytes
+        ),
+        "per_server_peak_used_memory_bytes": per_server_peak_used_memory_bytes,
+        "per_server_average_memory_utilization": (
+            per_server_average_memory_utilization
+        ),
+        "per_server_peak_memory_utilization": (
+            per_server_peak_memory_utilization
+        ),
+        "per_server_average_effective_used_memory_bytes": (
+            per_server_average_effective_used_memory_bytes
+        ),
+        "per_server_peak_effective_used_memory_bytes": (
+            per_server_peak_effective_used_memory_bytes
+        ),
+        "per_server_average_effective_memory_utilization": (
+            per_server_average_effective_memory_utilization
+        ),
+        "per_server_peak_effective_memory_utilization": (
+            per_server_peak_effective_memory_utilization
+        ),
+    }
+
+
+def _summarize_rejection_breakdown(
+    rejection_reason_counts: Counter[str],
+    *,
+    total_requests: int,
+) -> Dict[str, Any]:
+    counts = {
+        reason: int(count)
+        for reason, count in sorted(rejection_reason_counts.items())
+    }
+    total_rejections = int(sum(counts.values()))
+    if total_requests > 0:
+        rates = {
+            reason: float(count / total_requests)
+            for reason, count in counts.items()
+        }
+    else:
+        rates = {reason: 0.0 for reason in counts}
+    if total_rejections > 0:
+        shares = {
+            reason: float(count / total_rejections)
+            for reason, count in counts.items()
+        }
+    else:
+        shares = {reason: 0.0 for reason in counts}
+    return {
+        "counts": counts,
+        "rates": rates,
+        "shares": shares,
+        "compute_rejection_count": int(counts.get("compute", 0)),
+        "memory_rejection_count": int(counts.get("memory", 0)),
+        "compute_rejection_rate": float(rates.get("compute", 0.0)),
+        "memory_rejection_rate": float(rates.get("memory", 0.0)),
+        "compute_rejection_share": float(shares.get("compute", 0.0)),
+        "memory_rejection_share": float(shares.get("memory", 0.0)),
     }
 
 
@@ -3416,6 +3648,179 @@ def _save_power_distribution_figure(
     return output_path
 
 
+def _summarize_memory_occupancy_replay(
+    events: List[Dict[str, Any] | Any],
+    *,
+    n_devices: int,
+    start_time: float,
+    end_time: float,
+) -> Dict[str, Any]:
+    devices: list[dict[str, Any]] = []
+    has_effective = False
+
+    for device_id in range(max(0, int(n_devices))):
+        samples: list[dict[str, float]] = []
+        max_tokens = 0
+        for event in events:
+            if _event_value(event, "event_type") != "batch":
+                continue
+            try:
+                event_device_id = int(_event_value(event, "device_id", -1))
+            except (TypeError, ValueError):
+                continue
+            if event_device_id != device_id:
+                continue
+            try:
+                timestamp = float(_event_value(event, "timestamp", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if timestamp < start_time or timestamp > end_time:
+                continue
+            try:
+                used_tokens = int(_event_value(event, "used_kv_tokens", 0) or 0)
+            except (TypeError, ValueError):
+                used_tokens = 0
+            try:
+                effective_used_tokens = int(
+                    _event_value(event, "effective_used_kv_tokens", used_tokens)
+                    or used_tokens
+                )
+            except (TypeError, ValueError):
+                effective_used_tokens = used_tokens
+            try:
+                event_max_tokens = int(
+                    _event_value(event, "total_kv_tokens", 0) or 0
+                )
+            except (TypeError, ValueError):
+                event_max_tokens = 0
+            max_tokens = max(max_tokens, event_max_tokens)
+            samples.append({
+                "time": float(timestamp - start_time),
+                "used_tokens": float(max(0, used_tokens)),
+                "effective_used_tokens": float(max(0, effective_used_tokens)),
+            })
+            if effective_used_tokens != used_tokens:
+                has_effective = True
+
+        devices.append({
+            "device_id": int(device_id),
+            "max_tokens": int(max_tokens),
+            "samples": samples,
+        })
+
+    return {
+        "xlabel": "Service Time (s)",
+        "ylabel": "KV Occupancy (# Tokens)",
+        "devices": devices,
+        "has_effective": bool(has_effective),
+    }
+
+
+def _save_memory_occupancy_figure(
+    summary: Dict[str, Any],
+    path: str | Path,
+    *,
+    title: str,
+) -> Path:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    devices = summary.get("devices", [])
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2,
+        1,
+        figsize=(10, 6.5),
+        tight_layout=True,
+        gridspec_kw={"height_ratios": [1.0, 3.0]},
+    )
+
+    if not devices:
+        ax_top.text(0.5, 0.5, "No memory snapshots", ha="center", va="center")
+        ax_bottom.text(0.5, 0.5, "No memory snapshots", ha="center", va="center")
+        ax_top.set_axis_off()
+        ax_bottom.set_axis_off()
+        fig.savefig(output_path, dpi=220)
+        plt.close(fig)
+        return output_path
+
+    cmap = plt.get_cmap("tab10")
+    colors = [cmap(idx % 10) for idx in range(len(devices))]
+    device_labels = [f"S{int(device['device_id'])}" for device in devices]
+    max_tokens = [
+        float(device.get("max_tokens", 0.0) or 0.0)
+        for device in devices
+    ]
+    x = np.arange(len(devices), dtype=float)
+
+    ax_top.bar(x, max_tokens, color=colors, alpha=0.9)
+    ax_top.set_xticks(x)
+    ax_top.set_xticklabels(device_labels)
+    ax_top.set_ylabel("Max (# Tokens)")
+    ax_top.set_title(title)
+    ax_top.grid(True, axis="y", alpha=0.3)
+
+    line_handles = []
+    line_labels = []
+    has_effective = bool(summary.get("has_effective", False))
+    for color, device in zip(colors, devices):
+        samples = device.get("samples", [])
+        if not samples:
+            continue
+        times = [float(sample["time"]) for sample in samples]
+        used_tokens = [float(sample["used_tokens"]) for sample in samples]
+        label = f"S{int(device['device_id'])}"
+        handle = ax_bottom.step(
+            times,
+            used_tokens,
+            where="post",
+            color=color,
+            linewidth=2.0,
+            alpha=0.95,
+            label=label,
+        )[0]
+        line_handles.append(handle)
+        line_labels.append(label)
+        if has_effective:
+            effective_used_tokens = [
+                float(sample["effective_used_tokens"])
+                for sample in samples
+            ]
+            ax_bottom.step(
+                times,
+                effective_used_tokens,
+                where="post",
+                color=color,
+                linewidth=1.2,
+                alpha=0.45,
+                linestyle="--",
+            )
+
+    ax_bottom.set_xlabel(str(summary.get("xlabel", "Time (s)")))
+    ax_bottom.set_ylabel(str(summary.get("ylabel", "Occupancy")))
+    ax_bottom.grid(True, alpha=0.3)
+
+    if line_handles:
+        legend_handles = list(line_handles)
+        legend_labels = list(line_labels)
+        if has_effective:
+            legend_handles.extend([
+                plt.Line2D([0], [0], color="#333333", lw=2.0),
+                plt.Line2D([0], [0], color="#333333", lw=1.2, linestyle="--", alpha=0.6),
+            ])
+            legend_labels.extend(["Used", "Effective Used"])
+        ax_bottom.legend(
+            legend_handles,
+            legend_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.18),
+            ncol=min(4, max(1, len(legend_labels))),
+        )
+
+    fig.savefig(output_path, dpi=220)
+    plt.close(fig)
+    return output_path
+
+
 def save_benchmark_figures_from_result_row(
     result: Dict[str, Any],
     output_prefix: str | Path,
@@ -3451,11 +3856,23 @@ def save_benchmark_figures_from_result_row(
         f"{prefix}.power_vs_active_servers_and_batch_tokens.pdf",
         title_prefix=title_prefix,
     )
+    memory_png = _save_memory_occupancy_figure(
+        replay.get("memory_occupancy_over_time", {}),
+        f"{prefix}.memory_occupancy_over_time.png",
+        title=f"{title_prefix}: Memory Occupancy Over Time",
+    )
+    memory_pdf = _save_memory_occupancy_figure(
+        replay.get("memory_occupancy_over_time", {}),
+        f"{prefix}.memory_occupancy_over_time.pdf",
+        title=f"{title_prefix}: Memory Occupancy Over Time",
+    )
     return {
         "window_time_pct_vs_active_requests_figure": str(window_png),
         "window_time_pct_vs_active_requests_figure_pdf": str(window_pdf),
         "power_vs_active_servers_and_batch_tokens_figure": str(power_png),
         "power_vs_active_servers_and_batch_tokens_figure_pdf": str(power_pdf),
+        "memory_occupancy_over_time_figure": str(memory_png),
+        "memory_occupancy_over_time_figure_pdf": str(memory_pdf),
     }
 
 
@@ -3537,6 +3954,12 @@ def _summarize_benchmark_energy_and_figures(
     batch_tokens_summary = _summarize_power_vs_batch_tokens(
         _match_batch_power_rows(events)
     )
+    memory_occupancy_summary = _summarize_memory_occupancy_replay(
+        events,
+        n_devices=n_devices,
+        start_time=start_time,
+        end_time=end_time,
+    )
 
     replay = {
         "window_size_seconds": float(window_size),
@@ -3547,6 +3970,7 @@ def _summarize_benchmark_energy_and_figures(
         "window_time_pct_vs_active_requests": window_time_pct_summary,
         "power_vs_active_servers": active_servers_summary,
         "power_vs_batch_tokens": batch_tokens_summary,
+        "memory_occupancy_over_time": memory_occupancy_summary,
     }
     figure_paths = save_benchmark_figures_from_result_row(
         {
@@ -4595,6 +5019,10 @@ async def main(
         print('Benchmark rejection reasons:', ', '.join(rejection_parts))
     else:
         print('Benchmark rejection reasons: none')
+    rejection_breakdown = _summarize_rejection_breakdown(
+        rejection_reason_counts,
+        total_requests=len(requests),
+    )
     results['rps'] = rps
     results['requested_n_device'] = requested_n_devices
     results['effective_n_device'] = problem.n_devices
@@ -4603,9 +5031,27 @@ async def main(
     results['rr_slice_total_request_count'] = original_request_count
     results['run_status'] = 'completed'
     results['overloaded'] = False
-    results['rejection_reason_counts'] = dict(
-        sorted(rejection_reason_counts.items())
-    )
+    results['rejection_reason_counts'] = rejection_breakdown['counts']
+    results['rejection_reason_rates'] = rejection_breakdown['rates']
+    results['rejection_reason_shares'] = rejection_breakdown['shares']
+    results['compute_rejection_count'] = rejection_breakdown[
+        'compute_rejection_count'
+    ]
+    results['memory_rejection_count'] = rejection_breakdown[
+        'memory_rejection_count'
+    ]
+    results['compute_rejection_rate'] = rejection_breakdown[
+        'compute_rejection_rate'
+    ]
+    results['memory_rejection_rate'] = rejection_breakdown[
+        'memory_rejection_rate'
+    ]
+    results['compute_rejection_share'] = rejection_breakdown[
+        'compute_rejection_share'
+    ]
+    results['memory_rejection_share'] = rejection_breakdown[
+        'memory_rejection_share'
+    ]
     results['rejected_request_reasons'] = {
         request_id: rejected_request_reasons[request_id]
         for request_id in sorted(
@@ -4623,6 +5069,10 @@ async def main(
     extra_metrics = results.setdefault('extra_metrics', {})
     extra_metrics.update(service_tier_metrics)
     extra_metrics.update(_summarize_per_server_energy_metrics(
+        events,
+        problem.n_devices,
+    ))
+    extra_metrics.update(_summarize_per_server_memory_metrics(
         events,
         problem.n_devices,
     ))
@@ -6038,6 +6488,51 @@ def run(
         )
         if not overwrite and cache_key in results:
             print(f'Skipping {load_scale}, {n_device}, {scheduling_policy}, {routing_policy}, {ttft_slo_scale}, {slo_tpot}, {perf_model_err} because it already exists')
+            cached_result = results[cache_key]
+            cached_event_file = cached_result.get('event_file')
+            cached_recommendation = cached_result.get(
+                'vllm_clock_monitor_recommendation')
+            if (
+                cached_event_file is not None
+                and not isinstance(cached_recommendation, dict)
+            ):
+                cached_reqs_file = _reqs_file_from_event_prefix(cached_event_file)
+                if cached_reqs_file.exists() and os.path.exists(cached_event_file):
+                    try:
+                        cached_recommendation = (
+                            _recommend_clock_monitor_low_mhz_from_trace(
+                                reqs_file=cached_reqs_file,
+                                events_file=cached_event_file,
+                            )
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to backfill clock-monitor recommendation for cached run %s: %r",
+                            cached_event_file,
+                            exc,
+                        )
+                    if cached_recommendation is not None:
+                        cached_recommendation = dict(cached_recommendation)
+                        cached_recommendation['reqs_file'] = str(cached_reqs_file)
+                        cached_recommendation['events_file'] = str(cached_event_file)
+                        cached_result['vllm_clock_monitor_recommendation'] = (
+                            cached_recommendation
+                        )
+                        cached_result['vllm_clock_monitor_recommendation_file'] = (
+                            f'{Path(cached_event_file).with_suffix("").with_suffix("")}.'
+                            'clock_monitor_recommendation.json'
+                        )
+                        Path(
+                            cached_result[
+                                'vllm_clock_monitor_recommendation_file'
+                            ]).write_text(
+                                json.dumps(
+                                    cached_recommendation,
+                                    indent=2,
+                                    sort_keys=True,
+                                ),
+                                encoding='utf-8',
+                            )
             summary_problem = None
             if concise_logging:
                 with _maybe_suppress_stdout(True):
@@ -6108,12 +6603,11 @@ def run(
                     )
                 summary_problem = summary_problems[0] if summary_problems else None
                 _print_concise_result_row(
-                    results[cache_key],
+                    cached_result,
                     trace_used=trace,
                     problem=summary_problem,
                 )
             if not disable_independent_slo_grid_report:
-                cached_result = results[cache_key]
                 cached_event_file = cached_result.get('event_file')
                 cached_reqs_file = (
                     _reqs_file_from_event_prefix(cached_event_file)
@@ -6342,6 +6836,14 @@ def run(
             result['power_vs_active_servers_and_batch_tokens_figure_pdf'] = (
                 f'{problems[0].store_prefix}.power_vs_active_servers_and_batch_tokens.pdf'
             )
+        if result.get('memory_occupancy_over_time_figure') is not None:
+            result['memory_occupancy_over_time_figure'] = (
+                f'{problems[0].store_prefix}.memory_occupancy_over_time.png'
+            )
+        if result.get('memory_occupancy_over_time_figure_pdf') is not None:
+            result['memory_occupancy_over_time_figure_pdf'] = (
+                f'{problems[0].store_prefix}.memory_occupancy_over_time.pdf'
+            )
         if 'perf_model_error_summary' in best_result.results:
             result['perf_model_error_summary'] = best_result.results[
                 'perf_model_error_summary']
@@ -6468,6 +6970,8 @@ def run(
             'window_time_pct_vs_active_requests.pdf',
             'power_vs_active_servers_and_batch_tokens.png',
             'power_vs_active_servers_and_batch_tokens.pdf',
+            'memory_occupancy_over_time.png',
+            'memory_occupancy_over_time.pdf',
         ]:
             src = f'{best_result.event_file}.{figure_suffix}'
             dst = f'{problems[0].store_prefix}.{figure_suffix}'
