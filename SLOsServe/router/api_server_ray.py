@@ -37,7 +37,8 @@ import logging
 from SLOsServe.client_spec import parse_client_spec
 from SLOsServe.perf_model import PerfModel
 from SLOsServe.router.execplan_bus import (ExecPlanBus, ExecPlan,
-                                           extract_load_statistics)
+                                           extract_load_statistics,
+                                           make_default_load_stats)
 from SLOsServe.router.adm_ctrl import Request as BatchPlannerRequest
 from SLOsServe.router.engine_shutdown import shutdown_engine_instance
 from SLOsServe.router.macro import DUMP_SCHS, DUMP_ADM
@@ -3195,12 +3196,55 @@ class RequestPool:
             logger.warning(f"sync: Timed out after {remained_time} seconds waiting for tasks")
 
     async def get_load_statistics(self) -> list[dict[str, Any]]:
-        load_statistics = extract_load_statistics(await self._get_engine_states(),
-                                                 self.n_devices)
-        if load_statistics is not None:
+        engine_states = await self._get_engine_states()
+        load_statistics = extract_load_statistics(engine_states, self.n_devices)
+        if (
+            load_statistics is not None
+            and self._engine_state_load_stats_are_usable(
+                engine_states,
+                load_statistics,
+            )
+        ):
             return load_statistics
 
         return await self._get_load_statistics_from_engines()
+
+    def _engine_state_load_stats_are_usable(
+        self,
+        engine_states: dict[int, dict[str, Any]] | None,
+        load_statistics: list[dict[str, Any]],
+    ) -> bool:
+        if not isinstance(engine_states, dict):
+            return False
+        if len(load_statistics) != self.n_devices:
+            return False
+
+        default_stats = make_default_load_stats()
+        has_non_default = False
+        now = time.time()
+        max_age_s = max(1.0, 2.0 * float(self.stat_window))
+
+        for device_id in range(self.n_devices):
+            state = engine_states.get(device_id)
+            if not isinstance(state, dict):
+                return False
+            try:
+                timestamp = float(state.get("timestamp", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return False
+            if timestamp <= 0.0 or now - timestamp > max_age_s:
+                return False
+
+            stats = load_statistics[device_id]
+            if not isinstance(stats, dict):
+                return False
+            if any(
+                int(stats.get(key, default_value)) != int(default_value)
+                for key, default_value in default_stats.items()
+            ):
+                has_non_default = True
+
+        return has_non_default
 
     async def _get_engine_states(self) -> dict[int, dict[str, Any]]:
         global execplan_bus_actor

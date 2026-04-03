@@ -3821,12 +3821,43 @@ def _save_memory_occupancy_figure(
     return output_path
 
 
+def _load_json_artifact(path: str | Path | None) -> Dict[str, Any] | None:
+    if path is None:
+        return None
+    artifact_path = Path(path)
+    if not artifact_path.exists():
+        return None
+    try:
+        with open(artifact_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_json_artifact(path: str | Path, payload: Dict[str, Any]) -> str:
+    artifact_path = Path(path)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return str(artifact_path)
+
+
 def save_benchmark_figures_from_result_row(
     result: Dict[str, Any],
     output_prefix: str | Path,
 ) -> Dict[str, str]:
     replay = result.get("benchmark_figure_replay")
+    memory_summary = result.get("memory_occupancy_over_time")
+    if not isinstance(memory_summary, dict):
+        memory_summary = _load_json_artifact(
+            result.get("memory_occupancy_over_time_file")
+        )
     if not isinstance(replay, dict):
+        replay = {}
+    if not replay and not isinstance(memory_summary, dict):
         return {}
 
     prefix = str(output_prefix)
@@ -3834,46 +3865,52 @@ def save_benchmark_figures_from_result_row(
         f"{result.get('scheduling_policy', 'benchmark')} / "
         f"{result.get('routing_policy', 'policy')}"
     )
-    window_png = _save_window_time_pct_figure(
-        replay.get("window_time_pct_vs_active_requests", {}),
-        f"{prefix}.window_time_pct_vs_active_requests.png",
-        title=f"{title_prefix}: Window Time % vs Active Requests",
-    )
-    window_pdf = _save_window_time_pct_figure(
-        replay.get("window_time_pct_vs_active_requests", {}),
-        f"{prefix}.window_time_pct_vs_active_requests.pdf",
-        title=f"{title_prefix}: Window Time % vs Active Requests",
-    )
-    power_png = _save_power_distribution_figure(
-        replay.get("power_vs_active_servers", {}),
-        replay.get("power_vs_batch_tokens", {}),
-        f"{prefix}.power_vs_active_servers_and_batch_tokens.png",
-        title_prefix=title_prefix,
-    )
-    power_pdf = _save_power_distribution_figure(
-        replay.get("power_vs_active_servers", {}),
-        replay.get("power_vs_batch_tokens", {}),
-        f"{prefix}.power_vs_active_servers_and_batch_tokens.pdf",
-        title_prefix=title_prefix,
-    )
-    memory_png = _save_memory_occupancy_figure(
-        replay.get("memory_occupancy_over_time", {}),
-        f"{prefix}.memory_occupancy_over_time.png",
-        title=f"{title_prefix}: Memory Occupancy Over Time",
-    )
-    memory_pdf = _save_memory_occupancy_figure(
-        replay.get("memory_occupancy_over_time", {}),
-        f"{prefix}.memory_occupancy_over_time.pdf",
-        title=f"{title_prefix}: Memory Occupancy Over Time",
-    )
-    return {
-        "window_time_pct_vs_active_requests_figure": str(window_png),
-        "window_time_pct_vs_active_requests_figure_pdf": str(window_pdf),
-        "power_vs_active_servers_and_batch_tokens_figure": str(power_png),
-        "power_vs_active_servers_and_batch_tokens_figure_pdf": str(power_pdf),
-        "memory_occupancy_over_time_figure": str(memory_png),
-        "memory_occupancy_over_time_figure_pdf": str(memory_pdf),
-    }
+    figure_paths: Dict[str, str] = {}
+    if replay:
+        window_png = _save_window_time_pct_figure(
+            replay.get("window_time_pct_vs_active_requests", {}),
+            f"{prefix}.window_time_pct_vs_active_requests.png",
+            title=f"{title_prefix}: Window Time % vs Active Requests",
+        )
+        window_pdf = _save_window_time_pct_figure(
+            replay.get("window_time_pct_vs_active_requests", {}),
+            f"{prefix}.window_time_pct_vs_active_requests.pdf",
+            title=f"{title_prefix}: Window Time % vs Active Requests",
+        )
+        power_png = _save_power_distribution_figure(
+            replay.get("power_vs_active_servers", {}),
+            replay.get("power_vs_batch_tokens", {}),
+            f"{prefix}.power_vs_active_servers_and_batch_tokens.png",
+            title_prefix=title_prefix,
+        )
+        power_pdf = _save_power_distribution_figure(
+            replay.get("power_vs_active_servers", {}),
+            replay.get("power_vs_batch_tokens", {}),
+            f"{prefix}.power_vs_active_servers_and_batch_tokens.pdf",
+            title_prefix=title_prefix,
+        )
+        figure_paths.update({
+            "window_time_pct_vs_active_requests_figure": str(window_png),
+            "window_time_pct_vs_active_requests_figure_pdf": str(window_pdf),
+            "power_vs_active_servers_and_batch_tokens_figure": str(power_png),
+            "power_vs_active_servers_and_batch_tokens_figure_pdf": str(power_pdf),
+        })
+    if isinstance(memory_summary, dict):
+        memory_png = _save_memory_occupancy_figure(
+            memory_summary,
+            f"{prefix}.memory_occupancy_over_time.png",
+            title=f"{title_prefix}: Memory Occupancy Over Time",
+        )
+        memory_pdf = _save_memory_occupancy_figure(
+            memory_summary,
+            f"{prefix}.memory_occupancy_over_time.pdf",
+            title=f"{title_prefix}: Memory Occupancy Over Time",
+        )
+        figure_paths.update({
+            "memory_occupancy_over_time_figure": str(memory_png),
+            "memory_occupancy_over_time_figure_pdf": str(memory_pdf),
+        })
+    return figure_paths
 
 
 def _summarize_benchmark_energy_and_figures(
@@ -3960,6 +3997,10 @@ def _summarize_benchmark_energy_and_figures(
         start_time=start_time,
         end_time=end_time,
     )
+    memory_occupancy_file = _write_json_artifact(
+        f"{output_prefix}.memory_occupancy_over_time.json",
+        memory_occupancy_summary,
+    )
 
     replay = {
         "window_size_seconds": float(window_size),
@@ -3970,11 +4011,11 @@ def _summarize_benchmark_energy_and_figures(
         "window_time_pct_vs_active_requests": window_time_pct_summary,
         "power_vs_active_servers": active_servers_summary,
         "power_vs_batch_tokens": batch_tokens_summary,
-        "memory_occupancy_over_time": memory_occupancy_summary,
     }
     figure_paths = save_benchmark_figures_from_result_row(
         {
             "benchmark_figure_replay": replay,
+            "memory_occupancy_over_time_file": memory_occupancy_file,
             "scheduling_policy": scheduling_policy,
             "routing_policy": routing_policy,
         },
@@ -3988,6 +4029,7 @@ def _summarize_benchmark_energy_and_figures(
         "benchmark_idle_power_per_replica_w": float(idle_power_per_replica),
         "benchmark_power_source": str(power_summary.get("source", "measured")),
         "benchmark_figure_replay": replay,
+        "memory_occupancy_over_time_file": memory_occupancy_file,
         **figure_paths,
     }
 
@@ -6866,6 +6908,10 @@ def run(
             result['memory_occupancy_over_time_figure_pdf'] = (
                 f'{problems[0].store_prefix}.memory_occupancy_over_time.pdf'
             )
+        if result.get('memory_occupancy_over_time_file') is not None:
+            result['memory_occupancy_over_time_file'] = (
+                f'{problems[0].store_prefix}.memory_occupancy_over_time.json'
+            )
         if 'perf_model_error_summary' in best_result.results:
             result['perf_model_error_summary'] = best_result.results[
                 'perf_model_error_summary']
@@ -6999,6 +7045,10 @@ def run(
             dst = f'{problems[0].store_prefix}.{figure_suffix}'
             if os.path.exists(src):
                 os.system(f'cp {src} {dst}')
+        src = f'{best_result.event_file}.memory_occupancy_over_time.json'
+        dst = f'{problems[0].store_prefix}.memory_occupancy_over_time.json'
+        if os.path.exists(src):
+            os.system(f'cp {src} {dst}')
         if clock_monitor_recommendation is not None:
             clock_monitor_recommendation = dict(clock_monitor_recommendation)
             clock_monitor_recommendation['reqs_file'] = str(canonical_reqs_file)
