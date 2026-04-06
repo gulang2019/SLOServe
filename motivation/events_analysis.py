@@ -3962,11 +3962,21 @@ def draw_energy_comparison(
                 arrival_counts = np.bincount(window_idx)
                 arrival_time_axis = t0 + np.arange(arrival_counts.size, dtype=np.float64) * arrival_window
 
-        power_summary = _compute_state_based_power_series(
+        power_summary = _compute_measured_power_series(
             events,
             n_device=n_device,
             window_size=window_size,
         )
+        if power_summary.get("source") != "measured":
+            print(
+                f"WARNING: draw_energy_comparison falling back to state-based power "
+                f"for '{label}' ({file}) because measured power profiling is unavailable."
+            )
+            power_summary = _compute_state_based_power_series(
+                events,
+                n_device=n_device,
+                window_size=window_size,
+            )
         violation_time_axis, violation_counts = _compute_slo_violations(reqs, file, violation_window)
         active_devices = _count_active_devices_from_power_summary(power_summary)
         all_energies[label] = power_summary["total_power"].tolist()
@@ -3997,6 +4007,7 @@ def draw_energy_comparison(
             "events": events,
             "reqs": reqs,
             "power_summary": power_summary,
+            "power_source": str(power_summary.get("source", "unknown")),
             "active_devices": active_devices,
             "violation_time_axis": violation_time_axis,
             "violation_counts": violation_counts,
