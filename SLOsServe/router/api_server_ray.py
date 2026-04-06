@@ -67,6 +67,8 @@ def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
 
 logger = setup_logger("SLOsServe.router.api_server", os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"))
 
+POST_ADMISSION_OOM_REJECTION_REASON = "POST_ADMISSION_OOM"
+
 
 def _build_rejection_response(
     rejection_reason: str | None,
@@ -78,10 +80,103 @@ def _build_rejection_response(
     return payload
 
 
+def _is_rejection_payload(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    finish_reason = payload.get("finish_reason")
+    if finish_reason is None:
+        return False
+    return "reject" in str(finish_reason).lower()
+
+
+def _extract_rejection_reason(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    reason = payload.get("rejection_reason")
+    if reason is None:
+        reason = payload.get("stop_reason")
+    if reason is None:
+        return None
+    return str(reason)
+
+
+def _is_post_admission_oom_reason(reason: Any) -> bool:
+    if reason is None:
+        return False
+    normalized = str(reason).strip().upper().replace("-", "_")
+    return normalized in {
+        POST_ADMISSION_OOM_REJECTION_REASON,
+        "REJECT_POST_ADMISSION_OOM",
+    }
+
+
 def _ensure_parent_dir(path: str) -> None:
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+
+def _format_load_statistics_table(
+    load_statistics: list[dict[str, Any]] | None,
+) -> str:
+    columns: list[tuple[str, str | None, str]] = [
+        ("dev", None, "left"),
+        ("wait", "n_waitings", "right"),
+        ("run", "n_running", "right"),
+        ("free", "num_free_blocks", "right"),
+        ("eff_free", "effective_num_free_blocks", "right"),
+        ("oom", "n_oom_rejects", "right"),
+        ("arr_oom", "n_arrival_oom_rejects", "right"),
+        ("post_oom", "n_post_admission_oom_rejects", "right"),
+    ]
+    if not isinstance(load_statistics, list) or not load_statistics:
+        return "dev | wait | run | free | eff_free | oom | arr_oom | post_oom\n<empty>"
+
+    def _int_value(stats: dict[str, Any], key: str) -> int:
+        try:
+            return int(stats.get(key, 0))
+        except (TypeError, ValueError):
+            return 0
+
+    rows: list[list[str]] = [[label for label, _, _ in columns]]
+    totals: dict[str, int] = {
+        key: 0 for _, key, _ in columns if key is not None
+    }
+    for device_id, stats in enumerate(load_statistics):
+        stats = stats if isinstance(stats, dict) else {}
+        row = [str(device_id)]
+        for _, key, _ in columns[1:]:
+            assert key is not None
+            value = _int_value(stats, key)
+            row.append(str(value))
+            totals[key] += value
+        rows.append(row)
+
+    total_row = ["total"]
+    for _, key, _ in columns[1:]:
+        assert key is not None
+        total_row.append(str(totals[key]))
+    rows.append(total_row)
+
+    widths = [
+        max(len(row[col_idx]) for row in rows)
+        for col_idx in range(len(columns))
+    ]
+
+    def _format_row(row: list[str]) -> str:
+        cells: list[str] = []
+        for idx, cell in enumerate(row):
+            _, _, align = columns[idx]
+            width = widths[idx]
+            cells.append(
+                cell.ljust(width) if align == "left" else cell.rjust(width)
+            )
+        return " | ".join(cells)
+
+    separator = "-+-".join("-" * width for width in widths)
+    rendered_rows = [_format_row(rows[0]), separator]
+    rendered_rows.extend(_format_row(row) for row in rows[1:])
+    return "\n".join(rendered_rows)
 
 
 def _sorted_metric_columns(fieldnames: list[str], prefix: str) -> list[str]:
@@ -695,6 +790,8 @@ class EngineWorker:
             response['timestamp'] = time.time()
             if isinstance(last_output.kv_transfer_params, dict):
                 response['kv_transfer_params'] = last_output.kv_transfer_params
+            if _is_rejection_payload(response):
+                return False, None, _extract_rejection_reason(response)
         return True, response, None
 
     async def decode_stream(self, req_data: dict, request_id: str):
@@ -875,8 +972,16 @@ class RequestInstance:
         # Staled Request State
         self.num_computed_tokens = 0
         self.timestamps: list[tuple[int, float]] = []
+        self.generated_token_ids: list[int] = []
+        self.generated_text = ""
     
     def update(self, data: dict):
+        token_ids = data.get('token_ids')
+        if isinstance(token_ids, list) and token_ids:
+            self.generated_token_ids.extend(int(token_id) for token_id in token_ids)
+        text = data.get('text')
+        if isinstance(text, str) and text:
+            self.generated_text += text
         if (num_computed_tokens:= data.get('num_computed_tokens', None)) is not None: 
             self.num_computed_tokens = num_computed_tokens
             event_ts = data.get('timestamp', time.time())
@@ -917,6 +1022,34 @@ class RequestInstance:
             return max(0, int(self.payload.get('vllm_xargs', {}).get('cached_tokens', 0)))
         except (TypeError, ValueError):
             return 0
+
+    @property
+    def num_generated_tokens(self) -> int:
+        return len(self.generated_token_ids)
+
+    @property
+    def remaining_output_tokens(self) -> int:
+        total_output_tokens = int(
+            self.payload.get('vllm_xargs', {}).get(
+                'output_length',
+                self.payload.get('max_tokens', 0),
+            ) or 0
+        )
+        return max(total_output_tokens - self.num_generated_tokens, 0)
+
+    def sync_resume_state(self) -> None:
+        extra_args = self.payload.setdefault('vllm_xargs', {})
+        if self.generated_token_ids:
+            extra_args['existing_output_token_ids'] = list(
+                self.generated_token_ids)
+        else:
+            extra_args.pop('existing_output_token_ids', None)
+        self.payload['max_tokens'] = int(
+            extra_args.get(
+                'output_length',
+                self.payload.get('max_tokens', 0),
+            ) or 0
+        )
 
     
     @property
@@ -987,6 +1120,7 @@ class FinishEvent(LoadEvent):
 @dataclass
 class RejectEvent(LoadEvent):
     request_id: str
+    rejection_reason: str | None = None
     
 @dataclass 
 class DeviceStat:
@@ -1893,7 +2027,13 @@ class SLOsServeRouter(Router):
         if not self.oracle_mem:
             return self.admission_max_decode_length
         extra_args = request.payload.get('vllm_xargs', {})
-        return int(extra_args.get('output_length', request.payload.get('max_tokens', self.admission_max_decode_length)))
+        total_decode_length = int(
+            extra_args.get(
+                'output_length',
+                request.payload.get('max_tokens', self.admission_max_decode_length),
+            )
+        )
+        return max(total_decode_length - request.num_generated_tokens, 0)
         
     def get_req_data(self, request: RequestInstance):
         extra_args = request.payload['vllm_xargs']
@@ -1975,7 +2115,13 @@ class SLOsServeRouter(Router):
                 continue
             prefill_ddl, input_length, profit, prefill_mem, _ = self.get_req_data(req)
             if mode == 'prefill_only': prefill_ddl -= self.kv_xfer_delay
-            num_computed = req.num_prompt_tokens if mode == 'decode_only' else self._effective_cached_tokens(req, did, mode)
+            if mode == 'decode_only':
+                num_computed = req.num_prompt_tokens
+            else:
+                num_computed = max(
+                    self._effective_cached_tokens(req, did, mode),
+                    req.num_computed_tokens if req.num_generated_tokens > 0 else 0,
+                )
             decode_length_ub = self._get_decode_length_ub(req)
             remaining_prompt_tokens = max(req.num_prompt_tokens - num_computed, 0)
             n_block_ub = math.ceil((remaining_prompt_tokens + decode_length_ub) / self.block_size)
@@ -2365,7 +2511,14 @@ class SLOsServeRouter(Router):
             if req.admitted: continue
             prefill_ddl, input_length, profit, prefill_mem, mem = self.get_req_data(req)
             decode_length_ub = self._get_decode_length_ub(req)
-            num_computed_tokens = self._effective_cached_tokens(req, did, 'prefill_only' if prefill_only else 'normal')
+            num_computed_tokens = max(
+                self._effective_cached_tokens(
+                    req,
+                    did,
+                    'prefill_only' if prefill_only else 'normal',
+                ),
+                req.num_computed_tokens if req.num_generated_tokens > 0 else 0,
+            )
             remaining_prompt_tokens = max(req.num_prompt_tokens - num_computed_tokens, 0)
             n_block_ub = math.ceil((remaining_prompt_tokens + decode_length_ub) / self.block_size)
             c_req = SLOsServe_C.Request(
@@ -3292,6 +3445,7 @@ class RequestPool:
         load_statistics = await self.get_load_statistics()
         self.load_stat.update(load_statistics)
         routing_iter = 0
+        last_report_at = time.time() - 10.0
         while True:
             if self.auto_scaler is not None: 
                 if time.time() >= next_auto_scaling_time:
@@ -3328,6 +3482,14 @@ class RequestPool:
                 if best_effort_waiting_requests:
                     self._route_best_effort_requests(best_effort_waiting_requests)
             routing_elapsed = time.time() - it_start_time
+            now = time.time()
+            if now >= last_report_at + 10.0:
+                last_report_at = now
+                logger.info(
+                    "Routing loop: routing_elapsed=%s\n%s",
+                    routing_elapsed,
+                    _format_load_statistics_table(self.load_stat.stats),
+                )
 
             if len(self.waiting_pool) > 0:
                 self._profile_events.append({
@@ -3349,8 +3511,6 @@ class RequestPool:
                         'routing_iter': routing_iter 
                     }
                 })
-                if routing_iter % 100 == 0:
-                    logger.info(f"Routing loop: routing_iter={routing_iter}, load_statistics={self.load_stat.stats}")
             
             to_logging = time.time() - it_start_time
 
@@ -3566,6 +3726,7 @@ class RequestPool:
                 'request_id': request.request_id
             })
             admission_history['prefill_ddl'] = admission_history.get('prefill_ddl', request.payload['vllm_xargs']['prefill_ddl'] - time.time())
+            request.sync_resume_state()
 
             admitted, generator, rejection_reason = await stream_service_response_engine(
                 request.prefill_device_id,
@@ -3582,6 +3743,7 @@ class RequestPool:
                     'device_id': request.prefill_device_id,
                     'request_id': request.request_id,
                     'service_tier': request.service_tier,
+                    'rejection_reason': request.rejection_reason,
                 })
                 admission_history.update({
                     'is_rejected': True
@@ -3611,11 +3773,45 @@ class RequestPool:
                 "request_id": request.request_id,
                 "device_id": -1
             })
+            stream_rejection_reason: str | None = None
             async for data in generator:
                 request.update(data)
+                if _is_rejection_payload(data):
+                    stream_rejection_reason = _extract_rejection_reason(data)
+                    request.rejection_reason = stream_rejection_reason
+                    if self.enable_rescheduling and _is_post_admission_oom_reason(
+                        stream_rejection_reason,
+                    ):
+                        continue
                 await request.response_queue.put(data)
-            await request.response_queue.put(None)
-            self.update_req_state(request, RequestState.DECODE_FINISHED)
+            if stream_rejection_reason is not None:
+                self.load_stat.add_event({
+                    'type': 'reject',
+                    'timestamp': time.time(),
+                    'device_id': request.decode_device_id,
+                    'request_id': request.request_id,
+                    'service_tier': request.service_tier,
+                    'rejection_reason': stream_rejection_reason,
+                })
+                if self.enable_rescheduling and _is_post_admission_oom_reason(
+                    stream_rejection_reason,
+                ):
+                    self.waiting_pool.append(request)
+                    self.running_pool.remove(request)
+                    request.admitted = None
+                    request.prefill_device_id = request.decode_device_id = -1
+                    self.update_req_state(request, RequestState.WAITING)
+                    self._emit_rescheduling_event(
+                        request_id=request.request_id,
+                        prefill_device_id=attempted_prefill_device_id,
+                        decode_device_id=attempted_decode_device_id,
+                    )
+                    return
+                await request.response_queue.put(None)
+                self.update_req_state(request, RequestState.DECODE_REJECTED)
+            else:
+                await request.response_queue.put(None)
+                self.update_req_state(request, RequestState.DECODE_FINISHED)
             return 
         
         if request.state < RequestState.PREFILL_FINISHED:
@@ -3639,6 +3835,7 @@ class RequestPool:
             })
 
             logger.debug(f"Request {request.request_id} sending to prefill device {request.prefill_device_id}")
+            request.sync_resume_state()
             request.payload['vllm_xargs']['prefill_ddl'] -= self.kv_xfer_delay
             request.payload['vllm_xargs']['slo_ttft'] -= self.kv_xfer_delay
             admitted, response, rejection_reason = await send_request_to_service_engine(
@@ -3658,6 +3855,7 @@ class RequestPool:
                     'device_id': request.prefill_device_id,
                     'request_id': request.request_id,
                     'service_tier': request.service_tier,
+                    'rejection_reason': request.rejection_reason,
                 })
                 self.update_req_state(request, RequestState.PREFILL_REJECTED)
                 if self.enable_rescheduling:
@@ -3736,6 +3934,7 @@ class RequestPool:
         is_rejected = False
         attempted_prefill_device_id = request.prefill_device_id
         attempted_decode_device_id = request.decode_device_id
+        request.sync_resume_state()
         admitted, generator, rejection_reason = await stream_service_response_engine(
             request.decode_device_id,
             request.payload,
@@ -3751,6 +3950,7 @@ class RequestPool:
                 'device_id': request.decode_device_id,
                 'request_id': request.request_id,
                 'service_tier': request.service_tier,
+                'rejection_reason': request.rejection_reason,
             })
             self.update_req_state(request, RequestState.DECODE_REJECTED)
             if self.enable_rescheduling:
@@ -3772,23 +3972,69 @@ class RequestPool:
                 await request.response_queue.put(None)
             return 
             
+        stream_rejection_reason: str | None = None
         async for data in generator:
             request.update(data)
-            if not is_rejected:
+            if _is_rejection_payload(data):
+                stream_rejection_reason = _extract_rejection_reason(data)
+                request.rejection_reason = stream_rejection_reason
+                is_rejected = True
+                if self.enable_rescheduling and _is_post_admission_oom_reason(
+                    stream_rejection_reason,
+                ):
+                    continue
+            if not is_rejected or _is_rejection_payload(data):
                 await request.response_queue.put(data)
-                
-        self.load_stat.add_event({
-            'type': 'finish',
-            'timestamp': time.time(),
-            'device_id': request.decode_device_id,
-            'request_id': request.request_id,
-            'is_rejection': False,
-            'is_slo_violation': request.is_slo_violation,
-            'service_tier': request.service_tier,
-        })
+
+        if stream_rejection_reason is not None:
+            self.load_stat.add_event({
+                'type': 'reject',
+                'timestamp': time.time(),
+                'device_id': request.decode_device_id,
+                'request_id': request.request_id,
+                'service_tier': request.service_tier,
+                'rejection_reason': stream_rejection_reason,
+            })
+            if self.enable_rescheduling and _is_post_admission_oom_reason(
+                stream_rejection_reason,
+            ):
+                self.update_req_state(request, RequestState.DECODE_REJECTED)
+                self.update_req_state(request, RequestState.DECODE_REJECTED_WAITING)
+                self.waiting_pool.append(request)
+                self.running_pool.remove(request)
+                request.admitted = None
+                request.decode_device_id = -1
+                self._emit_rescheduling_event(
+                    request_id=request.request_id,
+                    prefill_device_id=attempted_prefill_device_id,
+                    decode_device_id=attempted_decode_device_id,
+                )
+                logger.debug(
+                    "Request %s waiting for rescheduling after post-admission OOM",
+                    request.request_id,
+                )
+                return
+        else:
+            self.load_stat.add_event({
+                'type': 'finish',
+                'timestamp': time.time(),
+                'device_id': request.decode_device_id,
+                'request_id': request.request_id,
+                'is_rejection': False,
+                'is_slo_violation': request.is_slo_violation,
+                'service_tier': request.service_tier,
+            })
         await request.response_queue.put(None)
-        self.update_req_state(request, RequestState.DECODE_FINISHED)
-        logger.debug(f"Request {request.request_id} finished decode (disaggregated)")
+        if stream_rejection_reason is not None:
+            self.update_req_state(request, RequestState.DECODE_REJECTED)
+            logger.debug(
+                "Request %s finished decode with streamed rejection reason=%s",
+                request.request_id,
+                stream_rejection_reason,
+            )
+        else:
+            self.update_req_state(request, RequestState.DECODE_FINISHED)
+            logger.debug(f"Request {request.request_id} finished decode (disaggregated)")
 
 request_pool: RequestPool | None = None
 

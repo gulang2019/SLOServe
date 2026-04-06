@@ -8,6 +8,7 @@ from typing import Callable
 from sklearn.metrics import r2_score
 import matplotlib
 
+from plots.common import get_method_style
 
 from SLOsServe.perf_model import PerfModel
 filepath = 'events/Qwen_Qwen2.5-7B-Instruct_pd_sharegpt_chat_azure_chat_0-500_0.1.jsonl'
@@ -1038,18 +1039,27 @@ def _plot_step_series(
     linewidth: float = 2.0,
     linestyle: str = "-",
     alpha: float = 1.0,
+    marker: str | None = None,
+    markersize: float = 5.0,
 ) -> None:
     if time.size == 0 or values.size == 0:
         return
+    plot_kwargs = {
+        "where": "post",
+        "label": label,
+        "color": color,
+        "linewidth": linewidth,
+        "linestyle": linestyle,
+        "alpha": alpha,
+    }
+    if marker:
+        plot_kwargs["marker"] = marker
+        plot_kwargs["markersize"] = markersize
+        plot_kwargs["markevery"] = max(1, int(time.size // 12))
     ax.step(
         time,
         values,
-        where="post",
-        label=label,
-        color=color,
-        linewidth=linewidth,
-        linestyle=linestyle,
-        alpha=alpha,
+        **plot_kwargs,
     )
 
 def calc_n_active_servers(
@@ -3855,6 +3865,7 @@ def draw_energy_comparison(
     line_styles: Dict[str, str] | None = None,
     per_device: bool = False,
     window_size: float = 1.0,
+    output_prefix = "energy_comparison"
 ):
     if line_styles is None:
         line_styles = {}
@@ -3916,7 +3927,6 @@ def draw_energy_comparison(
     arrival_window = 5
     violation_window = 5
     linewidth = 2
-    cmap = plt.get_cmap('tab10', max(len(parsed_event_files), 1))
     legend_handles = []
     trace_data = []
     all_energies = {}
@@ -3924,11 +3934,23 @@ def draw_energy_comparison(
     arrival_counts = np.array([], dtype=np.float64)
     max_num_devices = 0
 
-    for idx, (label, file, n_device) in enumerate(parsed_event_files):
-        color = cmap(idx)
+    for label, file, n_device in parsed_event_files:
+        style = get_method_style(label)
+        color = style["color"]
+        marker = style["marker"]
+        markersize = float(style["markersize"])
         linestyle = line_styles.get(label, '-')
         legend_handles.append(
-            plt.Line2D([0], [0], color=color, linewidth=2.5, linestyle=linestyle, label=label)
+            plt.Line2D(
+                [0],
+                [0],
+                color=color,
+                linewidth=2.5,
+                linestyle=linestyle,
+                marker=marker,
+                markersize=markersize,
+                label=label,
+            )
         )
         events, reqs = analyze_events(file)
         if arrival_time_axis.size == 0:
@@ -3956,6 +3978,8 @@ def draw_energy_comparison(
             "label": label,
             "file": file,
             "color": color,
+            "marker": marker,
+            "markersize": markersize,
             "linestyle": linestyle,
             "events": events,
             "reqs": reqs,
@@ -4018,6 +4042,8 @@ def draw_energy_comparison(
             color=trace["color"],
             linewidth=2.5,
             linestyle=trace["linestyle"],
+            marker=trace["marker"],
+            markersize=trace["markersize"],
         )
         _plot_step_series(
             active_ax,
@@ -4027,6 +4053,8 @@ def draw_energy_comparison(
             color=trace["color"],
             linewidth=2.5,
             linestyle=trace["linestyle"],
+            marker=trace["marker"],
+            markersize=trace["markersize"],
         )
         if trace["violation_time_axis"].size:
             violation_ax.step(
@@ -4036,6 +4064,9 @@ def draw_energy_comparison(
                 color=trace["color"],
                 linewidth=linewidth,
                 linestyle=trace["linestyle"],
+                marker=trace["marker"],
+                markersize=trace["markersize"],
+                markevery=max(1, int(trace["violation_time_axis"].size // 12)),
             )
         if per_device:
             for device_id, device_ax in enumerate(device_power_axes):
@@ -4050,12 +4081,14 @@ def draw_energy_comparison(
                     color=trace["color"],
                     linewidth=2.2,
                     linestyle=trace["linestyle"],
+                    marker=trace["marker"],
+                    markersize=trace["markersize"],
                 )
 
     print('all_energies', {label: np.mean(value) for label, value in all_energies.items()})
 
     total_power_ax.set_ylabel('GPU Power\n(W)', fontsize=30)
-    total_power_ax.set_ylim(0, 1500)
+    # total_power_ax.set_ylim(0, 1500)
     total_power_ax.set_xlabel("")
     total_power_ax.grid(True, alpha=0.3)
 
@@ -4081,8 +4114,10 @@ def draw_energy_comparison(
         loc='upper center',
         ncol=max(1, min(4, len(legend_handles))),
     )
-    fig.savefig(f'energy_comparison-{output_suffix}.png')
-    print(f'saved to energy_comparison-{output_suffix}.png')
+    fig.savefig(f'{output_prefix}-{output_suffix}.png')
+    fig.savefig(f'{output_prefix}-{output_suffix}.pdf')
+    print(f'saved to {output_prefix}-{output_suffix}.png')
+    print(f'saved to {output_prefix}-{output_suffix}.pdf')
     
     # fig, ax = plt.subplots(tight_layout = True, figsize = (5, 5))
     # labels = list(all_energies.keys())

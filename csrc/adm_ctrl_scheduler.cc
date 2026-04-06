@@ -1513,16 +1513,17 @@ std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::_admission_co
                 return {false, "CMP"};
             if (n_decode > 0) {
                 size_t decode_n_reqs = std::max<size_t>(1, n_decode);
+                double elapsed = t - now;
                 size_t decode_n_past_tokens =
                     static_cast<size_t>(std::max(0, active_decode_past_tokens));
+                size_t n_batch = std::floor(elapsed / tpot);
+                decode_n_past_tokens += (n_batch / 2) * n_decode;
                 int decode_bs = planner->time_to_batch(
                     tpot, decode_n_reqs, decode_n_past_tokens, 1);
                 double decode_time = planner->batch_to_time(
                     decode_bs, decode_n_reqs, decode_n_past_tokens, 1);
                 if (n_decode > static_cast<size_t>(decode_bs))
                     return {false, "CMP"};
-                double elapsed = t - now;
-                size_t n_batch = std::floor(elapsed / decode_time);
                 remained_mem -= n_batch * n_decode;
                 if (remained_mem < 0) {
                     return {false, "MEM"};

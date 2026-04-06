@@ -449,6 +449,8 @@ def _normalize_rejection_reason(reason: Any) -> str | None:
         return "memory"
     if normalized in {"OOM", "REJECTED-OOM", "OUT_OF_MEMORY"}:
         return "oom"
+    if normalized in {"POST_ADMISSION_OOM", "REJECT_POST_ADMISSION_OOM"}:
+        return "reject-post-admission-oom"
     if normalized in {"ROUTER", "ROUTER_REJECTION"}:
         return "router"
     if normalized == "UNKNOWN":
@@ -3027,6 +3029,7 @@ def _summarize_boxplot(values: List[float], *, label: str) -> Dict[str, Any] | N
         "label": label,
         "count": int(data.size),
         "mean": float(np.mean(data)),
+        "std": float(np.std(data)),
         "min": float(np.min(data)),
         "max": float(np.max(data)),
         "q1": float(np.percentile(data, 25)),
@@ -3593,6 +3596,7 @@ def _draw_serialized_boxplot(
     title: str,
     xlabel: str,
     ylabel: str,
+    show_std: bool = False,
 ) -> None:
     if not stats:
         ax.text(0.5, 0.5, "No samples", ha="center", va="center")
@@ -3608,6 +3612,42 @@ def _draw_serialized_boxplot(
     for median in artists["medians"]:
         median.set_color("#222222")
         median.set_linewidth(1.8)
+    if show_std:
+        std_positions: list[int] = []
+        std_means: list[float] = []
+        std_values: list[float] = []
+        for idx, item in enumerate(stats, start=1):
+            mean = item.get("mean")
+            std = item.get("std")
+            if mean is None or std is None:
+                continue
+            try:
+                mean_value = float(mean)
+                std_value = float(std)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(mean_value) or not np.isfinite(std_value):
+                continue
+            std_positions.append(idx)
+            std_means.append(mean_value)
+            std_values.append(std_value)
+        if std_positions:
+            ax.errorbar(
+                std_positions,
+                std_means,
+                yerr=std_values,
+                fmt="o",
+                color="#111827",
+                mfc="white",
+                mec="#111827",
+                markersize=4.5,
+                linewidth=1.2,
+                elinewidth=1.2,
+                capsize=4,
+                label="Mean ± 1 std",
+                zorder=3,
+            )
+            ax.legend(frameon=False, loc="best")
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
@@ -3632,6 +3672,7 @@ def _save_power_distribution_figure(
         title=f"{title_prefix}: Power vs # Active Servers",
         xlabel=active_servers_summary.get("xlabel", "# Active Servers"),
         ylabel=active_servers_summary.get("ylabel", "Power (W)"),
+        show_std=True,
     )
     _draw_serialized_boxplot(
         axes[1],

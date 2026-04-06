@@ -19,6 +19,9 @@ DEFAULT_LOAD_STATS = {
     "n_regular_running": 0,
     "n_best_effort_waitings": 0,
     "n_best_effort_running": 0,
+    "n_oom_rejects": 0,
+    "n_arrival_oom_rejects": 0,
+    "n_post_admission_oom_rejects": 0,
 }
 
 

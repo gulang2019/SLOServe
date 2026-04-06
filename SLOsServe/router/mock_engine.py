@@ -662,6 +662,14 @@ class MockEngineCore:
             client_index = 0,
             block_hasher = self.request_block_hasher 
         )
+        existing_output_token_ids = sampling_params.extra_args.get(
+            'existing_output_token_ids',
+            []
+        )
+        if existing_output_token_ids:
+            request.append_output_token_ids([
+                int(token_id) for token_id in existing_output_token_ids
+            ])
         
         self._profile_events.append({
             "event_type": "arrival",

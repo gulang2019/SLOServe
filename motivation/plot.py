@@ -35,12 +35,9 @@ def draw_figures(experiment_dir, df):
         nrows = math.ceil(n_groups / ncols)
 
         for xlabel, ylabel in [
-            (feature, 'energy_est'),
-            (feature, 'slo_violation_rate'),
-            (feature, 'energy_consumption'),
-            (feature, 'energy_consumption_active'),
-            (feature, 'energy_consumption_non_idle'),
+            ('slo_violation_rate', feature)
             ('slo_violation_rate', 'energy_consumption'),
+            # ('energy_consumption', 'slo_violation_rate')
         ]:
             if xlabel not in df.columns or ylabel not in df.columns:
                 continue
@@ -69,7 +66,6 @@ def draw_figures(experiment_dir, df):
             for extra_idx in range(idx, nrows * ncols):
                 row, col = divmod(extra_idx, ncols)
                 axes[row][col].set_visible(False)
-
             fig.tight_layout()
             output_path = f'{experiment_dir}/figs/{ylabel}_vs_{xlabel}_change_{feature}.png'
             fig.savefig(output_path, dpi=300)
