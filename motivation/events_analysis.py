@@ -3970,6 +3970,19 @@ def draw_energy_comparison(
         violation_time_axis, violation_counts = _compute_slo_violations(reqs, file, violation_window)
         active_devices = _count_active_devices_from_power_summary(power_summary)
         all_energies[label] = power_summary["total_power"].tolist()
+        power_time = np.asarray(power_summary["time"], dtype=np.float64)
+        total_power = np.asarray(power_summary["total_power"], dtype=np.float64)
+        cumulative_energy_time = np.array([], dtype=np.float64)
+        cumulative_energy = np.array([], dtype=np.float64)
+        if power_time.size:
+            cumulative_energy_time = np.concatenate((
+                [0.0],
+                power_time + float(window_size),
+            ))
+            cumulative_energy = np.concatenate((
+                [0.0],
+                np.cumsum(total_power * float(window_size)),
+            ))
         max_device_id = max(power_summary["per_device_power"], default=-1)
         max_num_devices = max(max_num_devices, max_device_id + 1)
         if n_device > 0:
@@ -3987,11 +4000,13 @@ def draw_energy_comparison(
             "active_devices": active_devices,
             "violation_time_axis": violation_time_axis,
             "violation_counts": violation_counts,
+            "cumulative_energy_time": cumulative_energy_time,
+            "cumulative_energy": cumulative_energy,
         })
 
     if per_device:
-        num_axes = 4 + max_num_devices
-        fig_height = max(14, 2.6 * max(num_axes, 1))
+        num_axes = 5 + max_num_devices
+        fig_height = max(16, 2.6 * max(num_axes, 1))
         fig, axes = plt.subplots(
             num_axes,
             figsize=(18, fig_height),
@@ -4004,13 +4019,15 @@ def draw_energy_comparison(
         device_power_axes = axes[2: 2 + max_num_devices]
         active_ax = axes[2 + max_num_devices]
         violation_ax = axes[3 + max_num_devices]
+        energy_ax = axes[4 + max_num_devices]
     else:
-        fig, axes = plt.subplots(4, figsize=(16, 16), sharex=True, tight_layout=True)
+        fig, axes = plt.subplots(5, figsize=(16, 19), sharex=True, tight_layout=True)
         axes = np.atleast_1d(axes)
         arrival_ax = axes[0]
         active_ax = axes[1]
         total_power_ax = axes[2]
         violation_ax = axes[3]
+        energy_ax = axes[4]
         device_power_axes = []
 
     if arrival_time_axis.size:
@@ -4068,6 +4085,23 @@ def draw_energy_comparison(
                 markersize=trace["markersize"],
                 markevery=max(1, int(trace["violation_time_axis"].size // 12)),
             )
+        if trace["cumulative_energy_time"].size:
+            energy_plot_kwargs = {
+                "color": trace["color"],
+                "linewidth": 2.5,
+                "linestyle": trace["linestyle"],
+            }
+            if trace["marker"]:
+                energy_plot_kwargs["marker"] = trace["marker"]
+                energy_plot_kwargs["markersize"] = trace["markersize"]
+                energy_plot_kwargs["markevery"] = max(
+                    1, int(trace["cumulative_energy_time"].size // 12)
+                )
+            energy_ax.plot(
+                trace["cumulative_energy_time"],
+                trace["cumulative_energy"],
+                **energy_plot_kwargs,
+            )
         if per_device:
             for device_id, device_ax in enumerate(device_power_axes):
                 device_power = trace["power_summary"]["per_device_power"].get(device_id)
@@ -4105,9 +4139,14 @@ def draw_energy_comparison(
     active_ax.grid(True, alpha=0.3)
 
     violation_ax.set_ylabel('SLO Viol.\nPer Window', fontsize=30)
-    violation_ax.set_xlabel('Time (s)', fontsize=30)
+    violation_ax.set_xlabel("")
     violation_ax.set_ylim(0)
     violation_ax.grid(True, alpha=0.3)
+
+    energy_ax.set_ylabel('Cumulative\nEnergy (J)', fontsize=30)
+    energy_ax.set_xlabel('Time (s)', fontsize=30)
+    energy_ax.set_ylim(0)
+    energy_ax.grid(True, alpha=0.3)
 
     fig.legend(
         handles=legend_handles,
