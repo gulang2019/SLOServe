@@ -6031,6 +6031,9 @@ def build_problems(
             opt_n_prefill_devices = int(optimal_prefill_ratio * group_size)
             opt_n_prefill_devices = min(max(opt_n_prefill_devices, 1), n_device - 1)
             print(f'opt_n_prefill_devices: {opt_n_prefill_devices}')
+            if len(_args) >= 3:
+                opt_n_prefill_devices = int(_args[2])
+            print(f'use: {opt_n_prefill_devices}/{group_size} for prefill')
             extra_kwargs = {
                 'group_size': group_size,
                 'is_pd_disagg': True,
