@@ -24,7 +24,7 @@ def timeline_comparison(
 ):
     if prefix is None:
         prefix = str(get_paper_figure_dir("timeline_comparison", "timeline_comparison") / "energy_consumption")
-    draw_energy_comparison(event_files, output_suffix=surfix, output_prefix= prefix)
+    draw_energy_comparison(event_files, output_suffix=surfix, output_prefix= prefix, per_device=True)
 
 
 def _infer_trace_style_key(event_file: str) -> str:
