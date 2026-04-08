@@ -683,6 +683,7 @@ def main(
     replay_metadata=None,
     export_metadata: bool = True,
     metadata_only: bool = False,
+    whitelist:set|None = None
 ):
     if replay_metadata:
         replay_figures_from_metadata(replay_metadata)
@@ -696,6 +697,7 @@ def main(
             **kwargs,
             export_metadata=export_metadata,
             render=not metadata_only,
+            whitelist=whitelist
         )
 
 
