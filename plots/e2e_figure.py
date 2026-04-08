@@ -497,7 +497,7 @@ def _build_power_figure_spec(
     }
 
 
-def build_figure_specs(name, file, xlim=None, is_disagg=False, whitelist=None):
+def build_figure_specs(name, file, xlim=None, is_disagg=False, whitelist=None, dirname: str = 'e2e_figure'):
     _require_pandas()
     df = pd.read_json(file, lines=True)
     if df.empty:
@@ -507,7 +507,7 @@ def build_figure_specs(name, file, xlim=None, is_disagg=False, whitelist=None):
     if not required_columns.issubset(df.columns):
         return []
 
-    output_dir = get_paper_figure_dir('e2e_figure', 'draw_figures')
+    output_dir = get_paper_figure_dir(dirname, 'draw_figures')
     df = df.copy()
     df['slo_violation_rate'] *= 100
 
@@ -563,15 +563,18 @@ def _render_axis_spec(ax, axis_spec):
         )
 
     for annotation in axis_spec.get('annotations', []):
+        annotate_kwargs = {
+            'xy': tuple(annotation['xy']),
+            'xytext': tuple(annotation['xytext']),
+            'textcoords': annotation.get('textcoords', 'offset points'),
+        }
+        for key in ('color', 'fontsize', 'va', 'ha'):
+            value = annotation.get(key)
+            if value is not None:
+                annotate_kwargs[key] = value
         ax.annotate(
             annotation['text'],
-            xy=tuple(annotation['xy']),
-            xytext=tuple(annotation['xytext']),
-            textcoords=annotation.get('textcoords', 'offset points'),
-            color=annotation.get('color'),
-            fontsize=annotation.get('fontsize'),
-            va=annotation.get('va'),
-            ha=annotation.get('ha'),
+            **annotate_kwargs,
         )
 
     ax.set_xlabel(axis_spec.get('xlabel', ''))
@@ -663,6 +666,7 @@ def draw_figures(
     whitelist=None,
     export_metadata: bool = True,
     render: bool = True,
+    dirname: str = 'e2e_figure'
 ):
     specs = build_figure_specs(
         name=name,
@@ -670,6 +674,7 @@ def draw_figures(
         xlim=xlim,
         is_disagg=is_disagg,
         whitelist=whitelist,
+        dirname = dirname
     )
     for spec in specs:
         if export_metadata:
@@ -683,7 +688,8 @@ def main(
     replay_metadata=None,
     export_metadata: bool = True,
     metadata_only: bool = False,
-    whitelist:set|None = None
+    whitelist:set|None = None,
+    dirname: str = 'e2e_figure'
 ):
     if replay_metadata:
         replay_figures_from_metadata(replay_metadata)
@@ -697,7 +703,8 @@ def main(
             **kwargs,
             export_metadata=export_metadata,
             render=not metadata_only,
-            whitelist=whitelist
+            whitelist=whitelist,
+            dirname = dirname
         )
 
 
