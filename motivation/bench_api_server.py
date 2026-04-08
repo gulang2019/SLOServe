@@ -49,7 +49,8 @@ REQUEST_CANCEL_GRACE_S = 5.0
 BENCHMARK_METRIC_WINDOW_S = 1.0
 BENCHMARK_IDLE_POWER_PER_GPU_W = 70.0
 BENCHMARK_BATCH_POWER_MATCH_TOLERANCE_S = 0.2
-BENCHMARK_ENERGY_WINDOW_OFFSET_S = 10.0
+BENCHMARK_ENERGY_RUN_START_DELAY_S = 30.0
+BENCHMARK_ENERGY_LAST_ARRIVAL_DELAY_S = 30.0
 DEFAULT_REPORT_TTFT_SLO_SCALES = (2.0, 3.0, 5.0, 7.0, 10.0)
 DEFAULT_REPORT_SLO_TPOTS = (0.015, 0.025, 0.05, 0.10, 0.2)
 
@@ -299,6 +300,7 @@ def _build_concise_result_row(
             "normal_slo_attainment_rate": result.get(
                 "normal_slo_attainment_rate"
             ),
+            "asap_request_ratio": result.get("asap_request_ratio"),
             "rejection_rate": result.get("rejection_rate"),
             "rejection_reason_counts": rejection_reason_counts,
             "cache_hit_rate": cache_hit_rate,
@@ -2199,8 +2201,11 @@ def _make_overload_run_result(
             "overload_error_type": type(error).__name__,
             "overload_error": str(error),
             "extra_metrics": {
+                "energy_all": 0.0,
                 "energy_consumption_active": 0.0,
                 "energy_consumption_non_idle": 0.0,
+                "benchmark_active_duration_seconds": 0.0,
+                "average_power_active_w": 0.0,
                 "per_server_energy_consumption": zero_metrics.copy(),
                 "per_server_power": zero_metrics.copy(),
                 "per_server_rps": zero_metrics.copy(),
@@ -2447,6 +2452,54 @@ def _request_finish_time(req: Any) -> float:
     return float(getattr(req, "arrival_time", 0.0))
 
 
+def _summarize_asap_request_metrics(
+    events: List[Dict[str, Any] | Any],
+    *,
+    total_requests: int | None = None,
+) -> Dict[str, Any]:
+    initial_service_tier_by_request: dict[str, str] = {}
+    regular_request_ids: set[str] = set()
+    asap_request_ids: set[str] = set()
+
+    for event in events:
+        request_id = _event_value(event, "request_id")
+        if request_id is None:
+            continue
+        request_id = str(request_id)
+
+        initial_service_tier = _event_value(event, "initial_service_tier")
+        if initial_service_tier is not None:
+            initial_service_tier_by_request[request_id] = str(
+                initial_service_tier
+            )
+        elif request_id not in initial_service_tier_by_request:
+            service_tier = _event_value(event, "service_tier")
+            if service_tier is not None:
+                initial_service_tier_by_request[request_id] = str(service_tier)
+
+        if (
+            initial_service_tier_by_request.get(request_id, "default")
+            != "best_effort"
+        ):
+            regular_request_ids.add(request_id)
+
+        if _event_value(event, "event_type") == "router_asap":
+            asap_request_ids.add(request_id)
+
+    denominator = (
+        max(0, int(total_requests))
+        if total_requests is not None
+        else len(regular_request_ids)
+    )
+    asap_request_count = len(asap_request_ids)
+    return {
+        "asap_request_count": asap_request_count,
+        "asap_request_ratio": (
+            float(asap_request_count / denominator) if denominator > 0 else 0.0
+        ),
+    }
+
+
 def _summarize_service_tier_metrics(
     reqs: Dict[str, Any],
     all_events: List[Any],
@@ -2586,12 +2639,24 @@ def _apply_service_tier_reporting(
 def summarize_energy_events(
     events: List[Dict[str, Any] | Any],
     n_devices: int | None = None,
+    *,
+    start_time: float | None = None,
+    end_time: float | None = None,
 ) -> tuple[List[float], float]:
     per_gpu: Dict[int, float] = {}
     limit = None if n_devices is None else max(0, int(n_devices))
     for event in events:
         if _event_value(event, "event_type") != "energy":
             continue
+        timestamp = _event_value(event, "timestamp")
+        if start_time is not None or end_time is not None:
+            if timestamp is None:
+                continue
+            ts = float(timestamp)
+            if start_time is not None and ts < float(start_time):
+                continue
+            if end_time is not None and ts >= float(end_time):
+                continue
         device_id = int(_event_value(event, "device_id", 0))
         if device_id < 0:
             continue
@@ -2619,6 +2684,9 @@ def _event_value(event: Dict[str, Any] | Any, key: str, default: Any = None) -> 
 def _summarize_per_server_energy_metrics(
     events: List[Dict[str, Any] | Any],
     n_devices: int,
+    *,
+    start_time: float | None = None,
+    end_time: float | None = None,
 ) -> Dict[str, List[float]]:
     per_server_energy = [0.0 for _ in range(max(0, int(n_devices)))]
     per_server_elapsed = [0.0 for _ in range(len(per_server_energy))]
@@ -2629,6 +2697,15 @@ def _summarize_per_server_energy_metrics(
     for event in events:
         if _event_value(event, "event_type") != "energy":
             continue
+        timestamp = _event_value(event, "timestamp")
+        if start_time is not None or end_time is not None:
+            if timestamp is None:
+                continue
+            ts = float(timestamp)
+            if start_time is not None and ts < float(start_time):
+                continue
+            if end_time is not None and ts >= float(end_time):
+                continue
         try:
             device_id = int(_event_value(event, "device_id", -1))
         except (TypeError, ValueError):
@@ -2887,22 +2964,32 @@ def _resolve_benchmark_window_bounds(
     reqs: Dict[str, Any],
     *,
     window_size: float,
+    arrival_times: list[float] | None = None,
 ) -> tuple[float, float]:
-    arrival_times: list[float] = []
-    for req in reqs.values():
-        arrival_time = getattr(req, "engine_arrival_time", -1.0)
-        if arrival_time is None or arrival_time < 0:
-            arrival_time = getattr(req, "arrival_time", -1.0)
-        if arrival_time is not None and arrival_time >= 0:
-            arrival_times.append(float(arrival_time))
+    resolved_arrival_times: list[float] = []
+    if arrival_times is not None:
+        resolved_arrival_times = [
+            float(arrival_time)
+            for arrival_time in arrival_times
+            if arrival_time is not None and float(arrival_time) >= 0.0
+        ]
+    if not resolved_arrival_times:
+        for req in reqs.values():
+            arrival_time = getattr(req, "engine_arrival_time", -1.0)
+            if arrival_time is None or arrival_time < 0:
+                arrival_time = getattr(req, "arrival_time", -1.0)
+            if arrival_time is not None and arrival_time >= 0:
+                resolved_arrival_times.append(float(arrival_time))
 
-    if arrival_times:
-        first_arrival = min(arrival_times)
-        last_arrival = max(arrival_times)
-        # Measure benchmark energy in the requested arrival-anchored window.
+    if resolved_arrival_times:
+        last_arrival = max(resolved_arrival_times)
+        # Measure the stable region from 30s after benchmark start through
+        # 30s after the final request arrival.
+        start_time = float(BENCHMARK_ENERGY_RUN_START_DELAY_S)
+        end_time = float(last_arrival + BENCHMARK_ENERGY_LAST_ARRIVAL_DELAY_S)
         return (
-            first_arrival + BENCHMARK_ENERGY_WINDOW_OFFSET_S,
-            last_arrival + BENCHMARK_ENERGY_WINDOW_OFFSET_S,
+            start_time,
+            max(end_time, start_time + float(window_size)),
         )
 
     # Fallback: keep previous event-derived behavior when request arrivals are missing.
@@ -3963,14 +4050,19 @@ def _summarize_benchmark_energy_and_figures(
     output_prefix: str,
     scheduling_policy: str,
     routing_policy: str,
+    start_time: float | None = None,
+    end_time: float | None = None,
+    arrival_times: list[float] | None = None,
     window_size: float = BENCHMARK_METRIC_WINDOW_S,
     idle_power_per_gpu: float = BENCHMARK_IDLE_POWER_PER_GPU_W,
 ) -> Dict[str, Any]:
-    start_time, end_time = _resolve_benchmark_window_bounds(
-        events,
-        reqs,
-        window_size=window_size,
-    )
+    if start_time is None or end_time is None:
+        start_time, end_time = _resolve_benchmark_window_bounds(
+            events,
+            reqs,
+            window_size=window_size,
+            arrival_times=arrival_times,
+        )
     power_summary = _compute_measured_power_series(
         events,
         n_device=n_devices,
@@ -4010,6 +4102,12 @@ def _summarize_benchmark_energy_and_figures(
     any_active = np.asarray(active_req_summary["any_active"][:n_windows], dtype=bool)
 
     energy_consumption_active = float(np.sum(total_energy[any_active]))
+    active_duration_s = float(np.sum(any_active.astype(np.float64)) * window_size)
+    average_power_active_w = (
+        float(energy_consumption_active / active_duration_s)
+        if active_duration_s > 0.0
+        else 0.0
+    )
     idle_energy_per_window = float(
         idle_power_per_replica * max(0, int(n_devices)) * window_size
     )
@@ -4065,6 +4163,10 @@ def _summarize_benchmark_energy_and_figures(
     return {
         "energy_consumption_active": energy_consumption_active,
         "energy_consumption_non_idle": energy_consumption_non_idle,
+        "benchmark_active_duration_seconds": active_duration_s,
+        "average_power_active_w": average_power_active_w,
+        "benchmark_window_start_seconds": float(start_time),
+        "benchmark_window_end_seconds": float(end_time),
         "benchmark_window_size_seconds": float(window_size),
         "benchmark_idle_power_per_gpu_w": float(idle_power_per_gpu),
         "benchmark_idle_power_per_replica_w": float(idle_power_per_replica),
@@ -5065,6 +5167,14 @@ async def main(
     )
     batch_token_summary = _summarize_batch_token_metrics(events)
     events, reqs = analyze_events(filename, verbose = True)
+    benchmark_window_start_s, benchmark_window_end_s = (
+        _resolve_benchmark_window_bounds(
+            events,
+            reqs,
+            window_size=BENCHMARK_METRIC_WINDOW_S,
+            arrival_times=arrival_times,
+        )
+    )
     results = analyze_slo_violation(reqs, events, 
                                     model_name = problem.model_name, 
                                     length_pattern = problem.perf_model_task,
@@ -5079,6 +5189,10 @@ async def main(
                                     group_size = problem.routing_kwargs.get('group_size'),
                                     draw = True)
     service_tier_metrics = _summarize_service_tier_metrics(reqs, events)
+    asap_request_metrics = _summarize_asap_request_metrics(
+        events,
+        total_requests=len(requests),
+    )
     results = _apply_service_tier_reporting(results, service_tier_metrics)
     ttft_laxity_percentiles = results.get('ttft_laxity_percentiles', {})
     ttft_parts = [
@@ -5149,15 +5263,19 @@ async def main(
     results['configured_scheduling_overhead_s'] = float(
         problem.scheduling_overhead
     )
+    results.update(asap_request_metrics)
     if empirical_scheduling_overhead_summary is not None:
         results['empirical_scheduling_overhead_summary'] = (
             empirical_scheduling_overhead_summary
         )
     extra_metrics = results.setdefault('extra_metrics', {})
     extra_metrics.update(service_tier_metrics)
+    extra_metrics.update(asap_request_metrics)
     extra_metrics.update(_summarize_per_server_energy_metrics(
         events,
         problem.n_devices,
+        start_time=benchmark_window_start_s,
+        end_time=benchmark_window_end_s,
     ))
     extra_metrics.update(_summarize_per_server_memory_metrics(
         events,
@@ -5177,6 +5295,9 @@ async def main(
             problem.routing_policy,
             problem.admission_output_length_mode,
         ),
+        start_time=benchmark_window_start_s,
+        end_time=benchmark_window_end_s,
+        arrival_times=arrival_times,
     )
     extra_metrics.update(benchmark_energy_figure_metrics)
     arrival_duration_s = (
@@ -5259,23 +5380,17 @@ async def main(
         execution_results,
         key=lambda x: _request_id_sort_key(x.request_id),
     )
-    raw_per_gpu_energy = dump_profile_response.get("per_gpu_energy_consumption", [])
-    per_gpu_energy_consumption = [
-        float(value or 0.0)
-        for value in list(raw_per_gpu_energy)[:max(0, int(problem.n_devices))]
-    ]
-    if len(per_gpu_energy_consumption) < max(0, int(problem.n_devices)):
-        per_gpu_energy_consumption.extend(
-            [0.0] * (int(problem.n_devices) - len(per_gpu_energy_consumption))
-        )
-    energy_consumption = float(sum(per_gpu_energy_consumption))
-    if not per_gpu_energy_consumption or all(
-        energy <= 0.0 for energy in per_gpu_energy_consumption
-    ):
-        per_gpu_energy_consumption, energy_consumption = summarize_energy_events(
-            events,
-            n_devices=problem.n_devices,
-        )
+    _, energy_all = summarize_energy_events(
+        events,
+        n_devices=problem.n_devices,
+    )
+    per_gpu_energy_consumption, energy_consumption = summarize_energy_events(
+        events,
+        n_devices=problem.n_devices,
+        start_time=benchmark_window_start_s,
+        end_time=benchmark_window_end_s,
+    )
+    extra_metrics["energy_all"] = float(energy_all)
     results, energy_consumption = _scale_rr_energy_results(
         results=results,
         energy_consumption=energy_consumption,
@@ -5402,8 +5517,10 @@ def _scale_rr_energy_results(
         scaled_extra_metrics = dict(extra_metrics)
         for key in (
             "energy_est",
+            "energy_all",
             "energy_consumption_active",
             "energy_consumption_non_idle",
+            "average_power_active_w",
         ):
             if key in scaled_extra_metrics:
                 scaled_extra_metrics[key] = float(scaled_extra_metrics[key]) * multiplier
