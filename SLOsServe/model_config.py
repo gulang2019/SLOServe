@@ -21,7 +21,7 @@ class ModelConfig:
 def get_model_config(
     model_tag: str 
 ) -> ModelConfig:
-    from transformers import AutoConfig, OPTConfig, GPT2Config, Qwen2Config, Qwen3MoeConfig
+    from transformers import AutoConfig, OPTConfig, GPT2Config, Qwen2Config, Qwen3MoeConfig, Qwen3Config
     config = AutoConfig.from_pretrained(model_tag)
     print('Loaded', type(config))
     if isinstance(config, GPT2Config):
@@ -95,6 +95,19 @@ def get_model_config(
             n_param = config.num_hidden_layers * (config.hidden_size ** 2 * 4 + config.hidden_size * config.intermediate_size * 2)\
             + config.hidden_size * config.vocab_size,
             max_seq_len = 16384,# config.max_position_embeddings,
+            intermidiate_size = config.intermediate_size
+        )
+    elif isinstance(config, Qwen3Config):
+        return ModelConfig(
+            tag = model_tag,
+            embed_size = config.hidden_size,
+            num_heads = config.num_key_value_heads, 
+            head_dim = config.hidden_size // config.num_attention_heads,
+            vocab_size = config.vocab_size,
+            n_layer = config.num_hidden_layers,
+            n_param = config.num_hidden_layers * (config.hidden_size ** 2 * 4 + config.hidden_size * config.intermediate_size * 2)\
+            + config.hidden_size * config.vocab_size,
+            max_seq_len = config.max_position_embeddings,
             intermidiate_size = config.intermediate_size
         )
     elif isinstance(config, Qwen3MoeConfig):
