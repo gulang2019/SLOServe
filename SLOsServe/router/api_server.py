@@ -471,6 +471,7 @@ class RequestPool:
             "profit": request_json['vllm_xargs'].get('profit', 1),
             "prompt_tokens": request_json['vllm_xargs'].get('input_length', 0),
             "max_tokens": request_json['max_tokens'],
+            "thinking_length": request_json['vllm_xargs'].get('thinking_length', 0),
         })
         
         async def generate_stream():

@@ -22,14 +22,20 @@ DEFAULT_LOAD_STATS = {
     "n_oom_rejects": 0,
     "n_arrival_oom_rejects": 0,
     "n_post_admission_oom_rejects": 0,
+    "control_time_elapsed_avg_ms": 0.0,
+    "control_time_estimated_avg_ms": 0.0,
+    "control_time_delta_avg_ms": 0.0,
+    "control_time_delta_last_ms": 0.0,
+    "control_time_delta_samples": 0,
+    "control_online_slack_ms": 0.0,
 }
 
 
-def make_default_load_stats() -> dict[str, int]:
+def make_default_load_stats() -> dict[str, int | float]:
     return dict(DEFAULT_LOAD_STATS)
 
 
-def normalize_load_stats(load_stats: Any | None) -> dict[str, int]:
+def normalize_load_stats(load_stats: Any | None) -> dict[str, int | float]:
     normalized = make_default_load_stats()
     if not isinstance(load_stats, dict):
         return normalized
@@ -37,7 +43,10 @@ def normalize_load_stats(load_stats: Any | None) -> dict[str, int]:
     for key, default_value in DEFAULT_LOAD_STATS.items():
         value = load_stats.get(key, default_value)
         try:
-            normalized[key] = int(value)
+            if isinstance(default_value, float):
+                normalized[key] = float(value)
+            else:
+                normalized[key] = int(value)
         except (TypeError, ValueError):
             normalized[key] = default_value
     return normalized
@@ -97,6 +106,13 @@ def normalize_exec_plan(execplan: Any | None) -> ExecPlan | None:
         except (TypeError, ValueError):
             normalized.num_free_blocks = None
 
+    batch_id = execplan.get("batch_id")
+    if batch_id is not None:
+        try:
+            normalized.batch_id = int(batch_id)
+        except (TypeError, ValueError):
+            normalized.batch_id = None
+
     return normalized
 
 
@@ -117,11 +133,11 @@ def make_engine_state_entry(
 def extract_load_statistics(
     engine_states: dict[int, dict[str, Any]] | None,
     n_devices: int,
-) -> list[dict[str, int]] | None:
+) -> list[dict[str, int | float]] | None:
     if not isinstance(engine_states, dict):
         return None
 
-    load_statistics: list[dict[str, int]] = []
+    load_statistics: list[dict[str, int | float]] = []
     for device_id in range(n_devices):
         state = engine_states.get(device_id)
         if not isinstance(state, dict) or "load_stats" not in state:

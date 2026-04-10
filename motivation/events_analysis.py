@@ -183,6 +183,7 @@ class Arrival(Event):
     prompt_tokens: int
     num_cached_tokens: int = 0
     max_tokens: int = 0
+    thinking_length: int = 0
     prefill_ddl: float = 0
     profit: float = 0
     prefill_only: bool = False
@@ -215,6 +216,7 @@ class RouterArrival(Event):
     profit: float
     prompt_tokens: int
     max_tokens: int
+    thinking_length: int = 0
     num_cached_tokens: int = 0
     zero_load_ttft: float = 0
     service_tier: str = "default"
@@ -253,12 +255,15 @@ class RequestInstance:
     events: List[Event] = field(default_factory=list)
     timestamps: List[float] = field(default_factory=list)
     output_tokens: int = 0
+    thinking_length: int = 0
     prefill_device_id: int = -1
     decode_device_id: int = -1
     cache_hit_rate: float = 0
     prefill_ddl: float = 0
     ttft_normalized_laxity: float = 0
     tpot_laxities: List[float] = field(default_factory=list)
+    tpot_deadline_offsets: List[int] = field(default_factory=list)
+    tpot_schedule_indices: List[int | None] = field(default_factory=list)
     expected_finish_time: List[float] = field(default_factory=list)
     finish_reason: str | None = None
     slo_violation: str | None = None
@@ -283,12 +288,25 @@ class RequestInstance:
 
     def get_stats(self, slo_ttft_fn, slo_tpot, routing_overhead: float = -1.0):
         arrival_time = self.arrival_time if routing_overhead < 0.0 else self.engine_arrival_time + routing_overhead
-        
+
+        self.timestamps = []
+        self.tpot_laxities = []
+        self.tpot_deadline_offsets = []
+        self.tpot_schedule_indices = []
+        self.expected_finish_time = []
+
         slo_ttft = slo_ttft_fn(self)
+        tpot_deadline_offsets = _build_tpot_deadline_offsets(
+            self.output_tokens,
+            self.thinking_length,
+        )
         required_tokens = [(arrival_time + slo_ttft, self.prompt_tokens - self.num_cached_tokens)]
-        
-        for i in range(self.output_tokens - 1):
-            required_tokens.append((arrival_time + slo_ttft + (i + 1) * slo_tpot, 1))
+
+        for offset in tpot_deadline_offsets:
+            required_tokens.append((
+                arrival_time + slo_ttft + float(offset) * slo_tpot,
+                1,
+            ))
             
         # required_tokens = [(self.prefill_ddl + overhead, self.prompt_tokens - self.num_cached_tokens)]
         
@@ -323,6 +341,8 @@ class RequestInstance:
                 #     print(f'req {self.req_id} has negative ttft_normalized_laxity: {timestamp - t}')
             else:
                 self.tpot_laxities.append(timestamp - t)
+                self.tpot_deadline_offsets.append(tpot_deadline_offsets[j - 1])
+                self.tpot_schedule_indices.append(i - 1 if i > 0 else None)
             
         self.cache_hit_rate = self.num_cached_tokens / self.prompt_tokens if self.prompt_tokens > 0 else 0
         
@@ -370,6 +390,19 @@ TPOT_SLO_SWEEP_DELTAS = (
     ("plus_0p005", 0.005),
     ("plus_0p010", 0.010),
 )
+
+
+def _build_tpot_deadline_offsets(
+    output_tokens: int,
+    thinking_length: int,
+) -> List[int]:
+    output_tokens = max(int(output_tokens), 0)
+    thinking_length = max(int(thinking_length), 0)
+    if output_tokens <= 0:
+        return []
+    if thinking_length > 0:
+        return list(range(thinking_length, thinking_length + output_tokens))
+    return list(range(1, output_tokens))
 
 
 def _summarize_selected_percentiles(
@@ -446,7 +479,20 @@ def _compute_tpot_slo_violation_rate_sweep(
             if not req.tpot_laxities:
                 continue
 
-            token_indices = np.arange(1, len(req.tpot_laxities) + 1, dtype=np.float64)
+            token_indices = np.asarray(
+                getattr(req, "tpot_deadline_offsets", [])
+                or _build_tpot_deadline_offsets(
+                    getattr(req, "output_tokens", 0),
+                    getattr(req, "thinking_length", 0),
+                ),
+                dtype=np.float64,
+            )
+            if token_indices.shape[0] != len(req.tpot_laxities):
+                token_indices = np.arange(
+                    1,
+                    len(req.tpot_laxities) + 1,
+                    dtype=np.float64,
+                )
             adjusted_laxities = (
                 np.asarray(req.tpot_laxities, dtype=np.float64)
                 - token_indices * (candidate_tpot - configured_slo_tpot)
@@ -697,9 +743,17 @@ def analyze_events(filepath, start_time = None, verbose = False):
                 req.num_cached_tokens = max(req.num_cached_tokens, event.num_cached_tokens)
                 req.prompt_tokens = event.prompt_tokens
                 req.output_tokens = event.max_tokens
+                req.thinking_length = max(
+                    req.thinking_length,
+                    int(getattr(event, 'thinking_length', 0) or 0),
+                )
             if event.event_type == 'arrival':
                 req.num_cached_tokens = event.num_cached_tokens
                 req.prompt_tokens = event.prompt_tokens
+                req.thinking_length = max(
+                    req.thinking_length,
+                    int(getattr(event, 'thinking_length', 0) or 0),
+                )
                 if not event.prefill_only:
                     req.output_tokens = event.max_tokens
             if event.event_type == 'arrival':

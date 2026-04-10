@@ -125,6 +125,7 @@ protected:
     int max_bs;
     bool fixed_bs;
     bool continuous;
+    double online_slack = 0.0;
     
     virtual double batch_to_time(int n_tokens, size_t n_reqs = 1, size_t n_past_tokens = 0, size_t decode_steps = 1);
     virtual int time_to_batch(double t, size_t n_reqs = 1, size_t n_past_tokens = 0, size_t decode_steps = 1);
@@ -138,6 +139,8 @@ public:
     );
     virtual ~BatchPlanner() = default;
     void finalize_max_bs();
+    void set_online_slack(double slack) { online_slack = slack; }
+    double get_online_slack() const { return online_slack; }
 
     /**
      * @return int: the extra token batches available for prefills; <0 indicates the decode SLO cannot be satisfied
@@ -391,19 +394,22 @@ public:
         std::vector<Request>& reqs,
         double current_time,
         double max_time = 1,
-        bool verbose = false
+        bool verbose = false,
+        double online_slack = 0.0
     );
 
     std::tuple<bool, std::vector<bool> > admission_control(
         std::vector<Request>& reqs,
         const int M,
-        double current_time
+        double current_time,
+        double online_slack = 0.0
     );
 
     std::tuple<bool, std::vector<bool>, std::string> admission_control_with_reason(
         std::vector<Request>& reqs,
         const int M,
-        double current_time
+        double current_time,
+        double online_slack = 0.0
     );
 
     std::tuple<bool, std::vector<bool> > _admission_control(

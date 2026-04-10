@@ -22,6 +22,7 @@ from vllm.v1.core.kv_cache_utils import init_none_hash, get_request_block_hasher
 from vllm.outputs import RequestOutput, CompletionOutput
 
 from SLOsServe.model_config import get_model_config
+from SLOsServe.perf_model import summarize_perf_model
 from SLOsServe.router.execplan_bus import normalize_load_stats
 
 def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
@@ -163,7 +164,7 @@ def _get_scheduler_exec_plan_snapshot(scheduler) -> Any | None:
     return getter()
 
 
-def _get_scheduler_load_stats_snapshot(scheduler) -> dict[str, int]:
+def _get_scheduler_load_stats_snapshot(scheduler) -> dict[str, int | float]:
     getter = getattr(scheduler, "get_load_statistics", None)
     if callable(getter):
         try:
@@ -210,11 +211,70 @@ def _get_scheduler_load_stats_snapshot(scheduler) -> dict[str, int]:
             except Exception:
                 num_free_blocks = 0
 
+    control_online_slack_ms = 0.0
+    perf_model = getattr(scheduler, "perf_model", None)
+    if perf_model is not None:
+        try:
+            control_online_slack_ms = 1000.0 * float(
+                getattr(perf_model, "_online_spike_slack", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            control_online_slack_ms = 0.0
+
     return normalize_load_stats({
         "num_free_blocks": num_free_blocks,
         "n_waitings": waiting,
         "n_running": running,
+        "control_online_slack_ms": control_online_slack_ms,
     })
+
+
+def _scheduler_has_requests(scheduler) -> bool:
+    getter = getattr(scheduler, "has_requests", None)
+    if not callable(getter):
+        return True
+    try:
+        return bool(getter())
+    except Exception:
+        return True
+
+
+def _clear_scheduler_control_timing_anchor(scheduler) -> None:
+    clear_anchor = getattr(scheduler, "clear_control_timing_anchor", None)
+    if callable(clear_anchor):
+        try:
+            clear_anchor()
+        except Exception:
+            pass
+
+
+def _copy_scheduler_execution_perf_model(scheduler, model_name: str):
+    execution_perf_model = getattr(scheduler, "execution_perf_model", None)
+    if execution_perf_model is not None:
+        return copy.deepcopy(execution_perf_model)
+    from SLOsServe.perf_model import PerfModel
+    return PerfModel.get_perf_model(model_name)
+
+
+def _log_mock_engine_perf_models(
+    scheduler,
+    execution_perf_model,
+    *,
+    model_name: str,
+    device_id: int,
+    prefix: str,
+) -> None:
+    logger.info(
+        (
+            "%s: device_id=%s model_name=%s "
+            "scheduler_control=%s scheduler_execution=%s loop_execution=%s"
+        ),
+        prefix,
+        device_id,
+        model_name,
+        summarize_perf_model(getattr(scheduler, "perf_model", None)),
+        summarize_perf_model(getattr(scheduler, "execution_perf_model", None)),
+        summarize_perf_model(execution_perf_model),
+    )
 
 
 @ray.remote(max_concurrency=1024)
@@ -241,8 +301,6 @@ class MockEngineCore:
         from vllm.config import VllmConfig
         from unittest.mock import MagicMock
         from vllm.v1.structured_output import StructuredOutputManager
-        from SLOsServe.perf_model import PerfModel
-        
         attrs = {}
         import pickle
         for config_name in ['model_config', 'cache_config', 'parallel_config', 'scheduler_config', 'device_config',
@@ -285,7 +343,17 @@ class MockEngineCore:
             include_finished_set = True
         )
         logger.info(f'Scheduler created: {self.scheduler}')
-        self.perf_model = PerfModel.get_perf_model(model_name)
+        self.perf_model = _copy_scheduler_execution_perf_model(
+            self.scheduler,
+            model_name,
+        )
+        _log_mock_engine_perf_models(
+            self.scheduler,
+            self.perf_model,
+            model_name=model_name,
+            device_id=self.device_id,
+            prefix="Mock engine perf models initialized",
+        )
         
         caching_hash_fn = get_hash_fn_by_name(
             self.scheduler.vllm_config.cache_config.prefix_caching_hash_algo)
@@ -368,6 +436,17 @@ class MockEngineCore:
                 setattr(self.scheduler.scheduler_config, k, v)
         logger.info(f'Scheduler config updated: {self.scheduler.scheduler_config}')
         self.scheduler.reset(self._profile_events)
+        self.perf_model = _copy_scheduler_execution_perf_model(
+            self.scheduler,
+            self.model_name,
+        )
+        _log_mock_engine_perf_models(
+            self.scheduler,
+            self.perf_model,
+            model_name=self.model_name,
+            device_id=self.device_id,
+            prefix="Mock engine perf models updated",
+        )
 
     @property
     def on(self) -> bool: 
@@ -397,6 +476,7 @@ class MockEngineCore:
             print('mock engine started')
             while True:
                 if not self.on:
+                    _clear_scheduler_control_timing_anchor(self.scheduler)
                     await asyncio.sleep(0.003)
                     continue
                 start_time = time.time()
@@ -404,6 +484,23 @@ class MockEngineCore:
                 if self.batch_id % 100 == 0:
                     stats = self.scheduler.make_stats()
                     print(f'[MockEngineCore] batch_id={self.batch_id}, stats={stats}, n_arrived_reqs={self.n_arrived_reqs}, n_finished_reqs={self.n_finished_reqs}, n_rejected_reqs={self.n_rejected_reqs}')
+                if not _scheduler_has_requests(self.scheduler):
+                    _clear_scheduler_control_timing_anchor(self.scheduler)
+                    if self.execplan_bus is not None:
+                        exec_plan = _get_scheduler_exec_plan_snapshot(
+                            self.scheduler,
+                        )
+                        load_stats = _get_scheduler_load_stats_snapshot(
+                            self.scheduler,
+                        )
+                        self.execplan_bus.publish.remote(
+                            self.device_id,
+                            time.time(),
+                            exec_plan,
+                            load_stats=load_stats,
+                        )
+                    await asyncio.sleep(0.003)
+                    continue
                 self.batch_id += 1
                 scheduling_start = time.time()
                 if hasattr(self.scheduler, "atfc_planner"):
@@ -497,6 +594,7 @@ class MockEngineCore:
                 batch_time = self.perf_model.get_batch_time(batch)
                 control_perf_model = getattr(self.scheduler, "perf_model", None)
                 control_estimated_time = None
+                online_control_slack = None 
                 if control_perf_model is not None:
                     try:
                         control_estimated_time = float(
@@ -504,6 +602,7 @@ class MockEngineCore:
                         )
                     except Exception:
                         control_estimated_time = None
+                    online_control_slack = control_perf_model._online_spike_slack
                 
                 # we mimic the current runtime by blocking the loop for the batch time.
                 await asyncio.sleep(batch_time)
@@ -620,6 +719,7 @@ class MockEngineCore:
                             'publish_gc_counts_before': list(publish_gc_counts_before),
                             'publish_gc_counts_after_snapshot': list(publish_gc_counts_after_snapshot),
                             'publish_gc_counts_after_remote': list(publish_gc_counts_after_remote),
+                            "perf_model_slack": online_control_slack,
                         }
                     })
         except Exception as e:
@@ -677,6 +777,7 @@ class MockEngineCore:
             "request_id": request.request_id,
             "prompt_tokens": request.num_prompt_tokens,
             "max_tokens": request.max_tokens,
+            "thinking_length": request.sampling_params.extra_args.get('thinking_length', 0),
             "timestamp": time.time(),
             "prefill_ddl": self.scheduler._get_prefill_ddl(request),
             "profit": request.sampling_params.extra_args.get('profit', 1),

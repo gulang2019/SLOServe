@@ -35,7 +35,7 @@ from vllm.inputs import TokensPrompt
 
 import logging
 from SLOsServe.client_spec import parse_client_spec
-from SLOsServe.perf_model import PerfModel
+from SLOsServe.perf_model import PerfModel, summarize_perf_model
 from SLOsServe.router.execplan_bus import (ExecPlanBus, ExecPlan,
                                            extract_load_statistics,
                                            make_default_load_stats)
@@ -116,46 +116,159 @@ def _ensure_parent_dir(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
+def _get_perf_model_online_slack(perf_model: Any) -> float:
+    return float(getattr(perf_model, "_online_spike_slack", 0.0) or 0.0)
+
+
+def _get_engine_state_online_slack(engine_state: Any, perf_model: Any = None) -> float:
+    if engine_state is not None:
+        try:
+            return float(
+                getattr(engine_state, "control_online_slack_s", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+    return _get_perf_model_online_slack(perf_model)
+
+
+def _get_engine_entry_online_slack(engine_state_entry: Any,
+                                   perf_model: Any = None) -> float:
+    if isinstance(engine_state_entry, dict):
+        load_stats = engine_state_entry.get("load_stats")
+        if isinstance(load_stats, dict):
+            try:
+                return 0.001 * float(
+                    load_stats.get("control_online_slack_ms", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                pass
+    return _get_perf_model_online_slack(perf_model)
+
+
 def _format_load_statistics_table(
     load_statistics: list[dict[str, Any]] | None,
 ) -> str:
-    columns: list[tuple[str, str | None, str]] = [
-        ("dev", None, "left"),
-        ("wait", "n_waitings", "right"),
-        ("run", "n_running", "right"),
-        ("free", "num_free_blocks", "right"),
-        ("eff_free", "effective_num_free_blocks", "right"),
-        ("oom", "n_oom_rejects", "right"),
-        ("arr_oom", "n_arrival_oom_rejects", "right"),
-        ("post_oom", "n_post_admission_oom_rejects", "right"),
+    columns: list[dict[str, Any]] = [
+        {"label": "dev", "key": None, "align": "left", "kind": "text"},
+        {"label": "wait", "key": "n_waitings", "align": "right", "kind": "int", "agg": "sum"},
+        {"label": "run", "key": "n_running", "align": "right", "kind": "int", "agg": "sum"},
+        {"label": "free", "key": "num_free_blocks", "align": "right", "kind": "int", "agg": "sum"},
+        {"label": "eff_free", "key": "effective_num_free_blocks", "align": "right", "kind": "int", "agg": "sum"},
+        {"label": "oom", "key": "n_oom_rejects", "align": "right", "kind": "int", "agg": "sum"},
+        {"label": "arr_oom", "key": "n_arrival_oom_rejects", "align": "right", "kind": "int", "agg": "sum"},
+        {"label": "post_oom", "key": "n_post_admission_oom_rejects", "align": "right", "kind": "int", "agg": "sum"},
+        {
+            "label": "ctrl_est_ms",
+            "key": "control_time_estimated_avg_ms",
+            "align": "right",
+            "kind": "float",
+            "agg": "weighted_avg",
+            "weight_key": "control_time_delta_samples",
+        },
+        {
+            "label": "ctrl_elap_ms",
+            "key": "control_time_elapsed_avg_ms",
+            "align": "right",
+            "kind": "float",
+            "agg": "weighted_avg",
+            "weight_key": "control_time_delta_samples",
+        },
+        {
+            "label": "ctrl_avg_ms",
+            "key": "control_time_delta_avg_ms",
+            "align": "right",
+            "kind": "float",
+            "agg": "weighted_avg",
+            "weight_key": "control_time_delta_samples",
+        },
+        {
+            "label": "ctrl_last_ms",
+            "key": "control_time_delta_last_ms",
+            "align": "right",
+            "kind": "float",
+            "agg": "blank",
+        },
+        {
+            "label": "ctrl_n",
+            "key": "control_time_delta_samples",
+            "align": "right",
+            "kind": "int",
+            "agg": "sum",
+        },
+        {
+            "label": "ctrl_slk_ms",
+            "key": "control_online_slack_ms",
+            "align": "right",
+            "kind": "float",
+            "agg": "blank",
+        },
     ]
     if not isinstance(load_statistics, list) or not load_statistics:
-        return "dev | wait | run | free | eff_free | oom | arr_oom | post_oom\n<empty>"
+        return (
+            "dev | wait | run | free | eff_free | oom | arr_oom | post_oom | "
+            "ctrl_est_ms | ctrl_elap_ms | ctrl_avg_ms | ctrl_last_ms | ctrl_n | "
+            "ctrl_slk_ms\n<empty>"
+        )
 
-    def _int_value(stats: dict[str, Any], key: str) -> int:
+    def _numeric_value(stats: dict[str, Any], key: str, kind: str) -> int | float:
+        value = stats.get(key, 0)
         try:
-            return int(stats.get(key, 0))
+            if kind == "float":
+                return float(value)
+            return int(value)
         except (TypeError, ValueError):
-            return 0
+            return 0.0 if kind == "float" else 0
 
-    rows: list[list[str]] = [[label for label, _, _ in columns]]
-    totals: dict[str, int] = {
-        key: 0 for _, key, _ in columns if key is not None
-    }
+    def _format_value(value: Any, kind: str) -> str:
+        if kind == "float":
+            return f"{float(value):.1f}"
+        return str(int(value))
+
+    rows: list[list[str]] = [[str(column["label"]) for column in columns]]
+    totals: dict[str, float] = {}
+    weighted_totals: dict[str, tuple[float, float]] = {}
     for device_id, stats in enumerate(load_statistics):
         stats = stats if isinstance(stats, dict) else {}
         row = [str(device_id)]
-        for _, key, _ in columns[1:]:
+        for column in columns[1:]:
+            key = column["key"]
             assert key is not None
-            value = _int_value(stats, key)
-            row.append(str(value))
-            totals[key] += value
+            kind = str(column["kind"])
+            value = _numeric_value(stats, key, kind)
+            row.append(_format_value(value, kind))
+            agg = column.get("agg")
+            if agg == "sum":
+                totals[key] = totals.get(key, 0.0) + float(value)
+            elif agg == "weighted_avg":
+                weight_key = str(column.get("weight_key"))
+                weight = _numeric_value(stats, weight_key, "int")
+                weighted_value, weighted_weight = weighted_totals.get(
+                    key,
+                    (0.0, 0.0),
+                )
+                weighted_totals[key] = (
+                    weighted_value + float(value) * float(weight),
+                    weighted_weight + float(weight),
+                )
         rows.append(row)
 
     total_row = ["total"]
-    for _, key, _ in columns[1:]:
+    for column in columns[1:]:
+        key = column["key"]
         assert key is not None
-        total_row.append(str(totals[key]))
+        agg = column.get("agg")
+        kind = str(column["kind"])
+        if agg == "sum":
+            total_row.append(_format_value(totals.get(key, 0.0), kind))
+        elif agg == "weighted_avg":
+            weighted_value, weighted_weight = weighted_totals.get(
+                key,
+                (0.0, 0.0),
+            )
+            avg_value = (
+                weighted_value / weighted_weight if weighted_weight > 0.0 else 0.0
+            )
+            total_row.append(_format_value(avg_value, kind))
+        else:
+            total_row.append("")
     rows.append(total_row)
 
     widths = [
@@ -166,7 +279,7 @@ def _format_load_statistics_table(
     def _format_row(row: list[str]) -> str:
         cells: list[str] = []
         for idx, cell in enumerate(row):
-            _, _, align = columns[idx]
+            align = str(columns[idx]["align"])
             width = widths[idx]
             cells.append(
                 cell.ljust(width) if align == "left" else cell.rjust(width)
@@ -1024,6 +1137,16 @@ class RequestInstance:
             return 0
 
     @property
+    def thinking_length(self) -> int:
+        try:
+            return max(
+                0,
+                int(self.payload.get('vllm_xargs', {}).get('thinking_length', 0)),
+            )
+        except (TypeError, ValueError):
+            return 0
+
+    @property
     def num_generated_tokens(self) -> int:
         return len(self.generated_token_ids)
 
@@ -1054,9 +1177,20 @@ class RequestInstance:
     
     @property
     def is_slo_violation(self):
-        expected_timestamps = [(self.payload['vllm_xargs']['input_length'], self.payload['vllm_xargs']['prefill_ddl'])]
-        for _ in range(self.payload['vllm_xargs']['output_length'] - 1):
-            expected_timestamps.append((expected_timestamps[-1][0] + 1, expected_timestamps[-1][1] + self.payload['vllm_xargs']['slo_tpot']))
+        input_length = int(self.payload['vllm_xargs']['input_length'])
+        prefill_ddl = float(self.payload['vllm_xargs']['prefill_ddl'])
+        slo_tpot = float(self.payload['vllm_xargs']['slo_tpot'])
+        output_length = int(self.payload['vllm_xargs']['output_length'])
+        expected_timestamps = [(input_length, prefill_ddl)]
+        if self.thinking_length > 0:
+            offsets = range(self.thinking_length, self.thinking_length + output_length)
+        else:
+            offsets = range(1, output_length)
+        for offset in offsets:
+            expected_timestamps.append((
+                input_length + offset,
+                prefill_ddl + offset * slo_tpot,
+            ))
         idx = 0
         for n_token, t in expected_timestamps:
             while idx < len(self.timestamps) and self.timestamps[idx][0] < n_token: 
@@ -1443,6 +1577,15 @@ class Router(ABC):
     
     def set_iter(self, iter: int):
         self.iter = iter 
+
+    def wants_prefetched_engine_states(self) -> bool:
+        return False
+
+    def set_prefetched_engine_states(
+        self,
+        raw_engine_states: dict[int, dict[str, Any]] | None,
+    ) -> None:
+        del raw_engine_states
 
 class AutoScalingRouter(Router):
     def __init__(self, n_devices: int, router_kwargs: dict[str, Any]):
@@ -1912,6 +2055,8 @@ class EngineState:
     num_computed_tokens: dict = field(default_factory = dict)
     batch_id: int | None = None
     staleness: float | None = None
+    control_online_slack_s: float = 0.0
+    control_online_slack_ms: float = 0.0
 
 class SLOsServeRouter(Router):
     
@@ -1921,6 +2066,7 @@ class SLOsServeRouter(Router):
             router_kwargs = json.loads(router_kwargs)
         
         self.n_devices = n_devices
+        self._prefetched_raw_engine_states: dict[int, dict[str, Any]] | None = None
         from SLOsServe.perf_model import PerfModel
         self.model_name = router_kwargs['model_name']
         self.perf_model_task = str(router_kwargs.get('perf_model_task', 'default'))
@@ -1935,18 +2081,13 @@ class SLOsServeRouter(Router):
         )
         self.perf_model = perf_model
         self.hardware_params = perf_model.describe_hardware_params()
+        perf_model_summary = summarize_perf_model(self.perf_model)
         logger.info(
             "Loaded router perf model: model=%s task=%s type=%s breakpoints=%s perf_model_err=%s",
             self.model_name,
             self.perf_model_task,
-            (
-                "piecewise_current_tokens"
-                if perf_model.is_piecewise_current_tokens else "linear"
-            ),
-            (
-                self.hardware_params.get("breakpoints")
-                if isinstance(self.hardware_params, dict) else None
-            ),
+            perf_model_summary.get("type"),
+            perf_model_summary.get("breakpoints"),
             self.perf_model_err,
         )
         self.tpot = router_kwargs['tpot']
@@ -1993,6 +2134,20 @@ class SLOsServeRouter(Router):
             tpots=[self.tpot],
             fixed_bs=False,
         )
+        logger.info(
+            (
+                "Frontend router perf model initialized: tpot=%s "
+                "scheduling_overhead_s=%s perf_model=%s cpp_planner=%s"
+            ),
+            self.tpot,
+            float(router_kwargs.get("scheduling_overhead", 0.0) or 0.0),
+            perf_model_summary,
+            (
+                self.perf_model.get_cpp_planner_config()
+                if hasattr(self.perf_model, "get_cpp_planner_config")
+                else None
+            ),
+        )
         self.is_oracle = self.oracle_mem
         
         self.adm_planner = SLOsServe_C.AdmCtrlScheduler(
@@ -2022,6 +2177,15 @@ class SLOsServeRouter(Router):
             f'perf_model_err: {self.perf_model_err}, hardware_params: {self.hardware_params}, '
             f'scheduling_overhead: {router_kwargs["scheduling_overhead"]}'
         )
+
+    def wants_prefetched_engine_states(self) -> bool:
+        return bool(self.use_planner)
+
+    def set_prefetched_engine_states(
+        self,
+        raw_engine_states: dict[int, dict[str, Any]] | None,
+    ) -> None:
+        self._prefetched_raw_engine_states = raw_engine_states
 
     def _get_decode_length_ub(self, request: RequestInstance) -> int:
         if not self.oracle_mem:
@@ -2176,7 +2340,15 @@ class SLOsServeRouter(Router):
             
 
         t_before_schedule = time.perf_counter()
-        is_feasible, is_accepteds = self.adm_planner.adm_ctrl(c_reqs, engine_state.num_free_blocks, 0.0)
+        is_feasible, is_accepteds = self.adm_planner.adm_ctrl(
+            c_reqs,
+            engine_state.num_free_blocks,
+            0.0,
+            _get_engine_state_online_slack(
+                engine_state,
+                getattr(self, "perf_model", None),
+            ),
+        )
         accepted_ids = set(c_req.id for c_req, is_accepted in zip(c_reqs, is_accepteds) if is_accepted)
         t_after_schedule = time.perf_counter()
         # logger.info(f'[SLOPacker] {did=} {is_feasible=}')
@@ -2256,7 +2428,7 @@ class SLOsServeRouter(Router):
                 f"pre_adm_schedule_{self.iter}_did{did}_{mode}.txt",
             )
             with open(filename, "w") as f:
-                f.write("SLOPACKER_SCHEDULE_DUMP_V1\n")
+                f.write("SLOPACKER_SCHEDULE_DUMP_V2\n")
                 f.write(f"timestamp {now}\n")
                 f.write(f"did {did}\n")
                 f.write(f"mode {json.dumps(mode)}\n")
@@ -2268,18 +2440,30 @@ class SLOsServeRouter(Router):
                 f.write("planner_max_bs 16384\n")
                 f.write(f"tpots {1} {self.tpot}\n")
                 planner_config = self.perf_model.get_cpp_planner_config()
-                if planner_config["type"] == "piecewise_current_tokens":
-                    hardware_params = [
-                        value
-                        for segment_params in planner_config["segment_hardware_params"]
-                        for value in segment_params
-                    ]
+                planner_config_type = planner_config.get("type", "linear")
+                f.write(f"planner_config_type {json.dumps(planner_config_type)}\n")
+                if planner_config_type == "piecewise_current_tokens":
+                    breakpoints = planner_config.get("breakpoints", [])
+                    f.write(f"current_token_breakpoints {len(breakpoints)}")
+                    for breakpoint in breakpoints:
+                        f.write(f" {int(breakpoint)}")
+                    f.write("\n")
+                    segment_hardware_params = planner_config.get(
+                        "segment_hardware_params",
+                        [],
+                    )
+                    f.write(f"segment_hardware_params {len(segment_hardware_params)}\n")
+                    for segment_params in segment_hardware_params:
+                        f.write(f"segment_params {len(segment_params)}")
+                        for x in segment_params:
+                            f.write(f" {x}")
+                        f.write("\n")
                 else:
                     hardware_params = planner_config["hardware_params"]
-                f.write(f"hardware_params {len(hardware_params)}")
-                for x in hardware_params:
-                    f.write(f" {x}")
-                f.write("\n")
+                    f.write(f"hardware_params {len(hardware_params)}")
+                    for x in hardware_params:
+                        f.write(f" {x}")
+                    f.write("\n")
                 f.write(f"M {num_free_blocks}\n")
                 f.write(f"current_time {current_time}\n")
                 f.write("max_time 1.0\n")
@@ -2323,7 +2507,10 @@ class SLOsServeRouter(Router):
         except Exception:
             logger.exception("Failed to dump slow schedule inputs")
 
-    def get_engine_states(self):
+    def get_engine_states(
+        self,
+        raw_engine_states: dict[int, dict[str, Any]] | None = None,
+    ):
         now = time.time()
         def _compute_engine_state(exec_plan: ExecPlan, engine_state: EngineState):
             engine_state.batch_id = exec_plan.batch_id
@@ -2342,9 +2529,10 @@ class SLOsServeRouter(Router):
                     else:
                         break
             
-        global execplan_bus_actor
-        assert execplan_bus_actor is not None
-        raw_engine_states = ray.get(execplan_bus_actor.get_all.remote())
+        if raw_engine_states is None:
+            global execplan_bus_actor
+            assert execplan_bus_actor is not None
+            raw_engine_states = ray.get(execplan_bus_actor.get_all.remote())
         engine_states = {
             device_id: EngineState(next_batch_time=now,
                                    num_free_blocks=self.n_block)
@@ -2366,6 +2554,13 @@ class SLOsServeRouter(Router):
                                        engine_state.num_free_blocks)))
                 except (TypeError, ValueError):
                     pass
+                try:
+                    engine_state.control_online_slack_ms = float(
+                        load_stats.get('control_online_slack_ms', 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    engine_state.control_online_slack_ms = 0.0
+                engine_state.control_online_slack_s = (
+                    0.001 * engine_state.control_online_slack_ms)
             exec_plan = state.get('exec_plan')
             if exec_plan is not None:
                 _compute_engine_state(exec_plan, engine_state)
@@ -2375,8 +2570,10 @@ class SLOsServeRouter(Router):
             running_requests: List[RequestInstance]):
         # logger.info(f'exec_plans: {exec_plans}')
         # logger.info(f'fetch exec plans takes {elapsed_fetch_exec_plan}s')
-        
-        engine_states = self.get_engine_states()
+
+        raw_engine_states = self._prefetched_raw_engine_states
+        self._prefetched_raw_engine_states = None
+        engine_states = self.get_engine_states(raw_engine_states)
         if DUMP_ADM and hasattr(self, '_profile_events'):
             self._profile_events.append({
                 'event_type': 'engine_states',
@@ -2566,7 +2763,13 @@ class SLOsServeRouter(Router):
         # logger.info(f'slosserverouter: {c_reqs}, Mem: {self.device_mems[did]}, now: {now}')
         
         is_feasible, is_accepteds = self.pre_adm_ctrler.adm_ctrl(
-            c_reqs, num_free_blocks, now
+            c_reqs,
+            num_free_blocks,
+            now,
+            _get_engine_entry_online_slack(
+                exec_plan,
+                getattr(self, "perf_model", None),
+            ),
         )
         accpeted_ids = [req.id for req, accepted in zip(c_reqs, is_accepteds) if accepted]
         logger.info(f'slosserverouter, is_feasible: {is_feasible}, len(waiting): {len(waiting_requests)}, len(running): {len(running_requests)}')
@@ -3120,6 +3323,7 @@ class RequestPool:
             "prompt_tokens": request_json['vllm_xargs'].get('input_length', 0),
             "num_cached_tokens": request_json['vllm_xargs'].get('cached_tokens', 0),
             "max_tokens": request_json['max_tokens'],
+            "thinking_length": request_json['vllm_xargs'].get('thinking_length', 0),
             "service_tier": request_json['vllm_xargs'].get('service_tier', 'default'),
             "initial_service_tier": request_json['vllm_xargs'].get(
                 'initial_service_tier',
@@ -3348,8 +3552,12 @@ class RequestPool:
         except asyncio.TimeoutError:
             logger.warning(f"sync: Timed out after {remained_time} seconds waiting for tasks")
 
-    async def get_load_statistics(self) -> list[dict[str, Any]]:
-        engine_states = await self._get_engine_states()
+    async def get_load_statistics(
+        self,
+        engine_states: dict[int, dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        if engine_states is None:
+            engine_states = await self._get_engine_states()
         load_statistics = extract_load_statistics(engine_states, self.n_devices)
         if (
             load_statistics is not None
@@ -3377,6 +3585,17 @@ class RequestPool:
         now = time.time()
         max_age_s = max(1.0, 2.0 * float(self.stat_window))
 
+        def _is_non_default(
+            stats: dict[str, Any],
+            key: str,
+            default_value: int | float,
+        ) -> bool:
+            try:
+                value = float(stats.get(key, default_value))
+            except (TypeError, ValueError):
+                value = float(default_value)
+            return abs(value - float(default_value)) > 1e-9
+
         for device_id in range(self.n_devices):
             state = engine_states.get(device_id)
             if not isinstance(state, dict):
@@ -3392,7 +3611,7 @@ class RequestPool:
             if not isinstance(stats, dict):
                 return False
             if any(
-                int(stats.get(key, default_value)) != int(default_value)
+                _is_non_default(stats, key, default_value)
                 for key, default_value in default_stats.items()
             ):
                 has_non_default = True
@@ -3463,6 +3682,7 @@ class RequestPool:
             await self.sem.reset()
             
             
+            prefetched_engine_states = None
             if len(self.waiting_pool): 
                 routing_iter += 1
                 self.router.set_iter(routing_iter)
@@ -3475,6 +3695,11 @@ class RequestPool:
                     if request.service_tier == 'best_effort'
                 ]
                 if regular_waiting_requests:
+                    if self.router.wants_prefetched_engine_states():
+                        prefetched_engine_states = await self._get_engine_states()
+                        self.router.set_prefetched_engine_states(
+                            prefetched_engine_states
+                        )
                     self.router.run(
                         regular_waiting_requests,
                         self._get_regular_running_requests(),
@@ -3518,7 +3743,9 @@ class RequestPool:
                 next_load_statistics_time = time.time() + self.stat_window
                 if get_load_statistics_task is None:
                     get_load_statistics_task = asyncio.create_task(
-                        self.get_load_statistics(),
+                        self.get_load_statistics(
+                            engine_states=prefetched_engine_states
+                        ),
                         name="RequestPool.get_load_statistics",
                     )
                     get_load_statistics_task.add_done_callback(_task_done)
@@ -3627,6 +3854,9 @@ class RequestPool:
                         # When this request cannot be served w/in SLO, we keep it
                         # on its last placement when available; otherwise route it
                         # to the top of the packing chain and force admission.
+                        previous_prefill_device_id = request.prefill_device_id
+                        previous_decode_device_id = request.decode_device_id
+                        previous_service_tier = request.service_tier
                         logger.info(f'[SLO Packer] route {request.request_id} asap from ({request.prefill_device_id=}, {request.decode_device_id=}) ')
                         request.prefill_device_id, request.decode_device_id = self.router.select_asap_server(self.load_stat, request=request)
                         logger.info(f'[SLO Packer] route {request.request_id} asap to ({request.prefill_device_id=}, {request.decode_device_id=}) ')
@@ -3635,6 +3865,26 @@ class RequestPool:
                         request.payload['vllm_xargs']['must_admit'] = True
                         request.payload['vllm_xargs']['service_tier'] = 'best_effort'
                         request.admitted = True
+                        self._profile_events.append({
+                            "event_type": "router_asap",
+                            "timestamp": time.time(),
+                            "device_id": -1,
+                            "request_id": request.request_id,
+                            "extra_args": {
+                                "routing_iter": routing_iter,
+                                "from_service_tier": previous_service_tier,
+                                "to_service_tier": request.service_tier,
+                                "initial_service_tier": request.initial_service_tier,
+                                "previous_prefill_device_id": (
+                                    previous_prefill_device_id
+                                ),
+                                "previous_decode_device_id": (
+                                    previous_decode_device_id
+                                ),
+                                "prefill_device_id": request.prefill_device_id,
+                                "decode_device_id": request.decode_device_id,
+                            },
+                        })
                         
                 logger.debug(f"Request {request.request_id} admitted, prefill_device_id={request.prefill_device_id}, decode_device_id={request.decode_device_id}")
                 self._profile_events.append({

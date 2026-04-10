@@ -22,7 +22,7 @@ RUN_BATCH_PORT="${RUN_BATCH_PORT:-8000}"
 SUCCEEDED_LOG="${SUCCEEDED_LOG:-$SCRIPT_DIR/succeeded_runs.log}"
 FAILED_LOG="${FAILED_LOG:-$SCRIPT_DIR/failed_runs.log}"
 RUN_LOG="${RUN_LOG:-$SCRIPT_DIR/all_runs.log}"
-SERVER_ROUTER_KWARGS='{"device_mem":1248576, "block_size":16, "model_name":"Qwen/Qwen2.5-7B-Instruct", "tpot":0.05, "scheduling_overhead":0.003, "max_decode_length":500, "is_pd_disagg":0, "n_prefill_per_group":1, "max_decode_bs":16, "enable_rerouting":0}'
+SERVER_ROUTER_KWARGS='{"device_mem":1248576, "block_size":16, "model_name":"Qwen/Qwen2.5-7B-Instruct", "tpot":0.05, "scheduling_overhead":0.003, "scheduling_safety_margin":0.002, "max_decode_length":500, "is_pd_disagg":0, "n_prefill_per_group":1, "max_decode_bs":16, "enable_rerouting":0}'
 SERVER_EXTRA_ARGS_SHELL="${SERVER_EXTRA_ARGS_SHELL:-}"
 SERVER_CLIENTS="${SERVER_CLIENTS:-0-7}"
 
@@ -35,6 +35,7 @@ DEFAULT_PROFIT="constant"
 DEFAULT_ADMISSION_MODE="arrival"
 DEFAULT_SLO_ROUTING_OVERHEAD="0.05"
 DEFAULT_SCHEDULING_OVERHEAD="0.003"
+DEFAULT_SCHEDULING_SAFETY_MARGIN="0.002"
 DEFAULT_ROUTING_OVERHEAD="-1.0"
 DEFAULT_ROUTING_FALLBACK_POLICY="asap"
 DEFAULT_TENSOR_PARALLEL_SIZE="1"
@@ -74,6 +75,7 @@ load_config() {
     admission_mode="${TRACE_ADMISSION_MODE[$key]}"
     slo_routing_overhead="${TRACE_SLO_ROUTING_OVERHEAD[$key]}"
     scheduling_overhead="${TRACE_SCHEDULING_OVERHEAD[$key]}"
+    scheduling_safety_margin="${TRACE_SCHEDULING_SAFETY_MARGIN[$key]}"
     routing_overhead="${TRACE_ROUTING_OVERHEAD[$key]}"
     routing_fallback_policy="${TRACE_ROUTING_FALLBACK_POLICY[$key]}"
     tensor_parallel_size="${TRACE_TENSOR_PARALLEL_SIZE[$key]}"
@@ -117,6 +119,7 @@ load_config() {
   admission_mode="$DEFAULT_ADMISSION_MODE"
   slo_routing_overhead="$DEFAULT_SLO_ROUTING_OVERHEAD"
   scheduling_overhead="$DEFAULT_SCHEDULING_OVERHEAD"
+  scheduling_safety_margin="$DEFAULT_SCHEDULING_SAFETY_MARGIN"
   routing_overhead="$DEFAULT_ROUTING_OVERHEAD"
   routing_fallback_policy="$DEFAULT_ROUTING_FALLBACK_POLICY"
   tensor_parallel_size="$DEFAULT_TENSOR_PARALLEL_SIZE"
@@ -132,18 +135,20 @@ render_runtime_server_router_kwargs() {
   local base_kwargs="$1"
   local model_name="$2"
   local scheduling_overhead="$3"
-  local slo_tpot="$4"
-  local perf_model_err="$5"
+  local scheduling_safety_margin="$4"
+  local slo_tpot="$5"
+  local perf_model_err="$6"
 
-  python - "$base_kwargs" "$model_name" "$scheduling_overhead" "$slo_tpot" "$perf_model_err" <<'PY'
+  python - "$base_kwargs" "$model_name" "$scheduling_overhead" "$scheduling_safety_margin" "$slo_tpot" "$perf_model_err" <<'PY'
 import json
 import sys
 
 kwargs = json.loads(sys.argv[1])
 kwargs["model_name"] = sys.argv[2]
 kwargs["scheduling_overhead"] = float(sys.argv[3])
-kwargs["tpot"] = float(sys.argv[4])
-kwargs["perf_model_err"] = float(sys.argv[5])
+kwargs["scheduling_safety_margin"] = float(sys.argv[4])
+kwargs["tpot"] = float(sys.argv[5])
+kwargs["perf_model_err"] = float(sys.argv[6])
 print(json.dumps(kwargs, separators=(",", ":"), sort_keys=True))
 PY
 }
@@ -175,7 +180,7 @@ make_run_key() {
     "$length_trace" \
     "$arrival_trace" \
     "$policy" \
-    "$window|load_scales=${load_scales[*]}|ttft_slo_scales=${ttft_slo_scales[*]}|slo_tpots=${slo_tpots_key}|perf_model_errs=${perf_model_errs_key}|model_name=${model_name}|tensor_parallel_size=${tensor_parallel_size}|profit=${profit}|admission_mode=${admission_mode}|slo_routing_overhead=${slo_routing_overhead}|scheduling_overhead=${scheduling_overhead}|routing_overhead=${routing_overhead}|routing_fallback_policy=${routing_fallback_policy}|output_dir=${output_dir}|extra_args=${extra_bench_args[*]}" \
+    "$window|load_scales=${load_scales[*]}|ttft_slo_scales=${ttft_slo_scales[*]}|slo_tpots=${slo_tpots_key}|perf_model_errs=${perf_model_errs_key}|model_name=${model_name}|tensor_parallel_size=${tensor_parallel_size}|profit=${profit}|admission_mode=${admission_mode}|slo_routing_overhead=${slo_routing_overhead}|scheduling_overhead=${scheduling_overhead}|scheduling_safety_margin=${scheduling_safety_margin}|routing_overhead=${routing_overhead}|routing_fallback_policy=${routing_fallback_policy}|output_dir=${output_dir}|extra_args=${extra_bench_args[*]}" \
     "${devices[*]}"
 }
 
@@ -372,6 +377,7 @@ run_suite() {
             "$trace_server_router_kwargs_base" \
             "$model_name" \
             "$scheduling_overhead" \
+            "$scheduling_safety_margin" \
             "$current_slo_tpot" \
             "$current_perf_model_err")"
           next_server_signature="$(compute_server_signature)"
@@ -398,6 +404,7 @@ run_suite() {
           echo "  admission_mode=$admission_mode"
           echo "  slo_routing_overhead=$slo_routing_overhead"
           echo "  scheduling_overhead=$scheduling_overhead"
+          echo "  scheduling_safety_margin=$scheduling_safety_margin"
           echo "  routing_overhead=$routing_overhead"
           echo "  routing_fallback_policy=$routing_fallback_policy"
           echo "  output_dir=$output_dir"
@@ -424,6 +431,7 @@ run_suite() {
             --admission_mode "$admission_mode"
             --slo_routing_overhead "$slo_routing_overhead"
             --scheduling_overhead "$scheduling_overhead"
+            --scheduling_safety_margin "$scheduling_safety_margin"
             --model_name "$model_name"
             --tensor_parallel_size "$tensor_parallel_size"
             --port "$RUN_BATCH_PORT"

@@ -32,6 +32,7 @@ SCALAR_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "admission_mode": (),
     "slo_routing_overhead": (),
     "scheduling_overhead": (),
+    "scheduling_safety_margin": (),
     "routing_overhead": (),
     "routing_fallback_policy": (),
     "tensor_parallel_size": (),
@@ -44,6 +45,7 @@ DEFAULT_TRACE_SPEC: dict[str, Any] = {
     "admission_mode": "arrival",
     "slo_routing_overhead": "0.05",
     "scheduling_overhead": "0.003",
+    "scheduling_safety_margin": "0.002",
     "routing_overhead": "-1.0",
     "routing_fallback_policy": "reject",
     "tensor_parallel_size": "1",
@@ -268,6 +270,10 @@ def _build_trace_server_router_kwargs(
     merged["model_name"] = trace_spec["model_name"]
     if "scheduling_overhead" in trace_spec:
         merged["scheduling_overhead"] = float(trace_spec["scheduling_overhead"])
+    if "scheduling_safety_margin" in trace_spec:
+        merged["scheduling_safety_margin"] = float(
+            trace_spec["scheduling_safety_margin"]
+        )
 
     slo_tpots = trace_spec.get("slo_tpots", [])
     if len(slo_tpots) == 1:

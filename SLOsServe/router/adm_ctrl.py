@@ -8,7 +8,7 @@ import math
 import SLOsServe_C
 
 from SLOsServe.decode_length_predictor import DecodeLengthPredictorPlugin
-from SLOsServe.perf_model import PerfModel
+from SLOsServe.perf_model import PerfModel, summarize_perf_model
 from SLOsServe.router.execplan_bus import ExecPlan
 from SLOsServe.router.macro import DUMP_SCHS, DUMP_ADM
 
@@ -97,8 +97,6 @@ class BatchPlanner:
     _cpp_adm_ctrl_iterations: int = 0
     _cpp_schedule_iterations: int = 0
     _fast_sched_perf_mode: str = "full"
-    
-    
     def __post_init__(self):
         fast_sched_perf_mode = os.getenv(
             "SLOSERVE_PY_FAST_SCHED_PERF_MODE",
@@ -115,6 +113,17 @@ class BatchPlanner:
         self._adm_ctrler = SLOsServe_C.AdmCtrlScheduler("edf_sim", self._block_size, False, False)
         self._adm_ctrler_tpot = None
         self.batch_id = 0
+        logger.info(
+            (
+                "BatchPlanner perf model initialized: block_size=%s "
+                "max_decode_length=%s max_batch_size=%s oracle=%s perf_model=%s"
+            ),
+            self._block_size,
+            self._max_decode_length,
+            self._max_batch_size,
+            self._is_oracle,
+            summarize_perf_model(self._perf_model),
+        )
 
     def _cap_batch_size(self, batch_size: int) -> int:
         batch_size = max(0, int(batch_size))
@@ -252,11 +261,18 @@ class BatchPlanner:
             if predictor_override is None else predictor_override
         )
         if predictor is not None:
-            return max(0, int(predictor.predict_length(req)))
-        if self._is_oracle:
+            predicted = max(0, int(predictor.predict_length(req)))
+        elif self._is_oracle:
             assert req.output_length is not None
-            return int(req.output_length)
-        return int(self._max_decode_length)
+            predicted = int(req.output_length)
+        else:
+            predicted = int(self._max_decode_length)
+
+        # The control plane models max_tokens as the total decode horizon, not
+        # the remaining one. Keep it ahead of already-generated decode tokens so
+        # active requests are never translated into "already finished" C++ work.
+        decoded_tokens = max(0, req.num_computed_tokens - req.num_prompt_tokens)
+        return max(predicted, decoded_tokens + 1)
 
     def _build_request(
         self,
@@ -326,7 +342,42 @@ class BatchPlanner:
             tpots=[tpot],
             fixed_bs=False,
         )
+        if self._adm_ctrler_tpot is None:
+            logger.info(
+                (
+                    "BatchPlanner C adm controller configured: tpot=%s "
+                    "perf_model=%s cpp_planner=%s"
+                ),
+                tpot,
+                summarize_perf_model(self._perf_model),
+                (
+                    self._perf_model.get_cpp_planner_config()
+                    if hasattr(self._perf_model, "get_cpp_planner_config")
+                    else None
+                ),
+            )
         self._adm_ctrler_tpot = tpot
+
+    def _dump_tag(self) -> str:
+        tag = getattr(self, "tag", None)
+        if tag is None:
+            tag = f"planner_{getattr(self, 'batch_id', 0)}"
+        return str(tag).replace(os.sep, "_").replace(" ", "_")
+
+    def _get_cpp_online_slack(self) -> float:
+        return float(getattr(self._perf_model, "_online_spike_slack", 0.0) or 0.0)
+
+    def update_perf_model(self, delta):
+        self._perf_model.update(delta)
+
+    def _emit_planner_sch_event(self, extra_args: dict) -> None:
+        event = {
+            "event_type": "planner_sch",
+            "timestamp": time.time(),
+            "extra_args": extra_args,
+        }
+        if hasattr(self, "_profile_events"):
+            self._profile_events.append(event)
 
     def _dump_schedule_inputs(
         self,
@@ -337,16 +388,16 @@ class BatchPlanner:
         current_time: float,
         is_feasible: bool,
         surfix: str
-    ) -> None:
+    ) -> str | None:
         try:
             now = time.time()
             os.makedirs(_LOCAL_DUMP_DIR, exist_ok=True)
             filename = os.path.join(
                 _LOCAL_DUMP_DIR,
-                f"schedule_{self.tag}_{surfix}.txt",
+                f"schedule_{self._dump_tag()}_{surfix}.txt",
             )
             with open(filename, "w") as f:
-                f.write("SLOPACKER_SCHEDULE_DUMP_V1\n")
+                f.write("SLOPACKER_SCHEDULE_DUMP_V2\n")
                 f.write(f"timestamp {now}\n")
                 f.write("did 0\n")
                 f.write(f"mode {json.dumps('adm_ctrl_refresh')}\n")
@@ -362,19 +413,37 @@ class BatchPlanner:
                 f.write(f"planner_max_bs {planner_max_bs}\n")
                 tpot = self._adm_ctrler_tpot if self._adm_ctrler_tpot is not None else 0.0
                 f.write(f"tpots 1 {tpot}\n")
-                planner_config = self._perf_model.get_cpp_planner_config()
-                if planner_config["type"] == "piecewise_current_tokens":
-                    hardware_params = [
-                        value
-                        for segment_params in planner_config["segment_hardware_params"]
-                        for value in segment_params
-                    ]
+                if hasattr(self._perf_model, "get_cpp_planner_config"):
+                    planner_config = self._perf_model.get_cpp_planner_config()
+                else:
+                    planner_config = {
+                        "type": "linear",
+                        "hardware_params": getattr(self._perf_model, "hardware_params", []),
+                    }
+                planner_config_type = planner_config.get("type", "linear")
+                f.write(f"planner_config_type {json.dumps(planner_config_type)}\n")
+                if planner_config_type == "piecewise_current_tokens":
+                    breakpoints = planner_config.get("breakpoints", [])
+                    f.write(f"current_token_breakpoints {len(breakpoints)}")
+                    for breakpoint in breakpoints:
+                        f.write(f" {int(breakpoint)}")
+                    f.write("\n")
+                    segment_hardware_params = planner_config.get(
+                        "segment_hardware_params",
+                        [],
+                    )
+                    f.write(f"segment_hardware_params {len(segment_hardware_params)}\n")
+                    for segment_params in segment_hardware_params:
+                        f.write(f"segment_params {len(segment_params)}")
+                        for x in segment_params:
+                            f.write(f" {x}")
+                        f.write("\n")
                 else:
                     hardware_params = planner_config["hardware_params"]
-                f.write(f"hardware_params {len(hardware_params)}")
-                for x in hardware_params:
-                    f.write(f" {x}")
-                f.write("\n")
+                    f.write(f"hardware_params {len(hardware_params)}")
+                    for x in hardware_params:
+                        f.write(f" {x}")
+                    f.write("\n")
                 f.write(f"M {num_free_blocks}\n")
                 f.write(f"current_time {current_time}\n")
                 f.write(f"max_time {self._max_time}\n")
@@ -405,8 +474,10 @@ class BatchPlanner:
                     )
             logger.warning(f'dumping takes {time.time()-now:.3f}s')
             logger.warning(f"[BatchPlanner] Dumped anomalous cpp schedule inputs to {filename}")
+            return filename
         except Exception:
             logger.exception("Failed to dump anomalous cpp schedule inputs")
+            return None
 
     def _to_cpp_request(
         self,
@@ -480,16 +551,18 @@ class BatchPlanner:
             if num_free_blocks_override is None
             else int(num_free_blocks_override)
         )
+        online_slack = self._get_cpp_online_slack()
         reject_reason = None
         if hasattr(self._adm_ctrler, "adm_ctrl_with_reason"):
             is_feasible, is_accepteds, reject_reason = self._adm_ctrler.adm_ctrl_with_reason(
-                c_reqs, num_free_blocks, 0.0
+                c_reqs, num_free_blocks, 0.0, online_slack
             )
         else:
             is_feasible, is_accepteds = self._adm_ctrler.adm_ctrl(
                 c_reqs,
                 num_free_blocks,
                 0.0,
+                online_slack,
             )
         # print('c_reqs', c_reqs, 'num_free_blocks', self._num_free_blocks)
         # print('is_feasible', is_feasible, 'is_accepteds', is_accepteds)
@@ -604,7 +677,11 @@ class BatchPlanner:
     ) -> tuple[bool, set[str]]:
         reqs = [
             req for req in self._requests.values()
-            if req.service_tier != 'best_effort' 
+            if (
+                req.service_tier != 'best_effort'
+                and req.arrived
+                and not req.finished(self._is_oracle)
+            )
         ]
         if not len(reqs): 
             return True, set()
@@ -625,15 +702,18 @@ class BatchPlanner:
             if num_free_blocks_override is None
             else int(num_free_blocks_override)
         )
+        online_slack = self._get_cpp_online_slack()
+        reject_reason = None
         if hasattr(self._adm_ctrler, "adm_ctrl_with_reason"):
-            is_feasible, is_accepteds, _reject_reason = self._adm_ctrler.adm_ctrl_with_reason(
-                c_reqs, num_free_blocks, 0.0
+            is_feasible, is_accepteds, reject_reason = self._adm_ctrler.adm_ctrl_with_reason(
+                c_reqs, num_free_blocks, 0.0, online_slack
             )
         else:
             is_feasible, is_accepteds = self._adm_ctrler.adm_ctrl(
                 c_reqs,
                 num_free_blocks,
                 0.0,
+                online_slack,
             )
         accepted_ids = {
             req.request_id
@@ -645,7 +725,6 @@ class BatchPlanner:
     def get_last_infeasible_reason(self) -> str | None:
         return self._last_infeasible_reason
         
-    
     def get_next_batch_and_admitted_reqs(self) -> tuple[dict[str, int], set[str], ExecPlan]:
         start = time.time()
             
@@ -720,7 +799,6 @@ class BatchPlanner:
         
         # if not num_scheduled_tokens == self._batch_plan[0].n_scheduled_tokens:
         #     logger.warning(f"num_scheduled_tokens mismatch: {num_scheduled_tokens=}, {self._batch_plan[0].n_scheduled_tokens=}")
-            
         for req_id in finished_reqs:
             self._requests.pop(req_id, None)
         if finished_reqs:
@@ -739,7 +817,6 @@ class BatchPlanner:
         # is_feasible, self._batch_plan, reason = self._refresh_c()
         # if not is_feasible:
             # logger.info(f'[BatchPlanner]: Infeasibility detected. {reason=}')
-
     def _refresh_fast(self) -> tuple[bool, list[Batch], str | None]:
         now = max(self._next_batch_time or 0, self._now())
         load_ddls = sorted(
@@ -810,30 +887,25 @@ class BatchPlanner:
             batch_size_source = "best_effort_only"
 
         if batch_size <= 0:
-            if hasattr(self, '_profile_events'):
-                self._profile_events.append({
-                    'event_type': 'planner_sch',
-                    'timestamp': time.time(),
-                    'extra_args': {
-                        'batch_id': self.batch_id,
-                        'load_ddls': load_ddls,
-                        'sch': {},
-                        'unsched_tokens': 0,
-                        'accepted_regular_count': len(accepted_regular_ids),
-                        'rejected_regular_count': rejected_regular_count,
-                        'batch_size_source': batch_size_source,
-                        'batch_time_budget': batch_time_budget,
-                        'selected_deadline_req_id': selected_deadline_req_id,
-                        'selected_deadline_cumulative_load': selected_deadline_cumulative_load,
-                        'selected_deadline_total_past_tokens': selected_deadline_total_past_tokens,
-                        'selected_deadline_num_reqs': selected_deadline_num_reqs,
-                        'regular_feasible': regular_feasible,
-                        'fast_sched_perf_mode': self._fast_sched_perf_mode,
-                        'total_past_tokens': 0,
-                        'total_scheduled_tokens': 0,
-                        'num_scheduled_reqs': 0
-                    }
-                })
+            self._emit_planner_sch_event({
+                'batch_id': self.batch_id,
+                'load_ddls': load_ddls,
+                'sch': {},
+                'unsched_tokens': 0,
+                'accepted_regular_count': len(accepted_regular_ids),
+                'rejected_regular_count': rejected_regular_count,
+                'batch_size_source': batch_size_source,
+                'batch_time_budget': batch_time_budget,
+                'selected_deadline_req_id': selected_deadline_req_id,
+                'selected_deadline_cumulative_load': selected_deadline_cumulative_load,
+                'selected_deadline_total_past_tokens': selected_deadline_total_past_tokens,
+                'selected_deadline_num_reqs': selected_deadline_num_reqs,
+                'regular_feasible': regular_feasible,
+                'fast_sched_perf_mode': self._fast_sched_perf_mode,
+                'total_past_tokens': 0,
+                'total_scheduled_tokens': 0,
+                'num_scheduled_reqs': 0
+            })
             return True, [], None
 
         b = Batch(start_time=now, unscheduled_tokens=batch_size)
@@ -863,30 +935,25 @@ class BatchPlanner:
             total_past_tokens += req.num_computed_tokens
             num_scheduled_reqs += 1
             b.unscheduled_tokens = remaining_tokens - n_sch
-        if hasattr(self, '_profile_events'):
-            self._profile_events.append({
-                'event_type': 'planner_sch',
-                'timestamp': time.time(),
-                'extra_args': {
-                    'batch_id': self.batch_id,
-                    'load_ddls': load_ddls,
-                    'sch': b.n_scheduled_tokens,
-                    'unsched_tokens': b.unscheduled_tokens,
-                    'accepted_regular_count': len(accepted_regular_ids),
-                    'rejected_regular_count': rejected_regular_count,
-                    'batch_size_source': batch_size_source,
-                    'batch_time_budget': batch_time_budget,
-                    'selected_deadline_req_id': selected_deadline_req_id,
-                    'selected_deadline_cumulative_load': selected_deadline_cumulative_load,
-                    'selected_deadline_total_past_tokens': selected_deadline_total_past_tokens,
-                    'selected_deadline_num_reqs': selected_deadline_num_reqs,
-                    'regular_feasible': regular_feasible,
-                    'fast_sched_perf_mode': self._fast_sched_perf_mode,
-                    'total_past_tokens': total_past_tokens,
-                    'total_scheduled_tokens': total_scheduled_tokens,
-                    'num_scheduled_reqs': num_scheduled_reqs
-                }
-            })
+        self._emit_planner_sch_event({
+            'batch_id': self.batch_id,
+            'load_ddls': load_ddls,
+            'sch': b.n_scheduled_tokens,
+            'unsched_tokens': b.unscheduled_tokens,
+            'accepted_regular_count': len(accepted_regular_ids),
+            'rejected_regular_count': rejected_regular_count,
+            'batch_size_source': batch_size_source,
+            'batch_time_budget': batch_time_budget,
+            'selected_deadline_req_id': selected_deadline_req_id,
+            'selected_deadline_cumulative_load': selected_deadline_cumulative_load,
+            'selected_deadline_total_past_tokens': selected_deadline_total_past_tokens,
+            'selected_deadline_num_reqs': selected_deadline_num_reqs,
+            'regular_feasible': regular_feasible,
+            'fast_sched_perf_mode': self._fast_sched_perf_mode,
+            'total_past_tokens': total_past_tokens,
+            'total_scheduled_tokens': total_scheduled_tokens,
+            'num_scheduled_reqs': num_scheduled_reqs
+        })
         return True, [b], None
 
 
@@ -899,8 +966,9 @@ class BatchPlanner:
         self._ensure_cpp_planner(tpot)
         setup_elapsed = time.time() - start
         c_reqs = [self._to_cpp_request(req, is_new_req=False, now=now) for req in self._requests.values()]
+        online_slack = self._get_cpp_online_slack()
         is_feasible, c_batches = self._adm_ctrler.schedule(
-            c_reqs, 0.0, self._max_time, False,
+            c_reqs, 0.0, self._max_time, False, online_slack,
         )
         accepted_ids = [req.id for req in c_reqs]
         sch_elapsed = time.time() - start

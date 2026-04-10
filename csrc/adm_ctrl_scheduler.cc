@@ -421,7 +421,7 @@ double BatchPlanner::batch_to_time(int n_tokens, size_t n_reqs, size_t n_past_to
             t
         );
     }
-    return t;
+    return t + online_slack;
 }
 
 int BatchPlanner::time_to_batch(double t, size_t n_reqs, size_t n_past_tokens, size_t decode_steps) {
@@ -433,7 +433,9 @@ int BatchPlanner::time_to_batch(double t, size_t n_reqs, size_t n_past_tokens, s
         double k3 = hardware_params[i+2];
         double k4 = hardware_params[i+3];
         double b = hardware_params[i+4];
-        bs = std::min((t - b - k2 * n_reqs - k3 * n_past_tokens - k4 * decode_steps) / k1, bs);
+        bs = std::min(
+            (t - online_slack - b - k2 * n_reqs - k3 * n_past_tokens - k4 * decode_steps) / k1,
+            bs);
     }
     // std::cout << "time2batch, t:" << t << ", decode_steps:" << decode_steps << std::endl;
     assert(bs > 0);
@@ -512,7 +514,7 @@ double PiecewiseARBatchPlanner::batch_to_time(
         n_reqs,
         n_past_tokens,
         decode_steps
-    );
+    ) + online_slack;
 }
 
 int PiecewiseARBatchPlanner::time_to_batch(
@@ -537,6 +539,7 @@ int PiecewiseARBatchPlanner::time_to_batch(
         int candidate = segment_hi;
         const double k1 = params[0];
         const double residual_budget = t
+            - online_slack
             - params[4]
             - params[1] * static_cast<double>(n_reqs)
             - params[2] * static_cast<double>(n_past_tokens)
@@ -1252,9 +1255,13 @@ std::tuple<bool, std::vector<Batch> > AdmCtrlScheduler::schedule(
     std::vector<Request>& reqs,
     double current_time,
     double max_time,
-    bool verbose
+    bool verbose,
+    double online_slack
 ){
     (void)verbose;
+    if (planner) {
+        planner->set_online_slack(online_slack);
+    }
     return _construct_batch_prefix(
         reqs,
         std::numeric_limits<int>::max(),
@@ -1266,8 +1273,12 @@ std::tuple<bool, std::vector<Batch> > AdmCtrlScheduler::schedule(
 std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::admission_control(
     std::vector<Request>& reqs,
     const int M,
-    double current_time
+    double current_time,
+    double online_slack
 ) {
+    if (planner) {
+        planner->set_online_slack(online_slack);
+    }
 
     // Helper that applies the selected admission-control policy to a
     // given request list. The requests are sorted by deadline before
@@ -1410,13 +1421,21 @@ std::tuple<bool, std::vector<bool> > AdmCtrlScheduler::admission_control(
 std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::admission_control_with_reason(
     std::vector<Request>& reqs,
     const int M,
-    double current_time
+    double current_time,
+    double online_slack
 ) {
+    if (planner) {
+        planner->set_online_slack(online_slack);
+    }
     if (!fifo_fair && mode == "edf_sim") {
         return _admission_control_edf_sim_with_reason(reqs, M, current_time);
     }
 
-    auto [is_feasible, is_accepted] = admission_control(reqs, M, current_time);
+    auto [is_feasible, is_accepted] = admission_control(
+        reqs,
+        M,
+        current_time,
+        online_slack);
     std::string reject_reason = "NONE";
     if (!is_feasible) {
         reject_reason = "UNKNOWN";
@@ -1471,7 +1490,7 @@ std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::_admission_co
         return req.ddl + std::max(0, req.n_computed_tokens - req.input_length + 1) * planner->tpots[0];
     };
     // TODO(Yi): implement the memory feasibility check with MontCaro;
-    auto feasibility_check = [&](const std::vector<Request>& reqs) -> std::pair<bool, std::string> {
+    auto feasibility_check_general = [&](const std::vector<Request>& reqs) -> std::pair<bool, std::string> {
         std::vector<std::tuple<double, std::string, Request> > events;
         double tpot = planner->tpots[0];
         for (auto& req: reqs) {
@@ -1530,6 +1549,7 @@ std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::_admission_co
                 }
                 now += n_batch * decode_time;
                 remained_tks.back() += (decode_bs - n_decode) * n_batch;
+                active_decode_past_tokens += n_decode * n_batch;
             }
             if (type == "first_load") {
                 auto next_load = get_next_load(req);
@@ -1581,6 +1601,9 @@ std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::_admission_co
                 }
             }
             else if (type == "finish") {
+                if (n_decode == 0) {
+                    return {false, "CMP"};
+                }
                 n_decode -= 1;
                 remained_mem += req.input_length + req.max_tokens;
                 auto it = decode_past_tokens_by_req.find(req.id);
@@ -1592,6 +1615,82 @@ std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::_admission_co
             else if (type == "arrival") {
                 req_remained_tk_idx[req.id] = remained_tks.size();
                 remained_tks.push_back(0);
+            }
+        }
+        return {true, "NONE"};
+    };
+
+    auto feasibility_check_decode_only = [&](const std::vector<Request>& reqs) -> std::pair<bool, std::string> {
+        std::vector<std::tuple<int, std::string, Request> > events;
+        std::vector<Request> decode_reqs;
+        double tpot = planner->tpots[0];
+        
+        auto floor_by_tpot = [&](double time) -> int {
+            return std::floor(time / tpot);
+        };
+
+        auto ceil_by_tpot = [&](double time) -> int {
+            return std::ceil(time / tpot);
+        };
+
+        for (auto& req: reqs) {
+            int decode_start_step = floor_by_tpot(get_next_ddl(req) - tpot);
+            int finish_step = floor_by_tpot(req.ddl + req.max_tokens * tpot);
+            int earliest_arrival_step = ceil_by_tpot(req.arrival_time);
+            if (decode_start_step < earliest_arrival_step) {
+                return {false, "CMP"};
+            }
+            events.push_back({decode_start_step, "arrival", req});
+            events.push_back({finish_step, "finish", req});
+        }
+        std::sort(events.begin(), events.end(),
+                  [](const auto& a, const auto& b) {
+                      if (std::get<0>(a) != std::get<0>(b)) {
+                          return std::get<0>(a) < std::get<0>(b);
+                      }
+                      return std::get<1>(a) < std::get<1>(b);
+                  });
+        int cur_step = ceil_by_tpot(current_time);
+        double slack = cur_step * tpot - current_time;
+        double active_decode_past_tokens = 0;
+        int remained_mem = int_remained_mem;
+        for (auto& e: events) {
+            auto [step, type, req] = e;
+            if (step < cur_step) 
+                return {false, "CMP"};
+            if (decode_reqs.size()) {
+                int n_decode_step = step - cur_step;
+                int average_n_past_tokens = active_decode_past_tokens + n_decode_step * (decode_reqs.size() + 1) / 2;
+                double elapsed = planner->batch_to_time(
+                    decode_reqs.size(),
+                    decode_reqs.size(),
+                    average_n_past_tokens,
+                    1) * n_decode_step;
+                remained_mem -= decode_reqs.size() * n_decode_step;
+                active_decode_past_tokens += decode_reqs.size() * n_decode_step;
+                slack -= elapsed;
+            }
+            slack += (step - cur_step) * tpot;
+            cur_step = step;
+            if (slack < 0) {
+                return {false, "CMP"};
+            }
+            if (remained_mem < 0) {
+                return {false, "MEM"};
+            }
+            if (type == "arrival") {
+                decode_reqs.push_back(req);
+                active_decode_past_tokens += req.n_computed_tokens;
+            }
+            else if (type == "finish") {
+                auto it = std::find_if(decode_reqs.begin(), decode_reqs.end(),
+                    [&](const Request& r) { return r.id == req.id; });
+                if (it == decode_reqs.end()) {
+                    return {false, "CMP"};
+                }
+                decode_reqs.erase(it);
+                active_decode_past_tokens -= req.max_tokens + req.input_length;
+                remained_mem += req.max_tokens + req.input_length;
             }
         }
         return {true, "NONE"};
@@ -1610,6 +1709,20 @@ std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::_admission_co
             is_accepted[i] = true;
         }
     }
+
+    auto feasibility_check = [&](const std::vector<Request>& check_reqs) -> std::pair<bool, std::string> {
+        const bool is_decode_only = std::all_of(
+            check_reqs.begin(),
+            check_reqs.end(),
+            [](const Request& req) {
+                return req.n_computed_tokens >= req.input_length;
+            });
+        if (!is_decode_only) {
+            return feasibility_check_general(check_reqs);
+        }
+
+        return feasibility_check_decode_only(check_reqs);
+    };
 
     auto [feasible, baseline_reason] = feasibility_check(working_reqs);
     if (!feasible) {

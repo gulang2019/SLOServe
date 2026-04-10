@@ -99,6 +99,37 @@ def normalize_upper_bound_percentiles(
     return tuple(normalized)
 
 
+def summarize_perf_model(perf_model: Any) -> dict[str, Any]:
+    if perf_model is None:
+        return {}
+    describe = getattr(perf_model, "describe_hardware_params", None)
+    if callable(describe):
+        hardware_params = describe()
+    else:
+        hardware_params = copy.deepcopy(
+            getattr(perf_model, "hardware_params", None)
+        )
+    is_piecewise = bool(
+        getattr(perf_model, "is_piecewise_current_tokens", False)
+    )
+    return {
+        "model_name": getattr(perf_model, "model_name", None),
+        "type": "piecewise_current_tokens" if is_piecewise else "linear",
+        "breakpoints": (
+            hardware_params.get("breakpoints")
+            if isinstance(hardware_params, dict) else None
+        ),
+        "hardware_params": hardware_params,
+        "online_average_delay_s": float(
+            getattr(perf_model, "_online_average_delay", 0.0) or 0.0
+        ),
+        "online_spike_slack_s": float(
+            getattr(perf_model, "_online_spike_slack", 0.0) or 0.0
+        ),
+        "update_cnt": int(getattr(perf_model, "_update_cnt", 0) or 0),
+    }
+
+
 def normalize_current_token_breakpoints(
     breakpoints: tuple[int, ...] | list[int] | None,
 ) -> tuple[int, ...]:
@@ -1310,7 +1341,8 @@ class PerfModel:
         self.model_config = get_model_config(model_name)
         self._online_average_delay = 0.0
         self._online_spike_slack = 0.0
-        self._decay_factor = 0.95
+        self._decay_factor = 0.99
+        self._online_delay_clip_s = 1e-2
         self._update_cnt = 0
         self._model_type = "linear"
         self._linear_hardware_params: list[float] | None = None
@@ -1472,13 +1504,22 @@ class PerfModel:
             num_decode_steps=num_decode_steps,
         )
     
-    def update(self, batch: list[tuple[int, int]], elapsed: float):
-        pass 
-        return 
-        estimated = self.get_batch_time(batch) - self._online_spike_slack
-        self._online_average_delay = self._decay_factor * (self._online_average_delay) + \
-            (1 - self._decay_factor) * (elapsed - estimated)
-        self._online_spike_slack = max(self._online_average_delay, 0.0)
+    def update(self, delay: float): # the elasped time - estimated time
+        clipped_delay = min(
+            max(float(delay), -self._online_delay_clip_s),
+            self._online_delay_clip_s,
+        )
+        if self._update_cnt == 0:
+            self._online_average_delay = clipped_delay
+        else:
+            self._online_average_delay = (
+                self._decay_factor * self._online_average_delay
+                + (1 - self._decay_factor) * clipped_delay
+            )
+        self._online_spike_slack = max(
+            self._online_spike_slack + (1 - self._decay_factor) * clipped_delay,
+            0.0,
+        )
         if self._update_cnt % 100 == 0:
             logger.info(f'[PerfModel::Update]: {self._online_average_delay=}, {self._online_spike_slack=}')
         self._update_cnt += 1
@@ -1583,17 +1624,19 @@ class PerfModel:
         self,
         *,
         scale: float = 1.0,
-        constant_offset: float = 0.0,
+        constant_offset: float | None = None,
     ) -> 'PerfModel':
         adjusted = copy.deepcopy(self)
+        if constant_offset is not None:
+            adjusted._online_average_delay = 0.0
+            adjusted._online_spike_slack = max(float(constant_offset), 0.0)
+            adjusted._update_cnt = 0
         if not adjusted.is_piecewise_current_tokens:
             assert adjusted._linear_hardware_params is not None
             if scale != 1.0:
                 adjusted._linear_hardware_params = [
                     param * scale for param in adjusted._linear_hardware_params
                 ]
-            if constant_offset != 0.0:
-                adjusted._linear_hardware_params[4] += constant_offset
             adjusted.hardware_params = copy.deepcopy(adjusted._linear_hardware_params)
             return adjusted
 
@@ -1601,8 +1644,6 @@ class PerfModel:
             params = adjusted._piecewise_segment_params[segment_key]
             if scale != 1.0:
                 params = [param * scale for param in params]
-            if constant_offset != 0.0:
-                params[4] += constant_offset
             adjusted._piecewise_segment_params[segment_key] = params
         adjusted.hardware_params = build_piecewise_current_token_hardware_params(
             adjusted._piecewise_segment_params,
@@ -1683,7 +1724,13 @@ class PerfModel:
             viz=viz,
             min_abs_num_reqs_coef=min_abs_num_reqs_coef,
         )
-        
+    
+    def print(self):
+        print('==PerfModel==')
+        print('HW Params:', self.hardware_params)
+        print('online_slack:', self._online_spike_slack)
+        print('==PerfModel==')
+    
 DEFAULT_HW_PARAMS = {
     'default': [4.86e-5, 1.69e-5, 8e-8, 0, 1.4e-2],
     # 'Qwen/Qwen2.5-7B-Instruct': [4.86e-5, 3.7e-5, 5e-8, 0, 1.3e-2],

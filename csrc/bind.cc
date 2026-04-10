@@ -107,11 +107,13 @@ PYBIND11_MODULE(SLOsServe_C, m) {
             py::arg("alpha"), py::arg("max_sd_size"), py::arg("fixed_spec"), py::arg("max_bs") = 16384)
         .def("schedule", &AdmCtrlScheduler::schedule,
              py::arg("reqs"), py::arg("current_time"), py::arg("max_time") = 1,
-             py::arg("verbose") = false)
+             py::arg("verbose") = false, py::arg("online_slack") = 0.0)
         .def("adm_ctrl", &AdmCtrlScheduler::admission_control,
-             py::arg("reqs"), py::arg("M"), py::arg("current_time"))
+             py::arg("reqs"), py::arg("M"), py::arg("current_time"),
+             py::arg("online_slack") = 0.0)
         .def("adm_ctrl_with_reason", &AdmCtrlScheduler::admission_control_with_reason,
-             py::arg("reqs"), py::arg("M"), py::arg("current_time"))
+             py::arg("reqs"), py::arg("M"), py::arg("current_time"),
+             py::arg("online_slack") = 0.0)
         .def("__repr__", [](const AdmCtrlScheduler& scheduler) {
             return "<AdmCtrlScheduler>";
         });

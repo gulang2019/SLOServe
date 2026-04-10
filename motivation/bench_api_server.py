@@ -1160,6 +1160,8 @@ class Problem:
     window: str = '0:10'
     perf_model_err: float = 1.0 # the factor between used performance model and real performance model.
     scheduling_overhead: float = 0.0
+    scheduling_safety_margin: float = 0.0
+    post_update_config_delay_s: float = 10.0
     
     # runtime config
     load_scale: float = 1.0 
@@ -1294,6 +1296,19 @@ def compute_ttft_slo(
     )
 
 
+def _build_tpot_deadline_offsets(
+    output_tokens: int,
+    thinking_length: int,
+) -> list[int]:
+    output_tokens = max(int(output_tokens), 0)
+    thinking_length = max(int(thinking_length), 0)
+    if output_tokens <= 0:
+        return []
+    if thinking_length > 0:
+        return list(range(thinking_length, thinking_length + output_tokens))
+    return list(range(1, output_tokens))
+
+
 def _load_saved_request_rows(reqs_file: str | Path) -> List[Dict[str, Any]]:
     path = Path(reqs_file)
     raw = path.read_text(encoding="utf-8").strip()
@@ -1373,6 +1388,7 @@ def _evaluate_saved_request_slo(
     prompt_tokens = int(req_row.get("prompt_tokens", 0))
     cached_tokens = int(req_row.get("num_cached_tokens", 0))
     output_tokens = max(int(req_row.get("output_tokens", 0)), 0)
+    thinking_length = max(int(req_row.get("thinking_length", 0)), 0)
     uncached_prompt_tokens = max(prompt_tokens - cached_tokens, 0)
 
     corrected_schedules: list[tuple[float, int]] = []
@@ -1393,10 +1409,14 @@ def _evaluate_saved_request_slo(
         ))
         prev_timestamp = timestamp
 
+    tpot_deadline_offsets = _build_tpot_deadline_offsets(
+        output_tokens,
+        thinking_length,
+    )
     required_tokens = [(arrival_time + float(ttft_budget_s), uncached_prompt_tokens)]
-    for i in range(max(output_tokens - 1, 0)):
+    for offset in tpot_deadline_offsets:
         required_tokens.append((
-            arrival_time + float(ttft_budget_s) + (i + 1) * float(slo_tpot),
+            arrival_time + float(ttft_budget_s) + float(offset) * float(slo_tpot),
             1,
         ))
 
@@ -1405,6 +1425,7 @@ def _evaluate_saved_request_slo(
     completion_timestamp = arrival_time
     ttft_laxity = 0.0
     tpot_laxities: list[float] = []
+    tpot_schedule_indices: list[int | None] = []
     effective_timestamps: list[float] = []
     expected_finish_time: list[float] = []
 
@@ -1424,6 +1445,7 @@ def _evaluate_saved_request_slo(
             ttft_laxity = laxity
         else:
             tpot_laxities.append(laxity)
+            tpot_schedule_indices.append(schedule_idx - 1 if schedule_idx > 0 else None)
 
     finish_reason = req_row.get("finish_reason")
     if finish_reason != "length":
@@ -1439,9 +1461,13 @@ def _evaluate_saved_request_slo(
         "req_id": req_row.get("req_id"),
         "ttft_budget_s": float(ttft_budget_s),
         "slo_tpot": float(slo_tpot),
+        "thinking_length": int(thinking_length),
         "finish_reason": finish_reason,
         "violation": violation,
         "ttft_laxity": float(ttft_laxity),
+        "tpot_laxities": tpot_laxities,
+        "tpot_deadline_offsets": tpot_deadline_offsets,
+        "tpot_schedule_indices": tpot_schedule_indices,
         "max_tpot_laxity": float(max(tpot_laxities, default=0.0)),
         "p90_tpot_laxity": (
             float(np.percentile(tpot_laxities, 90))
@@ -1984,6 +2010,7 @@ def _build_request_payload(
     prompt: str | list[int],
     input_length: int,
     output_length: int,
+    thinking_length: int,
     zero_load_ttft: float,
     cached_tokens: int,
     session_id: str | None,
@@ -2000,6 +2027,7 @@ def _build_request_payload(
     vllm_xargs = {
         'input_length': input_length,
         'output_length': output_length,
+        'thinking_length': thinking_length,
         'zero_load_ttft': zero_load_ttft,
         'cached_tokens': cached_tokens,
         'slo_ttft': ttft_slo,
@@ -2257,6 +2285,7 @@ def _make_best_effort_request(
         cached_length=0,
         session_id=None,
         prompt=_build_synthetic_prompt_tokens(int(template.input_length), seed=seed),
+        thinking_length=int(getattr(template, "thinking_length", 0)),
     )
 
 
@@ -2266,6 +2295,7 @@ async def _run_request_with_client(client: httpx.AsyncClient,
                     prompt: str | list[int], 
                     input_length: int,
                     output_length: int,
+                    thinking_length: int,
                     zero_load_ttft: float,
                     cached_tokens: int,
                     session_id: str | None,
@@ -2291,6 +2321,7 @@ async def _run_request_with_client(client: httpx.AsyncClient,
             prompt=prompt,
             input_length=input_length,
             output_length=output_length,
+            thinking_length=thinking_length,
             zero_load_ttft=zero_load_ttft,
             cached_tokens=cached_tokens,
             session_id=session_id,
@@ -2367,6 +2398,7 @@ async def run_request(client: httpx.AsyncClient | None,
                     prompt: str | list[int], 
                     input_length: int,
                     output_length: int,
+                    thinking_length: int,
                     zero_load_ttft: float,
                     cached_tokens: int,
                     session_id: str | None,
@@ -2388,6 +2420,7 @@ async def run_request(client: httpx.AsyncClient | None,
                 prompt,
                 input_length,
                 output_length,
+                thinking_length,
                 zero_load_ttft,
                 cached_tokens,
                 session_id,
@@ -2414,6 +2447,7 @@ async def run_request(client: httpx.AsyncClient | None,
                 prompt,
                 input_length,
                 output_length,
+                thinking_length,
                 zero_load_ttft,
                 cached_tokens,
                 session_id,
@@ -3349,7 +3383,14 @@ def _recommend_clock_monitor_low_mhz_from_trace(
         first_positive_idx = _find_first_positive_index(req_row.get("tpot_laxities"))
         if first_positive_idx is None:
             continue
-        schedule_idx = first_positive_idx + 1
+        schedule_indices = req_row.get("tpot_schedule_indices") or []
+        if first_positive_idx < len(schedule_indices):
+            try:
+                schedule_idx = int(schedule_indices[first_positive_idx])
+            except (TypeError, ValueError):
+                schedule_idx = first_positive_idx + 1
+        else:
+            schedule_idx = first_positive_idx + 1
         if schedule_idx >= len(schedules):
             continue
         schedule = schedules[schedule_idx]
@@ -4636,6 +4677,12 @@ async def main(
         update_clients=update_clients,
     )
     await _wait_for_server_ready(endpoint)
+    if problem.post_update_config_delay_s > 0.0:
+        print(
+            "waiting after update_config:",
+            f"{float(problem.post_update_config_delay_s):.1f}s",
+        )
+        await asyncio.sleep(float(problem.post_update_config_delay_s))
     async with aiohttp.ClientSession() as session:
         try:
             async with session.post(
@@ -4752,6 +4799,7 @@ async def main(
                         prompt,
                         request.input_length,
                         request.output_length,
+                        int(getattr(request, "thinking_length", 0)),
                         zero_load_ttft=perf_model.get_zero_load_ttft(
                             request.input_length,
                             request.cached_length,
@@ -4818,6 +4866,7 @@ async def main(
                             best_effort_request.prompt or [],
                             best_effort_request.input_length,
                             best_effort_request.output_length,
+                            int(getattr(best_effort_request, "thinking_length", 0)),
                             zero_load_ttft=perf_model.get_zero_load_ttft(
                                 best_effort_request.input_length,
                                 0,
@@ -5817,6 +5866,8 @@ def build_problems(
     perf_model_err: float = 1.0,
     routing_overhead: float = -1.0,
     scheduling_overhead: float = 0.0,
+    scheduling_safety_margin: float = 0.0,
+    post_update_config_delay_s: float = 10.0,
     routing_fallback_policy: str = "asap",
     kv_xfer_delay: float = 0.05,
     enable_session_replay: bool = False,
@@ -6136,6 +6187,7 @@ def build_problems(
     for sch_kwargs in scheduling_kwargss:
         sch_kwargs['max_decoding_length'] = max_output_length
         sch_kwargs['admission_max_decoding_length'] = admission_output_length
+        sch_kwargs['scheduling_safety_margin'] = scheduling_safety_margin
     
     routing_kwargss = []
     if routing_policy.startswith('round_robin_session'):
@@ -6400,6 +6452,8 @@ def build_problems(
         admission_output_length = admission_output_length,
         perf_model_err = perf_model_err,
         scheduling_overhead = scheduling_overhead,
+        scheduling_safety_margin = scheduling_safety_margin,
+        post_update_config_delay_s = post_update_config_delay_s,
         routing_overhead = routing_overhead,
         routing_fallback_policy = routing_fallback_policy,
         enable_session_replay = enable_session_replay,
@@ -6455,6 +6509,8 @@ def run(
     slo_routing_overhead: float,
     admission_mode: str,
     scheduling_overhead: float,
+    scheduling_safety_margin: float,
+    post_update_config_delay_s: float,
     output_dir: str,
     perf_model_errs: list[float],
     routing_overhead: float,
@@ -6541,6 +6597,7 @@ def run(
     print(f"Experiment directory: {experiment_dir}")    
     print(f"admission_mode: {admission_mode}")
     print(f"scheduling_overhead: {scheduling_overhead}")
+    print(f"scheduling_safety_margin: {scheduling_safety_margin}")
     print(f'performance model errors: {perf_model_errs}')
     print(f'routing fallback policy: {routing_fallback_policy}')
     print(f'kv_xfer_delay: {kv_xfer_delay}')
@@ -6615,6 +6672,7 @@ def run(
                     r['ttft_slo_scale'],
                     r['slo_tpot'],
                     r['perf_model_err'],
+                    r.get('scheduling_safety_margin', 0.0),
                     r.get('baseline_decode_cap'),
                     r.get('fast_sched_baseline_bsz'),
                     r.get('mock_engine_device_mem_bytes'),
@@ -6689,6 +6747,7 @@ def run(
             ttft_slo_scale,
             slo_tpot,
             perf_model_err,
+            scheduling_safety_margin,
             baseline_decode_cap,
             fast_sched_baseline_bsz,
             mock_engine_device_mem_bytes,
@@ -6779,6 +6838,8 @@ def run(
                         perf_model_err,
                         routing_overhead,
                         scheduling_overhead=scheduling_overhead,
+                        scheduling_safety_margin=scheduling_safety_margin,
+                        post_update_config_delay_s=post_update_config_delay_s,
                         routing_fallback_policy=routing_fallback_policy,
                         kv_xfer_delay=kv_xfer_delay,
                         enable_session_replay=enable_session_replay,
@@ -6880,6 +6941,8 @@ def run(
             perf_model_err,
             routing_overhead,
             scheduling_overhead = scheduling_overhead,
+            scheduling_safety_margin = scheduling_safety_margin,
+            post_update_config_delay_s=post_update_config_delay_s,
             routing_fallback_policy=routing_fallback_policy,
             kv_xfer_delay=kv_xfer_delay,
             enable_session_replay=enable_session_replay,
@@ -6923,6 +6986,7 @@ def run(
             # print(f"Running problem: {problem}")
             problem.concise_logging = concise_logging
             problem.scheduling_kwargs['scheduling_overhead'] = scheduling_overhead
+            problem.scheduling_kwargs['scheduling_safety_margin'] = scheduling_safety_margin
             try:
                 exec_result = asyncio.run(
                     main(
@@ -7004,6 +7068,7 @@ def run(
             'admission_output_length': problems[0].admission_output_length,
             'enable_session_replay': enable_session_replay,
             'session_pause_s': session_pause_s,
+            'post_update_config_delay_s': post_update_config_delay_s,
             'frontend_httpx_max_connections': frontend_httpx_max_connections,
             'frontend_httpx_max_keepalive_connections': (
                 frontend_httpx_max_keepalive_connections
@@ -7018,6 +7083,7 @@ def run(
             'energy_consumption': best_result.energy_consumption,
             'per_gpu_energy_consumption': best_result.per_gpu_energy_consumption,
             'scheduling_overhead': scheduling_overhead,
+            'scheduling_safety_margin': scheduling_safety_margin,
             'burstiness_level': burstiness_level,
             'trace_used': trace,
             'slo_routing_overhead': problems[0].slo_routing_overhead,
@@ -7453,6 +7519,18 @@ if __name__ == '__main__':
     parser.add_argument('--admission_mode', type=str, default='arrival', choices=['arrival', 'anytime'], help = 'arrival: instant decision at arrival, anytime: admission can be made anytime.')
     parser.add_argument('--policies', type=str, default=[':'.join([a,b]) for a, b in product(ROUTING_POLICIES, SCHEDULING_POLICIES)], nargs='+', help = 'list of policies to run (routing_policy:scheduling_policy [routing_policy:scheduling_policy ...])')
     parser.add_argument('--scheduling_overhead', type=float, default=0.003, help = 'scheduling overhead per token in seconds')
+    parser.add_argument(
+        '--scheduling_safety_margin',
+        type=float,
+        default=0.0,
+        help='target control-estimate safety margin in seconds',
+    )
+    parser.add_argument(
+        '--post_update_config_delay_s',
+        type=float,
+        default=10.0,
+        help='seconds to wait after /update_config completes before benchmark arrivals start',
+    )
     parser.add_argument('--output_dir', type=str, default='experiments', help = 'output directory')
     parser.add_argument('--perf_model_err', type = float, default = [1.0], nargs = '+', help = 'list of performance model errors')
     parser.add_argument('--routing_overhead', type = float, default = -1.0, help = "mocked overhead from at engine.")
@@ -7681,6 +7759,8 @@ if __name__ == '__main__':
                 slo_routing_overhead = args.slo_routing_overhead,
                 admission_mode = args.admission_mode,
                 scheduling_overhead = args.scheduling_overhead,
+                scheduling_safety_margin = args.scheduling_safety_margin,
+                post_update_config_delay_s = args.post_update_config_delay_s,
                 output_dir = args.output_dir,
                 perf_model_errs = args.perf_model_err,
                 routing_overhead = args.routing_overhead,
@@ -7802,6 +7882,8 @@ if __name__ == '__main__':
                 'routing_overhead': args.routing_overhead,
                 'routing_fallback_policy': args.routing_fallback_policy,
                 'scheduling_overhead': args.scheduling_overhead,
+                'scheduling_safety_margin': args.scheduling_safety_margin,
+                'post_update_config_delay_s': args.post_update_config_delay_s,
                 'output_dir': args.output_dir,
                 'perf_model_errs': args.perf_model_err,
                 'kv_xfer_delay': args.kv_xfer_delay,

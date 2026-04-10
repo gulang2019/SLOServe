@@ -19,10 +19,13 @@ struct ScheduleDump {
     bool scheduler_fifo_fair = false;
     bool scheduler_continuous = false;
     std::string planner_type = "ar";
+    std::string planner_config_type = "linear";
     bool planner_fixed_bs = false;
     int planner_max_bs = 16384;
     std::vector<double> tpots;
     std::vector<double> hardware_params;
+    std::vector<int> current_token_breakpoints;
+    std::vector<std::vector<double> > segment_hardware_params;
     int M = 0;
     double current_time = 0.0;
     double max_time = 10.0;
@@ -52,11 +55,12 @@ bool load_dump(const std::string& path, ScheduleDump& dump, std::string& err) {
     }
 
     std::string magic;
-    if (!std::getline(in, magic) || magic != "SLOPACKER_SCHEDULE_DUMP_V1") {
+    if (!std::getline(in, magic)
+        || (magic != "SLOPACKER_SCHEDULE_DUMP_V1"
+            && magic != "SLOPACKER_SCHEDULE_DUMP_V2")) {
         err = "invalid dump format (magic mismatch)";
         return false;
     }
-
     if (!expect_label(in, "timestamp")) { err = "missing timestamp"; return false; }
     in >> dump.timestamp;
     if (!expect_label(in, "did")) { err = "missing did"; return false; }
@@ -82,11 +86,67 @@ bool load_dump(const std::string& path, ScheduleDump& dump, std::string& err) {
     dump.tpots.resize(n_tpots);
     for (size_t i = 0; i < n_tpots; ++i) in >> dump.tpots[i];
 
-    size_t n_hw = 0;
-    if (!expect_label(in, "hardware_params")) { err = "missing hardware_params"; return false; }
-    in >> n_hw;
-    dump.hardware_params.resize(n_hw);
-    for (size_t i = 0; i < n_hw; ++i) in >> dump.hardware_params[i];
+    std::string planner_config_label;
+    if (!(in >> planner_config_label)) { err = "missing planner config"; return false; }
+    if (planner_config_label == "planner_config_type") {
+        in >> std::quoted(dump.planner_config_type);
+        if (dump.planner_config_type == "piecewise_current_tokens") {
+            size_t n_breakpoints = 0;
+            if (!expect_label(in, "current_token_breakpoints")) {
+                err = "missing current_token_breakpoints";
+                return false;
+            }
+            in >> n_breakpoints;
+            dump.current_token_breakpoints.resize(n_breakpoints);
+            for (size_t i = 0; i < n_breakpoints; ++i) {
+                in >> dump.current_token_breakpoints[i];
+            }
+
+            size_t n_segments = 0;
+            if (!expect_label(in, "segment_hardware_params")) {
+                err = "missing segment_hardware_params";
+                return false;
+            }
+            in >> n_segments;
+            dump.segment_hardware_params.clear();
+            dump.segment_hardware_params.reserve(n_segments);
+            for (size_t i = 0; i < n_segments; ++i) {
+                std::string label;
+                size_t n_params = 0;
+                if (!(in >> label) || label != "segment_params") {
+                    err = "missing segment_params row";
+                    return false;
+                }
+                in >> n_params;
+                std::vector<double> segment(n_params);
+                for (size_t j = 0; j < n_params; ++j) {
+                    in >> segment[j];
+                }
+                dump.segment_hardware_params.push_back(std::move(segment));
+            }
+        } else if (dump.planner_config_type == "linear") {
+            size_t n_hw = 0;
+            if (!expect_label(in, "hardware_params")) {
+                err = "missing hardware_params";
+                return false;
+            }
+            in >> n_hw;
+            dump.hardware_params.resize(n_hw);
+            for (size_t i = 0; i < n_hw; ++i) in >> dump.hardware_params[i];
+        } else {
+            err = "unsupported planner_config_type: " + dump.planner_config_type;
+            return false;
+        }
+    } else if (planner_config_label == "hardware_params") {
+        size_t n_hw = 0;
+        dump.planner_config_type = "linear";
+        in >> n_hw;
+        dump.hardware_params.resize(n_hw);
+        for (size_t i = 0; i < n_hw; ++i) in >> dump.hardware_params[i];
+    } else {
+        err = "unexpected planner config label: " + planner_config_label;
+        return false;
+    }
 
     if (!expect_label(in, "M")) { err = "missing M"; return false; }
     in >> dump.M;
@@ -153,11 +213,14 @@ bool load_dump(const std::string& path, ScheduleDump& dump, std::string& err) {
             >> req.prefill_device_id
             >> req.decode_device_id
             >> req.prefill_only
-            >> req.arrival_time
-            >> req.max_tokens;
+            >> req.arrival_time;
         if (!row.good()) {
             err = "failed parsing req row";
             return false;
+        }
+        req.max_tokens = req.prefill_only ? 0 : -1;
+        if (!(row >> req.max_tokens)) {
+            row.clear();
         }
         dump.reqs.push_back(req);
     }
@@ -195,8 +258,25 @@ int main(int argc, char** argv) {
 
     AdmCtrlScheduler scheduler(dump.scheduler_mode, 16, dump.scheduler_fifo_fair, dump.scheduler_continuous);
     auto tpots = dump.tpots;
-    auto hardware = dump.hardware_params;
-    scheduler.set_ar_planner(tpots, hardware, dump.planner_fixed_bs, static_cast<size_t>(dump.planner_max_bs));
+    if (dump.planner_config_type == "piecewise_current_tokens") {
+        auto breakpoints = dump.current_token_breakpoints;
+        auto segment_hardware_params = dump.segment_hardware_params;
+        scheduler.set_ar_piecewise_planner(
+            tpots,
+            breakpoints,
+            segment_hardware_params,
+            dump.planner_fixed_bs,
+            static_cast<size_t>(dump.planner_max_bs)
+        );
+    } else {
+        auto hardware = dump.hardware_params;
+        scheduler.set_ar_planner(
+            tpots,
+            hardware,
+            dump.planner_fixed_bs,
+            static_cast<size_t>(dump.planner_max_bs)
+        );
+    }
 
     bool replay_is_feasible = false;
     std::vector<std::string> replay_accepted_ids;
@@ -208,13 +288,30 @@ int main(int argc, char** argv) {
     for (int i = 0; i < repeat; ++i) {
         std::vector<Request> reqs = dump.reqs;
         auto t0 = std::chrono::high_resolution_clock::now();
-        auto [is_schedule_feasible, out] = scheduler.schedule(reqs, dump.current_time, dump.max_time, false);
+        auto [is_accepted_feasible, is_accepted] = scheduler.admission_control(
+            reqs, dump.M, dump.current_time);
+        std::vector<Request> accepted_reqs;
+        std::vector<std::string> accepted_ids;
+        accepted_reqs.reserve(reqs.size());
+        accepted_ids.reserve(reqs.size());
+        for (size_t j = 0; j < reqs.size() && j < is_accepted.size(); ++j) {
+            if (!is_accepted[j]) {
+                continue;
+            }
+            accepted_reqs.push_back(reqs[j]);
+            accepted_ids.push_back(reqs[j].id);
+        }
+        auto [is_schedule_feasible, out] = is_accepted_feasible
+            ? scheduler.schedule(accepted_reqs, dump.current_time, dump.max_time, false)
+            : std::make_tuple(false, std::vector<Batch>{});
         auto t1 = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration<double>(t1 - t0).count();
         elapsed_sum_s += elapsed;
         elapsed_min_s = std::min(elapsed_min_s, elapsed);
         elapsed_max_s = std::max(elapsed_max_s, elapsed);
 
+        replay_is_feasible = is_accepted_feasible && is_schedule_feasible;
+        replay_accepted_ids = std::move(accepted_ids);
         replay_batches = std::move(out);
         std::cout << "Iteration " << (i + 1) << "/" << repeat
                   << ": replay_is_feasible=" << replay_is_feasible
@@ -238,12 +335,26 @@ int main(int argc, char** argv) {
     std::cout << "planner_type " << dump.planner_type
               << " fixed_bs " << dump.planner_fixed_bs
               << " max_bs " << dump.planner_max_bs << "\n";
+    std::cout << "planner_config_type " << dump.planner_config_type << "\n";
     std::cout << "tpots_n " << dump.tpots.size() << " tpots";
     for (double x : dump.tpots) std::cout << " " << x;
     std::cout << "\n";
-    std::cout << "hardware_params_n " << dump.hardware_params.size() << " hardware_params";
-    for (double x : dump.hardware_params) std::cout << " " << x;
-    std::cout << "\n";
+    if (dump.planner_config_type == "piecewise_current_tokens") {
+        std::cout << "current_token_breakpoints_n " << dump.current_token_breakpoints.size()
+                  << " current_token_breakpoints";
+        for (int x : dump.current_token_breakpoints) std::cout << " " << x;
+        std::cout << "\n";
+        std::cout << "segment_hardware_params_n " << dump.segment_hardware_params.size() << "\n";
+        for (size_t i = 0; i < dump.segment_hardware_params.size(); ++i) {
+            std::cout << "segment[" << i << "]";
+            for (double x : dump.segment_hardware_params[i]) std::cout << " " << x;
+            std::cout << "\n";
+        }
+    } else {
+        std::cout << "hardware_params_n " << dump.hardware_params.size() << " hardware_params";
+        for (double x : dump.hardware_params) std::cout << " " << x;
+        std::cout << "\n";
+    }
     std::cout << "n_reqs " << dump.reqs.size() << " M " << dump.M
               << " max_time " << dump.max_time << "\n";
     int n_new = 0;
