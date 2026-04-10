@@ -989,6 +989,173 @@ def _compute_avg_batch_tokens_series(
     return bins[:-1] - start_time, avg_tokens
 
 
+ENERGY_COMPARISON_METADATA_VERSION = 1
+
+
+def _normalize_energy_comparison_event_files(
+    event_files: list[tuple],
+) -> list[tuple[str, str, int]]:
+    parsed_event_files: list[tuple[str, str, int]] = []
+    for entry in event_files:
+        if len(entry) == 3:
+            parsed_event_files.append(entry)
+        elif len(entry) == 4:
+            parsed_event_files.append(entry[:3])
+        else:
+            raise ValueError(f'Expected (label, file, n_device) for event_files, got {entry}')
+    return parsed_event_files
+
+
+def _infer_slo_params_from_event_file(event_file: str) -> tuple[float, float]:
+    stem = event_file.rsplit('/', 1)[-1].removesuffix('.events.jsonl')
+    numeric_tokens = []
+    for token in reversed(stem.split('_')):
+        try:
+            numeric_tokens.append(float(token))
+        except ValueError:
+            continue
+        if len(numeric_tokens) == 2:
+            break
+    if len(numeric_tokens) < 2:
+        raise ValueError(f'Unable to infer SLO settings from {event_file}')
+    slo_tpot, ttft_slo_scale = numeric_tokens
+    return ttft_slo_scale, slo_tpot
+
+
+def _compute_global_arrival_series(
+    events: list[Event],
+    window_size: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    arrival_times = np.asarray(
+        [float(event.timestamp) for event in events if event.event_type == 'global_arrival'],
+        dtype=np.float64,
+    )
+    if arrival_times.size == 0:
+        empty = np.array([], dtype=np.float64)
+        return empty, empty
+
+    t0 = np.floor(arrival_times.min() / window_size) * window_size
+    n_bins = int(np.floor((arrival_times.max() - t0) / window_size)) + 1
+    idx = np.floor((arrival_times - t0) / window_size).astype(np.int64)
+    counts = np.bincount(idx, minlength=n_bins)
+    time_axis = t0 + np.arange(n_bins, dtype=np.float64) * window_size
+    return time_axis, counts
+
+
+def _compute_slo_violation_series(
+    reqs: Dict[str, RequestInstance],
+    event_file: str,
+    window_size: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not reqs:
+        empty = np.array([], dtype=np.float64)
+        return empty, empty
+
+    ttft_slo_scale, slo_tpot = _infer_slo_params_from_event_file(event_file)
+    slo_ttft_fn = lambda req: req.zero_load_ttft * ttft_slo_scale + 0.05
+    arrival_times: list[float] = []
+    violation_times: list[float] = []
+    for req in reqs.values():
+        req.get_stats(slo_ttft_fn, slo_tpot)
+        arrival_times.append(float(req.arrival_time))
+        if req.violate_slo() != 'none':
+            violation_times.append(float(req.arrival_time))
+
+    arrival_times_arr = np.asarray(arrival_times, dtype=np.float64)
+    if arrival_times_arr.size == 0:
+        empty = np.array([], dtype=np.float64)
+        return empty, empty
+
+    t0 = np.floor(arrival_times_arr.min() / window_size) * window_size
+    n_bins = int(np.floor((arrival_times_arr.max() - t0) / window_size)) + 1
+    counts = np.zeros(n_bins, dtype=np.int64)
+    if violation_times:
+        violation_times_arr = np.asarray(violation_times, dtype=np.float64)
+        idx = np.floor((violation_times_arr - t0) / window_size).astype(np.int64)
+        counts = np.bincount(idx, minlength=n_bins)
+    time_axis = t0 + np.arange(n_bins, dtype=np.float64) * window_size
+    return time_axis, counts
+
+
+def _compute_preferred_power_summary(
+    events: list[Event],
+    *,
+    label: str,
+    event_file: str,
+    n_device: int,
+    window_size: float,
+) -> dict[str, Any]:
+    power_summary = _compute_measured_power_series(
+        events,
+        n_device=n_device,
+        window_size=window_size,
+    )
+    if power_summary.get("source") == "measured":
+        return power_summary
+
+    print(
+        f"WARNING: falling back to state-based power "
+        f"for '{label}' ({event_file}) because measured power profiling is unavailable."
+    )
+    return _compute_state_based_power_series(
+        events,
+        n_device=n_device,
+        window_size=window_size,
+    )
+
+
+def build_energy_comparison_metadata(
+    event_files,
+    *,
+    power_window_s: float = 1.0,
+    arrival_window_s: float = 5.0,
+    violation_window_s: float = 5.0,
+) -> dict[str, Any]:
+    traces: list[dict[str, Any]] = []
+    for label, event_file, n_device in _normalize_energy_comparison_event_files(event_files):
+        events, reqs = analyze_events(event_file)
+        power_summary = _compute_preferred_power_summary(
+            events,
+            label=label,
+            event_file=event_file,
+            n_device=n_device,
+            window_size=power_window_s,
+        )
+        arrival_time_axis, arrival_counts = _compute_global_arrival_series(events, arrival_window_s)
+        violation_time_axis, violation_counts = _compute_slo_violation_series(
+            reqs,
+            event_file,
+            violation_window_s,
+        )
+        traces.append({
+            "label": str(label),
+            "event_file": str(event_file),
+            "n_device": int(n_device),
+            "power": {
+                "time_s": np.asarray(power_summary["time"], dtype=np.float64).tolist(),
+                "values_w": np.asarray(power_summary["total_power"], dtype=np.float64).tolist(),
+                "window_s": float(power_window_s),
+                "source": str(power_summary.get("source", "unknown")),
+            },
+            "arrivals": {
+                "time_s": np.asarray(arrival_time_axis, dtype=np.float64).tolist(),
+                "values": np.asarray(arrival_counts, dtype=np.int64).tolist(),
+                "window_s": float(arrival_window_s),
+            },
+            "slo_violations": {
+                "time_s": np.asarray(violation_time_axis, dtype=np.float64).tolist(),
+                "values": np.asarray(violation_counts, dtype=np.int64).tolist(),
+                "window_s": float(violation_window_s),
+            },
+        })
+
+    return {
+        "schema_version": ENERGY_COMPARISON_METADATA_VERSION,
+        "figure": "timeline_comparison",
+        "traces": traces,
+    }
+
+
 def _compute_measured_power_series(
     events: list[Event],
     *,
@@ -3924,60 +4091,6 @@ def draw_energy_comparison(
     if line_styles is None:
         line_styles = {}
 
-    def _infer_slo_params(event_file: str) -> tuple[float, float]:
-        stem = event_file.rsplit('/', 1)[-1].removesuffix('.events.jsonl')
-        numeric_tokens = []
-        for token in reversed(stem.split('_')):
-            try:
-                numeric_tokens.append(float(token))
-            except ValueError:
-                continue
-            if len(numeric_tokens) == 2:
-                break
-        if len(numeric_tokens) < 2:
-            raise ValueError(f'Unable to infer SLO settings from {event_file}')
-        slo_tpot, ttft_slo_scale = numeric_tokens
-        return ttft_slo_scale, slo_tpot
-
-    def _compute_slo_violations(reqs: Dict[str, RequestInstance], event_file: str, window_size: float):
-        if not reqs:
-            return np.array([]), np.array([])
-
-        ttft_slo_scale, slo_tpot = _infer_slo_params(event_file)
-        slo_ttft_fn = lambda req: req.zero_load_ttft * ttft_slo_scale + 0.05
-        violation_cnts = 0
-        arrival_times = []
-        violation_times = []
-        for req in reqs.values():
-            req.get_stats(slo_ttft_fn, slo_tpot)
-            arrival_times.append(req.arrival_time)
-            if req.violate_slo() != 'none':
-                violation_times.append(req.arrival_time)
-                violation_cnts += 1
-
-        arrival_times = np.asarray(arrival_times, dtype=np.float64)
-        if arrival_times.size == 0:
-            return np.array([]), np.array([])
-
-        t0 = np.floor(arrival_times.min() / window_size) * window_size
-        n_bins = int(np.floor((arrival_times.max() - t0) / window_size)) + 1
-        counts = np.zeros(n_bins, dtype=np.int64)
-        if violation_times:
-            violation_times = np.asarray(violation_times, dtype=np.float64)
-            idx = np.floor((violation_times - t0) / window_size).astype(np.int64)
-            counts = np.bincount(idx, minlength=n_bins)
-        time_axis = t0 + np.arange(n_bins, dtype=np.float64) * window_size
-        return time_axis, counts
-
-    parsed_event_files = []
-    for entry in event_files:
-        if len(entry) == 3:
-            parsed_event_files.append(entry)
-        elif len(entry) == 4:
-            parsed_event_files.append(entry[:3])
-        else:
-            raise ValueError(f'Expected (label, file, n_device) for event_files, got {entry}')
-
     arrival_window = 5
     violation_window = 5
     linewidth = 2
@@ -3988,7 +4101,7 @@ def draw_energy_comparison(
     arrival_counts = np.array([], dtype=np.float64)
     max_num_devices = 0
 
-    for label, file, n_device in parsed_event_files:
+    for label, file, n_device in _normalize_energy_comparison_event_files(event_files):
         style = get_method_style(label)
         color = style["color"]
         marker = style["marker"]
@@ -4008,30 +4121,23 @@ def draw_energy_comparison(
         )
         events, reqs = analyze_events(file)
         if arrival_time_axis.size == 0:
-            arrival_times = [e.timestamp for e in events if e.event_type == 'global_arrival']
-            if arrival_times:
-                arrival_times = np.asarray(arrival_times, dtype=np.float64)
-                t0 = np.floor(arrival_times.min() / arrival_window) * arrival_window
-                window_idx = np.floor((arrival_times - t0) / arrival_window).astype(np.int64)
-                arrival_counts = np.bincount(window_idx)
-                arrival_time_axis = t0 + np.arange(arrival_counts.size, dtype=np.float64) * arrival_window
+            arrival_time_axis, arrival_counts = _compute_global_arrival_series(
+                events,
+                arrival_window,
+            )
 
-        power_summary = _compute_measured_power_series(
+        power_summary = _compute_preferred_power_summary(
             events,
+            label=label,
+            event_file=file,
             n_device=n_device,
             window_size=window_size,
         )
-        if power_summary.get("source") != "measured":
-            print(
-                f"WARNING: draw_energy_comparison falling back to state-based power "
-                f"for '{label}' ({file}) because measured power profiling is unavailable."
-            )
-            power_summary = _compute_state_based_power_series(
-                events,
-                n_device=n_device,
-                window_size=window_size,
-            )
-        violation_time_axis, violation_counts = _compute_slo_violations(reqs, file, violation_window)
+        violation_time_axis, violation_counts = _compute_slo_violation_series(
+            reqs,
+            file,
+            violation_window,
+        )
         active_devices = _count_active_devices_from_power_summary(power_summary)
         all_energies[label] = power_summary["total_power"].tolist()
         power_time = np.asarray(power_summary["time"], dtype=np.float64)

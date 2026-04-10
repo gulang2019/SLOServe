@@ -8,10 +8,17 @@ import numpy as np
 
 from plots.common import get_method_color, get_paper_figure_dir
 from motivation.events_analysis import (
+    build_energy_comparison_metadata,
     build_active_requests_step,
     count_at_times,
     draw_energy_comparison,
 )
+
+
+def _resolve_timeline_comparison_prefix(prefix: str | None) -> str:
+    if prefix is None:
+        return str(get_paper_figure_dir("timeline_comparison", "timeline_comparison") / "energy_consumption")
+    return prefix
 
 
 def timeline_comparison(
@@ -22,9 +29,38 @@ def timeline_comparison(
     prefix: str | None = None,
     surfix = 'coding'
 ):
-    if prefix is None:
-        prefix = str(get_paper_figure_dir("timeline_comparison", "timeline_comparison") / "energy_consumption")
+    prefix = _resolve_timeline_comparison_prefix(prefix)
     draw_energy_comparison(event_files, output_suffix=surfix, output_prefix= prefix, per_device=True)
+
+
+def export_timeline_comparison_metadata(
+    event_files: list[tuple[str, str, int]] = [
+        ("Baseline", "traces/7B_code_baseline/qlm_round_robin_1.0_8_tp1_arrival_3.0_0.025_asap_fbsz256.events.jsonl", 8),
+        ("Ours", "traces/7B_code_ours/atfc_slosserve_planner_1.0_8_tp1_arrival_3.0_0.025_asap_fbsz256.events.jsonl", 8)
+    ],
+    prefix: str | None = None,
+    surfix: str = 'coding',
+    *,
+    suffix: str | None = None,
+    power_window_s: float = 1.0,
+    arrival_window_s: float = 5.0,
+    violation_window_s: float = 5.0,
+) -> tuple[dict, Path]:
+    output_prefix = _resolve_timeline_comparison_prefix(prefix)
+    output_suffix = surfix if suffix is None else suffix
+    metadata = build_energy_comparison_metadata(
+        event_files,
+        power_window_s=power_window_s,
+        arrival_window_s=arrival_window_s,
+        violation_window_s=violation_window_s,
+    )
+    output_stem = f"{output_prefix}-{output_suffix}" if output_suffix is not None else output_prefix
+    output_path = Path(f"{output_stem}.meta.json")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+    print(f"Saved {output_path}")
+    return metadata, output_path
 
 
 def _infer_trace_style_key(event_file: str) -> str:
@@ -495,11 +531,14 @@ def draw_overhead_breakdown(
         print(f"Saved {output_prefix}.png")
         print(f"Saved {output_prefix}.pdf")
 
-timeline_comparison(event_files = [
-        ("Baseline", "traces/7B_code_baseline/qlm_round_robin_1.0_8_tp1_arrival_3.0_0.025_asap_fbsz256.events.jsonl", 8),
-        ("Ours", "traces/7B_code_ours/atfc_slosserve_planner_1.0_8_tp1_arrival_3.0_0.025_asap_fbsz256.events.jsonl", 8)
-    ],
-    surfix = 'coding')
-draw_energy_vs_bs_or_concurrency("traces/7B_code_baseline/qlm_round_robin_1.0_8_tp1_arrival_3.0_0.025_asap_fbsz256.events.jsonl")
-draw_energy_vs_bs_or_concurrency("traces/7B_code_ours/atfc_slosserve_planner_1.0_8_tp1_arrival_3.0_0.025_asap_fbsz256.events.jsonl")
-draw_overhead_breakdown()
+if __name__ == "__main__":
+    timeline_comparison(
+        event_files=[
+            ("Baseline", "traces/7B_code_baseline/qlm_round_robin_1.0_8_tp1_arrival_3.0_0.025_asap_fbsz256.events.jsonl", 8),
+            ("Ours", "traces/7B_code_ours/atfc_slosserve_planner_1.0_8_tp1_arrival_3.0_0.025_asap_fbsz256.events.jsonl", 8),
+        ],
+        surfix='coding',
+    )
+    draw_energy_vs_bs_or_concurrency("traces/7B_code_baseline/qlm_round_robin_1.0_8_tp1_arrival_3.0_0.025_asap_fbsz256.events.jsonl")
+    draw_energy_vs_bs_or_concurrency("traces/7B_code_ours/atfc_slosserve_planner_1.0_8_tp1_arrival_3.0_0.025_asap_fbsz256.events.jsonl")
+    draw_overhead_breakdown()
