@@ -241,7 +241,7 @@ def _build_metric_figure_specs(
     whitelist=None,
 ):
     specs = []
-    features = [f for f in ['load_scale', 'n_device', 'ttft_slo_scale', 'slo_tpot'] if f in df.columns]
+    features = [f for f in ['load_scale', 'n_device', 'ttft_slo_scale', 'slo_tpot', 'perf_model_err'] if f in df.columns]
     if not features:
         return specs
 
@@ -264,6 +264,7 @@ def _build_metric_figure_specs(
             ('slo_violation_rate', 'energy_consumption'),
             ('slo_violation_rate', 'average_n_active_servers'),
             ('slo_violation_rate', feature),
+            (feature, 'energy_consumption')
         ]:
             if xlabel not in df.columns or ylabel not in df.columns:
                 continue
@@ -595,6 +596,21 @@ def _render_axis_spec(ax, axis_spec):
             ax.legend()
 
 
+def _save_figure_outputs(fig, output_stem: str | Path):
+    output_stem = Path(output_stem)
+    output_stem.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(f'{output_stem}.png', dpi=300)
+    fig.savefig(f'{output_stem}.pdf', dpi=300)
+    print(f"Saved plot to {output_stem}.png")
+    print(f"Saved plot to {output_stem}.pdf")
+
+
+def _render_axes_specs(axes, spec: dict):
+    for axis_spec in spec['axes']:
+        ax = axes[axis_spec['row']][axis_spec['col']]
+        _render_axis_spec(ax, axis_spec)
+
+
 def render_figure_spec(spec: dict, save_outputs: bool = True):
     plt = _get_pyplot()
     nrows = spec['layout']['nrows']
@@ -606,19 +622,49 @@ def render_figure_spec(spec: dict, save_outputs: bool = True):
         squeeze=False,
     )
 
-    for axis_spec in spec['axes']:
-        ax = axes[axis_spec['row']][axis_spec['col']]
-        _render_axis_spec(ax, axis_spec)
+    _render_axes_specs(axes, spec)
 
     if spec.get('tight_layout', False):
         fig.tight_layout()
 
     if save_outputs:
-        output_stem = Path(spec['output_stem'])
-        fig.savefig(f'{output_stem}.png', dpi=300)
-        fig.savefig(f'{output_stem}.pdf', dpi=300)
-        print(f"Saved plot to {output_stem}.png")
-        print(f"Saved plot to {output_stem}.pdf")
+        _save_figure_outputs(fig, spec['output_stem'])
+
+    plt.close(fig)
+
+
+def render_combined_figure_specs(specs: list[dict], save_outputs: bool = True):
+    if not specs:
+        return
+
+    plt = _get_pyplot()
+    figure_width = max(spec['figsize'][0] for spec in specs)
+    figure_height = sum(spec['figsize'][1] for spec in specs)
+    height_ratios = [spec['figsize'][1] for spec in specs]
+    fig = plt.figure(
+        figsize=(figure_width, figure_height),
+        constrained_layout=True,
+    )
+    outer_grid = fig.add_gridspec(
+        len(specs),
+        1,
+        height_ratios=height_ratios,
+    )
+
+    for idx, spec in enumerate(specs):
+        nrows = spec['layout']['nrows']
+        ncols = spec['layout']['ncols']
+        inner_grid = outer_grid[idx].subgridspec(nrows, ncols)
+        axes = [
+            [fig.add_subplot(inner_grid[row, col]) for col in range(ncols)]
+            for row in range(nrows)
+        ]
+        _render_axes_specs(axes, spec)
+
+    if save_outputs:
+        output_dir = Path(specs[0]['output_stem']).parent
+        figure_name = specs[0].get('name', 'figure')
+        _save_figure_outputs(fig, output_dir / f'combined_{figure_name}')
 
     plt.close(fig)
 
@@ -681,6 +727,8 @@ def draw_figures(
             write_figure_metadata(spec)
         if render:
             render_figure_spec(spec, save_outputs=True)
+    if render:
+        render_combined_figure_specs(specs, save_outputs=True)
 
 
 def main(
