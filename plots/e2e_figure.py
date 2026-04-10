@@ -669,6 +669,137 @@ def render_combined_figure_specs(specs: list[dict], save_outputs: bool = True):
     plt.close(fig)
 
 
+def _spec_category_key(spec: dict):
+    if spec['figure_kind'] == 'metric_grid':
+        return (
+            spec['figure_kind'],
+            spec.get('ylabel'),
+            spec.get('xlabel'),
+            spec.get('feature'),
+        )
+    return (spec['figure_kind'],)
+
+
+def _spec_category_label(spec: dict):
+    if spec['figure_kind'] == 'metric_grid':
+        return f"{spec['ylabel']} vs {spec['xlabel']}\nfeature={spec['feature']}"
+    if spec['figure_kind'] == 'power_grid':
+        return 'per_server_power'
+    return spec['figure_kind']
+
+
+def render_figure_matrix_by_name(
+    spec_groups: list[tuple[str, list[dict]]],
+    output_stem: str | Path,
+    save_outputs: bool = True,
+):
+    if not spec_groups:
+        return
+
+    plt = _get_pyplot()
+    ordered_categories = []
+    category_labels = {}
+    spec_maps = []
+
+    for column_name, specs in spec_groups:
+        spec_map = {}
+        for spec in specs:
+            category_key = _spec_category_key(spec)
+            spec_map[category_key] = spec
+            if category_key not in category_labels:
+                ordered_categories.append(category_key)
+                category_labels[category_key] = _spec_category_label(spec)
+        spec_maps.append((column_name, spec_map))
+
+    label_col_width = 3.8
+    header_row_height = 0.9
+    width_ratios = [label_col_width] + [
+        max((spec['figsize'][0] for spec in spec_map.values()), default=6.0)
+        for _, spec_map in spec_maps
+    ]
+    height_ratios = [header_row_height] + [
+        max(
+            (
+                spec_map[category_key]['figsize'][1]
+                for _, spec_map in spec_maps
+                if category_key in spec_map
+            ),
+            default=4.5,
+        )
+        for category_key in ordered_categories
+    ]
+
+    fig = plt.figure(
+        figsize=(sum(width_ratios), sum(height_ratios)),
+        constrained_layout=True,
+    )
+    outer_grid = fig.add_gridspec(
+        len(ordered_categories) + 1,
+        len(spec_maps) + 1,
+        width_ratios=width_ratios,
+        height_ratios=height_ratios,
+    )
+
+    corner_ax = fig.add_subplot(outer_grid[0, 0])
+    corner_ax.axis('off')
+
+    for col_idx, (column_name, _) in enumerate(spec_maps, start=1):
+        header_ax = fig.add_subplot(outer_grid[0, col_idx])
+        header_ax.axis('off')
+        header_ax.text(
+            0.5,
+            0.5,
+            column_name,
+            ha='center',
+            va='center',
+            fontsize=15,
+            fontweight='bold',
+        )
+
+    for row_idx, category_key in enumerate(ordered_categories, start=1):
+        label_ax = fig.add_subplot(outer_grid[row_idx, 0])
+        label_ax.axis('off')
+        label_ax.text(
+            0.5,
+            0.5,
+            category_labels[category_key],
+            ha='center',
+            va='center',
+            fontsize=12,
+            wrap=True,
+        )
+
+        for col_idx, (_, spec_map) in enumerate(spec_maps, start=1):
+            spec = spec_map.get(category_key)
+            if spec is None:
+                empty_ax = fig.add_subplot(outer_grid[row_idx, col_idx])
+                empty_ax.axis('off')
+                empty_ax.text(
+                    0.5,
+                    0.5,
+                    'N/A',
+                    ha='center',
+                    va='center',
+                    fontsize=12,
+                    color='#808080',
+                )
+                continue
+
+            nrows = spec['layout']['nrows']
+            ncols = spec['layout']['ncols']
+            inner_grid = outer_grid[row_idx, col_idx].subgridspec(nrows, ncols)
+            axes = [
+                [fig.add_subplot(inner_grid[row, col]) for col in range(ncols)]
+                for row in range(nrows)
+            ]
+            _render_axes_specs(axes, spec)
+
+    if save_outputs:
+        _save_figure_outputs(fig, output_stem)
+
+    plt.close(fig)
+
+
 def _metadata_path(output_stem: str | Path) -> Path:
     return Path(f'{output_stem}{METADATA_SUFFIX}')
 
@@ -729,6 +860,7 @@ def draw_figures(
             render_figure_spec(spec, save_outputs=True)
     if render:
         render_combined_figure_specs(specs, save_outputs=True)
+    return specs
 
 
 def main(
@@ -746,13 +878,24 @@ def main(
     if result_files is None:
         result_files = _default_result_files()
 
+    rendered_spec_groups = []
     for kwargs in result_files:
-        draw_figures(
+        specs = draw_figures(
             **kwargs,
             export_metadata=export_metadata,
             render=not metadata_only,
             whitelist=whitelist,
             dirname = dirname
+        )
+        if specs:
+            rendered_spec_groups.append((kwargs['name'], specs))
+
+    if not metadata_only and rendered_spec_groups:
+        output_dir = get_paper_figure_dir(dirname, 'draw_figures')
+        render_figure_matrix_by_name(
+            rendered_spec_groups,
+            output_dir / 'all_names_by_category',
+            save_outputs=True,
         )
 
 
