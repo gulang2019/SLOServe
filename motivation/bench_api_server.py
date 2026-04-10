@@ -1158,6 +1158,7 @@ class Problem:
     trace_spec: str = 'azure_code_23'
     perf_model_task: str = 'azure_code_23'
     window: str = '0:10'
+    trace_arrival_limit_s: float | None = None
     perf_model_err: float = 1.0 # the factor between used performance model and real performance model.
     scheduling_overhead: float = 0.0
     scheduling_safety_margin: float = 0.0
@@ -2004,13 +2005,36 @@ def _load_trace_inputs(
     return merged_requests, merged_arrival_times, components
 
 
+def _apply_trace_arrival_limit(
+    requests: list[Request],
+    arrival_times: list[float],
+    trace_arrival_limit_s: float | None,
+) -> tuple[list[Request], list[float]]:
+    if trace_arrival_limit_s is None:
+        return list(requests), list(arrival_times)
+    if trace_arrival_limit_s < 0:
+        raise ValueError(
+            "trace_arrival_limit_s must be non-negative, "
+            f"got {trace_arrival_limit_s}"
+        )
+    if len(requests) != len(arrival_times):
+        raise ValueError(f"{len(requests)=} != {len(arrival_times)=}")
+    if not arrival_times:
+        return [], []
+
+    start_time = float(arrival_times[0])
+    cutoff_time = start_time + float(trace_arrival_limit_s)
+    keep_count = bisect.bisect_right(arrival_times, cutoff_time)
+    return list(requests[:keep_count]), list(arrival_times[:keep_count])
+
+
 def _build_request_payload(
     *,
     model_name: str,
     prompt: str | list[int],
     input_length: int,
     output_length: int,
-    thinking_length: int,
+    thinking_length: int = 0,
     zero_load_ttft: float,
     cached_tokens: int,
     session_id: str | None,
@@ -4576,8 +4600,26 @@ async def main(
         load_scale=problem.load_scale,
         window=problem.window,
     )
+    loaded_trace_request_count = len(requests)
+    requests, arrival_times = _apply_trace_arrival_limit(
+        requests,
+        arrival_times,
+        problem.trace_arrival_limit_s,
+    )
+    arrival_limited_request_count = len(requests)
     if trace_components:
         print(f"trace_components: {trace_components}")
+    if not requests:
+        raise ValueError(
+            "No requests remain after applying the selected trace/window/"
+            "trace_arrival_limit_s filter."
+        )
+    if problem.trace_arrival_limit_s is not None:
+        print(
+            "trace_arrival_limit:",
+            f"{float(problem.trace_arrival_limit_s):.3f}s",
+            f"kept_requests={arrival_limited_request_count}",
+        )
     print('arrival_times:', arrival_times[0], '->', arrival_times[-1])
     arrival_base_time = arrival_times[0]
     requested_n_devices = problem.n_devices
@@ -5279,6 +5321,11 @@ async def main(
     results['rr_sliced'] = rr_sliced
     results['rr_slice_kept_request_count'] = len(requests)
     results['rr_slice_total_request_count'] = original_request_count
+    results['trace_arrival_limit_s'] = problem.trace_arrival_limit_s
+    results['trace_arrival_limit_kept_request_count'] = (
+        arrival_limited_request_count
+    )
+    results['trace_arrival_limit_total_request_count'] = loaded_trace_request_count
     results['run_status'] = 'completed'
     results['overloaded'] = False
     results['rejection_reason_counts'] = rejection_breakdown['counts']
@@ -5584,6 +5631,12 @@ def _session_replay_suffix(enable_session_replay: bool, session_pause_s: float) 
     return f"_sessionreplay_{pause}s"
 
 
+def _trace_arrival_limit_suffix(trace_arrival_limit_s: float | None) -> str:
+    if trace_arrival_limit_s is None:
+        return ""
+    return f"_arrlim{_compact_suffix_number(trace_arrival_limit_s)}s"
+
+
 def _baseline_cap_suffix(baseline_decode_cap: int | None) -> str:
     if baseline_decode_cap is None:
         return ""
@@ -5861,6 +5914,7 @@ def build_problems(
     window: str,
     load_scale: float,
     experiment_dir: str,
+    trace_arrival_limit_s: float | None = None,
     slo_routing_overhead: float = 0.08,
     admission_mode: str = 'arrival',
     perf_model_err: float = 1.0,
@@ -5913,6 +5967,9 @@ def build_problems(
         enable_session_replay,
         session_pause_s,
     )
+    trace_arrival_limit_suffix = _trace_arrival_limit_suffix(
+        trace_arrival_limit_s
+    )
     baseline_cap_suffix = _baseline_cap_suffix(baseline_decode_cap)
     fast_sched_baseline_bsz_suffix = _fast_sched_baseline_bsz_suffix(
         fast_sched_baseline_bsz
@@ -5962,7 +6019,8 @@ def build_problems(
         f'{experiment_dir}/{display_scheduling_policy}_{display_routing_policy}_{load_scale}_'
         f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
         f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
-        f'{session_replay_suffix}{baseline_cap_suffix}{fast_sched_baseline_bsz_suffix}'
+        f'{session_replay_suffix}{trace_arrival_limit_suffix}'
+        f'{baseline_cap_suffix}{fast_sched_baseline_bsz_suffix}'
         f'{mock_engine_device_mem_suffix}{clock_monitor_suffix}'
         f'{perf_model_regression_suffix}{frontend_httpx_suffix}{best_effort_suffix}')
     requests_trace = trace
@@ -5974,7 +6032,17 @@ def build_problems(
         load_scale=load_scale,
         window=window,
     )
+    requests, arrival_times = _apply_trace_arrival_limit(
+        requests,
+        arrival_times,
+        trace_arrival_limit_s,
+    )
     print(f'trace_components: {trace_components}')
+    if not requests:
+        raise ValueError(
+            "No requests remain after applying the selected trace/window/"
+            "trace_arrival_limit_s filter."
+        )
     
     input_lengths = np.fromiter((request.input_length for request in requests), dtype=np.float64, count=len(requests))
     output_lengths = np.fromiter((request.output_length for request in requests), dtype=np.float64, count=len(requests))
@@ -6221,7 +6289,10 @@ def build_problems(
         extra_kwargs = {}
         if len(_args) >= 2:
             assert _args[1] == 'disagg'
-            opt_n_prefill_devices = int(optimal_prefill_ratio * group_size)
+            if len(_args) >= 3:
+                opt_n_prefill_devices = int(_args[2])
+            else:
+                opt_n_prefill_devices = int(optimal_prefill_ratio * group_size)
             opt_n_prefill_devices = min(max(opt_n_prefill_devices, 1), n_device - 1)
             print(f'opt_n_prefill_devices: {opt_n_prefill_devices}')
             extra_kwargs = {
@@ -6430,6 +6501,7 @@ def build_problems(
         trace_spec = trace,
         perf_model_task = perf_model_task,
         window = window,
+        trace_arrival_limit_s = trace_arrival_limit_s,
         load_scale = load_scale,
         n_devices = n_device,
         tensor_parallel_size = tensor_parallel_size,
@@ -6499,6 +6571,7 @@ def run(
     profit: str,
     trace: str,
     window: str,
+    trace_arrival_limit_s: float | None,
     load_scales: list[float],
     n_devices: list[int],
     tensor_parallel_size: int,
@@ -6590,6 +6663,7 @@ def run(
     print(f"profit: {profit}")
     print(f"trace: {trace}")
     print(f"window: {window}")
+    print(f"trace_arrival_limit_s: {trace_arrival_limit_s}")
     print(f"load_scales: {load_scales}")
     print(f"n_devices: {n_devices}")
     print(f"tensor_parallel_size: {tensor_parallel_size}")
@@ -6689,6 +6763,7 @@ def run(
                     tuple(r.get('perf_model_piecewise_breakpoints') or ()),
                     r.get('enable_session_replay', False),
                     r.get('session_pause_s', 0.0),
+                    r.get('trace_arrival_limit_s'),
                     r.get('frontend_httpx_max_connections'),
                     r.get('frontend_httpx_max_keepalive_connections'),
                     r.get('frontend_dedicated_client_per_request', False),
@@ -6764,6 +6839,7 @@ def run(
             tuple(perf_model_piecewise_breakpoints or ()),
             enable_session_replay,
             session_pause_s,
+            trace_arrival_limit_s,
             frontend_httpx_max_connections,
             frontend_httpx_max_keepalive_connections,
             frontend_dedicated_client_per_request,
@@ -6833,10 +6909,11 @@ def run(
                         window,
                         load_scale,
                         experiment_dir,
-                        slo_routing_overhead,
-                        admission_mode,
-                        perf_model_err,
-                        routing_overhead,
+                        trace_arrival_limit_s=trace_arrival_limit_s,
+                        slo_routing_overhead=slo_routing_overhead,
+                        admission_mode=admission_mode,
+                        perf_model_err=perf_model_err,
+                        routing_overhead=routing_overhead,
                         scheduling_overhead=scheduling_overhead,
                         scheduling_safety_margin=scheduling_safety_margin,
                         post_update_config_delay_s=post_update_config_delay_s,
@@ -6936,10 +7013,11 @@ def run(
             window,
             load_scale,
             experiment_dir,
-            slo_routing_overhead,
-            admission_mode,
-            perf_model_err,
-            routing_overhead,
+            trace_arrival_limit_s=trace_arrival_limit_s,
+            slo_routing_overhead=slo_routing_overhead,
+            admission_mode=admission_mode,
+            perf_model_err=perf_model_err,
+            routing_overhead=routing_overhead,
             scheduling_overhead = scheduling_overhead,
             scheduling_safety_margin = scheduling_safety_margin,
             post_update_config_delay_s=post_update_config_delay_s,
@@ -7068,6 +7146,7 @@ def run(
             'admission_output_length': problems[0].admission_output_length,
             'enable_session_replay': enable_session_replay,
             'session_pause_s': session_pause_s,
+            'trace_arrival_limit_s': trace_arrival_limit_s,
             'post_update_config_delay_s': post_update_config_delay_s,
             'frontend_httpx_max_connections': frontend_httpx_max_connections,
             'frontend_httpx_max_keepalive_connections': (
@@ -7096,6 +7175,10 @@ def run(
                 'rr_slice_kept_request_count'),
             'rr_slice_total_request_count': best_result.results.get(
                 'rr_slice_total_request_count'),
+            'trace_arrival_limit_kept_request_count': best_result.results.get(
+                'trace_arrival_limit_kept_request_count'),
+            'trace_arrival_limit_total_request_count': best_result.results.get(
+                'trace_arrival_limit_total_request_count'),
         }
         if 'overload_reason' in best_result.results:
             result['overload_reason'] = best_result.results['overload_reason']
@@ -7504,6 +7587,15 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument('--window', type=str, default='0:1000', help = 'window of trace to run (inclusive)')
+    parser.add_argument(
+        '--trace_arrival_limit_s',
+        type=float,
+        default=None,
+        help=(
+            'keep only requests whose original trace arrival falls within this '
+            'many seconds of the selected window start'
+        ),
+    )
     parser.add_argument('--n_devices', type=int, default=[1,2,4,8], nargs='+', help = 'list of logical replicas to run')
     parser.add_argument('--tensor_parallel_size', type=int, default=1, help='number of GPUs per logical replica')
     parser.add_argument('--load_scales', type=float, default=[0.5,1.0,2.0,3.0,4.0], nargs='+', help = 'list of load scales (we rescale the arrival rate by load scale, higher load scale means higher query per second)')
@@ -7749,6 +7841,7 @@ if __name__ == '__main__':
                 args.profit,
                 trace,
                 args.window,
+                args.trace_arrival_limit_s,
                 args.load_scales,
                 args.n_devices,
                 args.tensor_parallel_size,
@@ -7871,6 +7964,7 @@ if __name__ == '__main__':
                 'policies': args.policies,
                 'trace': trace,
                 'window': args.window,
+                'trace_arrival_limit_s': args.trace_arrival_limit_s,
                 'load_scales': args.load_scales,
                 'n_devices': [n_device],
                 'tensor_parallel_size': args.tensor_parallel_size,
