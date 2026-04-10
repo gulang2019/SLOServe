@@ -4520,6 +4520,19 @@ def release_ready_session_turns(
         released_indices.append(request_idx)
     return released_indices
 
+
+def _collect_unissued_request_indices(
+    pending_indices: list[int],
+    trace_request_indices: list[int],
+    arrival_idx: int,
+    session_turn_queues: dict[str, deque[int]],
+) -> list[int]:
+    skipped_indices: set[int] = set(pending_indices)
+    skipped_indices.update(trace_request_indices[arrival_idx:])
+    for queue in session_turn_queues.values():
+        skipped_indices.update(queue)
+    return sorted(skipped_indices)
+
 async def _wait_for_server_ready(
     endpoint: str,
     timeout_s: float = 30.0,
@@ -4776,6 +4789,14 @@ async def main(
     n_timed_out = 0
     rejection_reason_counts: Counter[str] = Counter()
     rejected_request_reasons: dict[str, str] = {}
+    trace_arrival_runtime_limit_s = (
+        None
+        if problem.trace_arrival_limit_s is None
+        else float(problem.trace_arrival_limit_s)
+    )
+    trace_arrival_limit_enforced = False
+    trace_arrival_runtime_skipped_request_indices: set[int] = set()
+    regular_request_target = len(requests)
     frontend_httpx_limits = _build_frontend_httpx_limits(
         max_connections=problem.frontend_httpx_max_connections,
         max_keepalive_connections=problem.frontend_httpx_max_keepalive_connections,
@@ -4792,7 +4813,7 @@ async def main(
                     )
                 )
             while (
-                finished_bar.n < len(requests)
+                finished_bar.n < regular_request_target
                 or (
                     best_effort_enabled
                     and any(task.tier == "best_effort" for task in tasks)
@@ -4805,6 +4826,40 @@ async def main(
                     arrival_bar.update(1)
                     arrival_bar.set_description(f'Arrival Time: {arrival_times[arrival_idx]:.2f}, Elapsed Time: {elapsed_time:.2f}')
                     arrival_idx += 1
+
+                if (
+                    trace_arrival_runtime_limit_s is not None
+                    and not trace_arrival_limit_enforced
+                    and elapsed_time > trace_arrival_runtime_limit_s
+                ):
+                    skipped_now = _collect_unissued_request_indices(
+                        pending_indices,
+                        trace_request_indices,
+                        arrival_idx,
+                        session_turn_queues,
+                    )
+                    if skipped_now:
+                        skipped_now_set = set(skipped_now)
+                        trace_arrival_runtime_skipped_request_indices.update(
+                            skipped_now_set
+                        )
+                        regular_request_target -= len(skipped_now_set)
+                        pending_indices = [
+                            idx for idx in pending_indices
+                            if idx not in skipped_now_set
+                        ]
+                        arrival_idx = len(trace_request_indices)
+                        for queue in session_turn_queues.values():
+                            queue.clear()
+                        finished_bar.total = regular_request_target
+                        finished_bar.refresh()
+                        print(
+                            "trace_arrival_limit reached:",
+                            f"limit_s={trace_arrival_runtime_limit_s:.3f}",
+                            f"skipped_unissued_requests={len(skipped_now_set)}",
+                            f"considered_requests={regular_request_target}",
+                        )
+                    trace_arrival_limit_enforced = True
 
                 if problem.enable_session_replay:
                     release_ready_session_turns(
@@ -5282,7 +5337,7 @@ async def main(
     service_tier_metrics = _summarize_service_tier_metrics(reqs, events)
     asap_request_metrics = _summarize_asap_request_metrics(
         events,
-        total_requests=len(requests),
+        total_requests=regular_request_target,
     )
     results = _apply_service_tier_reporting(results, service_tier_metrics)
     ttft_laxity_percentiles = results.get('ttft_laxity_percentiles', {})
@@ -5313,7 +5368,7 @@ async def main(
         print('Benchmark rejection reasons: none')
     rejection_breakdown = _summarize_rejection_breakdown(
         rejection_reason_counts,
-        total_requests=len(requests),
+        total_requests=regular_request_target,
     )
     results['rps'] = rps
     results['requested_n_device'] = requested_n_devices
@@ -5326,6 +5381,12 @@ async def main(
         arrival_limited_request_count
     )
     results['trace_arrival_limit_total_request_count'] = loaded_trace_request_count
+    results['trace_arrival_runtime_considered_request_count'] = (
+        regular_request_target
+    )
+    results['trace_arrival_runtime_skipped_request_count'] = len(
+        trace_arrival_runtime_skipped_request_indices
+    )
     results['run_status'] = 'completed'
     results['overloaded'] = False
     results['rejection_reason_counts'] = rejection_breakdown['counts']
@@ -7179,6 +7240,14 @@ def run(
                 'trace_arrival_limit_kept_request_count'),
             'trace_arrival_limit_total_request_count': best_result.results.get(
                 'trace_arrival_limit_total_request_count'),
+            'trace_arrival_runtime_considered_request_count': (
+                best_result.results.get(
+                    'trace_arrival_runtime_considered_request_count')
+            ),
+            'trace_arrival_runtime_skipped_request_count': (
+                best_result.results.get(
+                    'trace_arrival_runtime_skipped_request_count')
+            ),
         }
         if 'overload_reason' in best_result.results:
             result['overload_reason'] = best_result.results['overload_reason']
