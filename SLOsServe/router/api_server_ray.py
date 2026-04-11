@@ -170,6 +170,7 @@ def _format_load_statistics_table(
         {"label": "arr_oom", "key": "n_arrival_oom_rejects", "align": "right", "kind": "int", "agg": "sum"},
         {"label": "post_oom", "key": "n_post_admission_oom_rejects", "align": "right", "kind": "int", "agg": "sum"},
         {"label": "power_w", "key": "realtime_power_w", "align": "right", "kind": "float", "agg": "sum"},
+        {"label": "avg_power_w", "key": "avg_power_w", "align": "right", "kind": "float", "agg": "sum"},
         {
             "label": "ctrl_est_ms",
             "key": "control_time_estimated_avg_ms",
@@ -218,7 +219,7 @@ def _format_load_statistics_table(
     ]
     if not isinstance(load_statistics, list) or not load_statistics:
         return (
-            "dev | wait | run | free | eff_free | oom | arr_oom | post_oom | power_w | "
+            "dev | wait | run | free | eff_free | oom | arr_oom | post_oom | power_w | avg_power_w | "
             "ctrl_est_ms | ctrl_elap_ms | ctrl_avg_ms | ctrl_last_ms | ctrl_n | "
             "ctrl_slk_ms\n<empty>"
         )
@@ -329,9 +330,9 @@ def _format_server_rejection_rates(
     return " ".join(parts) if parts else "<empty>"
 
 
-def _merge_load_statistics_with_realtime_power(
+def _merge_load_statistics_with_power_statistics(
     load_statistics: list[dict[str, Any]] | None,
-    realtime_power_w: list[float] | None,
+    power_statistics: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]] | None:
     if not isinstance(load_statistics, list):
         return load_statistics
@@ -339,13 +340,23 @@ def _merge_load_statistics_with_realtime_power(
     merged: list[dict[str, Any]] = []
     for device_id, stats in enumerate(load_statistics):
         merged_stats = dict(stats) if isinstance(stats, dict) else {}
-        power_w = 0.0
-        if isinstance(realtime_power_w, list) and device_id < len(realtime_power_w):
-            try:
-                power_w = float(realtime_power_w[device_id] or 0.0)
-            except (TypeError, ValueError):
-                power_w = 0.0
-        merged_stats["realtime_power_w"] = power_w
+        power_stats = {}
+        if isinstance(power_statistics, list) and device_id < len(power_statistics):
+            candidate = power_statistics[device_id]
+            if isinstance(candidate, dict):
+                power_stats = candidate
+        try:
+            merged_stats["realtime_power_w"] = float(
+                power_stats.get("realtime_power_w", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            merged_stats["realtime_power_w"] = 0.0
+        try:
+            merged_stats["avg_power_w"] = float(
+                power_stats.get("avg_power_w", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            merged_stats["avg_power_w"] = 0.0
         merged.append(merged_stats)
     return merged
 
@@ -421,6 +432,7 @@ class WorkerEnergyProfiler:
         self._meter: EnergyMeter | None = None
         self._recorder: EnergyHistoryRecorder | None = None
         self._started = False
+        self._started_at: float | None = None
 
     def _detect_physical_gpu_ids(self) -> list[int]:
         gpu_ids: list[int] = []
@@ -450,6 +462,7 @@ class WorkerEnergyProfiler:
             _ensure_parent_dir(self.csv_path)
         self._meter = EnergyMeter(devices=self.physical_gpu_ids or None)
         self._meter.start()
+        self._started_at = time.time()
         self._recorder = EnergyHistoryRecorder(
             self._meter,
             interval_s=self.interval_s,
@@ -493,6 +506,7 @@ class WorkerEnergyProfiler:
         csv_path = self.csv_path
         was_started = self._started
         self._started = False
+        self._started_at = None
         self._recorder = None
         self._meter = None
 
@@ -544,6 +558,26 @@ class WorkerEnergyProfiler:
             return float(sample.get("total_watts", 0.0) or 0.0)
         except (TypeError, ValueError):
             return None
+
+    def average_total_watts(self) -> float | None:
+        meter = self._meter
+        started_at = self._started_at
+        if meter is None or started_at is None:
+            return None
+        try:
+            _, total_joules = meter.read()
+        except Exception:
+            return None
+        elapsed_s = max(time.time() - started_at, 1e-6)
+        return float(total_joules) / elapsed_s
+
+    def power_statistics(self) -> dict[str, float]:
+        realtime_power_w = self.latest_total_watts()
+        avg_power_w = self.average_total_watts()
+        return {
+            "realtime_power_w": float(realtime_power_w or 0.0),
+            "avg_power_w": float(avg_power_w or 0.0),
+        }
 
 @dataclass 
 class EngineActor:
@@ -1047,22 +1081,18 @@ class EngineWorker:
         stats = await self.engine.get_load_statistics(n)
         if isinstance(stats, dict) and self._energy_profiler is not None:
             self._energy_profiler.ensure_live()
-            realtime_power_w = self._energy_profiler.latest_total_watts()
-            try:
-                stats = dict(stats)
-                stats["realtime_power_w"] = float(realtime_power_w or 0.0)
-            except (TypeError, ValueError):
-                stats["realtime_power_w"] = 0.0
+            stats = dict(stats)
+            stats.update(self._energy_profiler.power_statistics())
         return stats
 
-    async def get_realtime_power_w(self) -> float:
+    async def get_power_statistics(self) -> dict[str, float]:
         if self._energy_profiler is None:
-            return 0.0
+            return {
+                "realtime_power_w": 0.0,
+                "avg_power_w": 0.0,
+            }
         self._energy_profiler.ensure_live()
-        try:
-            return float(self._energy_profiler.latest_total_watts() or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
+        return self._energy_profiler.power_statistics()
     
     async def abort_request(self, request_id: str):
         await self.engine.abort(request_id)
@@ -4023,25 +4053,41 @@ class RequestPool:
         stats = list(await asyncio.gather(*refs))
         return stats
 
-    async def _get_realtime_power_statistics(self) -> list[float]:
+    async def _get_power_statistics(self) -> list[dict[str, float]]:
         if not engine_actors:
-            return [0.0 for _ in range(self.n_devices)]
+            return [
+                {
+                    "realtime_power_w": 0.0,
+                    "avg_power_w": 0.0,
+                } for _ in range(self.n_devices)
+            ]
 
         refs = [
-            engine_actors[i].engine_actor.get_realtime_power_w.remote()
+            engine_actors[i].engine_actor.get_power_statistics.remote()
             for i in range(self.n_devices)
         ]
         results = await asyncio.gather(*refs, return_exceptions=True)
-        realtime_power_w: list[float] = []
+        power_statistics: list[dict[str, float]] = []
         for result in results:
-            if isinstance(result, Exception):
-                realtime_power_w.append(0.0)
+            if isinstance(result, Exception) or not isinstance(result, dict):
+                power_statistics.append({
+                    "realtime_power_w": 0.0,
+                    "avg_power_w": 0.0,
+                })
                 continue
             try:
-                realtime_power_w.append(float(result or 0.0))
+                realtime_power_w = float(result.get("realtime_power_w", 0.0) or 0.0)
             except (TypeError, ValueError):
-                realtime_power_w.append(0.0)
-        return realtime_power_w
+                realtime_power_w = 0.0
+            try:
+                avg_power_w = float(result.get("avg_power_w", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                avg_power_w = 0.0
+            power_statistics.append({
+                "realtime_power_w": realtime_power_w,
+                "avg_power_w": avg_power_w,
+            })
+        return power_statistics
 
     def _route_best_effort_requests(
         self,
@@ -4072,7 +4118,7 @@ class RequestPool:
         get_load_statistics_task = None 
         load_statistics = await self.get_load_statistics()
         self.load_stat.update(load_statistics)
-        await self._get_realtime_power_statistics()
+        await self._get_power_statistics()
         routing_iter = 0
         last_report_at = time.time() - 10.0
         while True:
@@ -4132,10 +4178,10 @@ class RequestPool:
             if now >= last_report_at + 10.0:
                 last_report_at = now
                 stats_for_logging = self.load_stat.stats
-                realtime_power_w = await self._get_realtime_power_statistics()
-                stats_for_logging = _merge_load_statistics_with_realtime_power(
+                power_statistics = await self._get_power_statistics()
+                stats_for_logging = _merge_load_statistics_with_power_statistics(
                     stats_for_logging,
-                    realtime_power_w,
+                    power_statistics,
                 )
                 logger.info(
                     "Routing loop: routing_elapsed=%s\n%s",
