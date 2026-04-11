@@ -1376,6 +1376,14 @@ class RequestInstance:
     def get_state(self, key: str, default: Any = None) -> Any:
         return self._state.get(key, default)
 
+
+def _get_router_rejection_reason_for_request(
+    request: RequestInstance,
+) -> str:
+    if request.state < RequestState.PREFILL_FINISHED:
+        return "ROUTER_PREFILL"
+    return "ROUTER_DECODE"
+
     
 @dataclass(kw_only=True)
 class LoadEvent:
@@ -4317,6 +4325,14 @@ class RequestPool:
                         continue
 
                     if self.fallback_policy == 'reject':
+                        request.rejection_reason = (
+                            _get_router_rejection_reason_for_request(request)
+                        )
+                        router_rejection_stage = (
+                            "prefill"
+                            if request.rejection_reason == "ROUTER_PREFILL"
+                            else "decode"
+                        )
                         self._profile_events.append({
                             "event_type": "finish",
                             "timestamp": now,
@@ -4336,6 +4352,8 @@ class RequestPool:
                                 "admission_mode": self.admission_mode,
                                 "prefill_id": request.prefill_device_id,
                                 "decode_id": request.decode_device_id,
+                                "rejection_reason": request.rejection_reason,
+                                "rejection_stage": router_rejection_stage,
                                 'routing_iter': routing_iter
                             }
                         })
@@ -4350,11 +4368,12 @@ class RequestPool:
                             'service_tier': request.service_tier,
                         })
 
-                        request.rejection_reason = "ROUTER"
                         logger.debug(
-                            "Request %s rejected by router fallback policy=%s",
+                            "Request %s rejected by router fallback policy=%s stage=%s reason=%s",
                             request.request_id,
                             self.fallback_policy,
+                            router_rejection_stage,
+                            request.rejection_reason,
                         )
                         await request.response_queue.put(
                             _build_rejection_response(request.rejection_reason)

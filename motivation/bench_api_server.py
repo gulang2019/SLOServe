@@ -444,7 +444,7 @@ def _normalize_rejection_reason(reason: Any) -> str | None:
     raw = str(reason).strip()
     if not raw:
         return None
-    normalized = raw.upper()
+    normalized = raw.upper().replace("-", "_")
     if normalized in {"CMP", "COMPUTE", "REJECTED-COMPUTE"}:
         return "compute"
     if normalized in {"MEM", "MEMORY", "REJECTED-MEMORY"}:
@@ -453,11 +453,59 @@ def _normalize_rejection_reason(reason: Any) -> str | None:
         return "oom"
     if normalized in {"POST_ADMISSION_OOM", "REJECT_POST_ADMISSION_OOM"}:
         return "reject-post-admission-oom"
+    if normalized in {
+        "ROUTER_PREFILL",
+        "ROUTER_PREFILL_REJECTION",
+        "PREFILL_ROUTER_REJECTION",
+    }:
+        return "router-prefill"
+    if normalized in {
+        "ROUTER_DECODE",
+        "ROUTER_DECODE_REJECTION",
+        "DECODE_ROUTER_REJECTION",
+    }:
+        return "router-decode"
     if normalized in {"ROUTER", "ROUTER_REJECTION"}:
         return "router"
     if normalized == "UNKNOWN":
         return "unknown"
     return raw.lower()
+
+
+def _format_finished_bar_description(
+    finished_count: int,
+    *,
+    n_rejected: int,
+    n_timed_out: int,
+    rejection_reason_counts: Counter[str],
+) -> str:
+    router_prefill_rejections = int(
+        rejection_reason_counts.get("router-prefill", 0)
+    )
+    router_decode_rejections = int(
+        rejection_reason_counts.get("router-decode", 0)
+    )
+    other_rejections = max(
+        0,
+        int(n_rejected) - router_prefill_rejections - router_decode_rejections,
+    )
+    parts = [
+        f"Finished: {finished_count}",
+        f"Rejected: {n_rejected}",
+    ]
+    if (
+        router_prefill_rejections > 0
+        or router_decode_rejections > 0
+        or other_rejections > 0
+    ):
+        parts.append(
+            "Router P/D: "
+            f"{router_prefill_rejections}/{router_decode_rejections}"
+        )
+        if other_rejections > 0:
+            parts.append(f"Other Rej: {other_rejections}")
+    parts.append(f"Timed Out: {n_timed_out}")
+    return ", ".join(parts)
 
 
 def _extract_batch_perf_sample(
@@ -4759,7 +4807,12 @@ async def main(
     )
     finished_bar = tqdm.tqdm(
         total=len(requests),
-        desc='Finished Requests',
+        desc=_format_finished_bar_description(
+            0,
+            n_rejected=0,
+            n_timed_out=0,
+            rejection_reason_counts=Counter(),
+        ),
         disable=False,
     )
     
@@ -5022,7 +5075,6 @@ async def main(
                         timed_out_before = request_id in timed_out_requests
                         if not is_best_effort_task:
                             finished_bar.update(1)
-                            finished_bar.set_description(f'Finished: {finished_bar.n}, Rejected: {n_rejected}, Timed Out: {n_timed_out}')
 
                         # ---- explicit status checks ----
                         if task.cancelled():
@@ -5030,6 +5082,16 @@ async def main(
                             if not is_best_effort_task:
                                 execution_results.append(
                                     ExecutionResult(request, [task_start_time], request_id)
+                                )
+                                finished_bar.set_description(
+                                    _format_finished_bar_description(
+                                        finished_bar.n,
+                                        n_rejected=n_rejected,
+                                        n_timed_out=n_timed_out,
+                                        rejection_reason_counts=(
+                                            rejection_reason_counts
+                                        ),
+                                    )
                                 )
                             if (
                                 (not is_best_effort_task)
@@ -5088,6 +5150,17 @@ async def main(
                                 and request.session_id
                             ):
                                 session_ready_at[request.session_id] = completion_elapsed_time + problem.session_pause_s
+                            if not is_best_effort_task:
+                                finished_bar.set_description(
+                                    _format_finished_bar_description(
+                                        finished_bar.n,
+                                        n_rejected=n_rejected,
+                                        n_timed_out=n_timed_out,
+                                        rejection_reason_counts=(
+                                            rejection_reason_counts
+                                        ),
+                                    )
+                                )
                         finally:
                             timed_out_requests.discard(request_id)
 
@@ -5101,9 +5174,18 @@ async def main(
                             )
                             if not is_best_effort_task:
                                 finished_bar.update(1)
-                                finished_bar.set_description(f'Finished: {finished_bar.n}, Rejected: {n_rejected}, Timed Out: {n_timed_out}')
                                 execution_results.append(
                                     ExecutionResult(request, [task_start_time], request_id)
+                                )
+                                finished_bar.set_description(
+                                    _format_finished_bar_description(
+                                        finished_bar.n,
+                                        n_rejected=n_rejected,
+                                        n_timed_out=n_timed_out,
+                                        rejection_reason_counts=(
+                                            rejection_reason_counts
+                                        ),
+                                    )
                                 )
                             if (
                                 (not is_best_effort_task)
@@ -5118,6 +5200,16 @@ async def main(
                     elif current_time - task_start_time > timeout:
                         if not is_best_effort_task:
                             n_timed_out += 1
+                            finished_bar.set_description(
+                                _format_finished_bar_description(
+                                    finished_bar.n,
+                                    n_rejected=n_rejected,
+                                    n_timed_out=n_timed_out,
+                                    rejection_reason_counts=(
+                                        rejection_reason_counts
+                                    ),
+                                )
+                            )
                         task.cancel()
                         timed_out_requests.add(request_id)
                         if (
