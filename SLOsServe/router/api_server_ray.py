@@ -143,6 +143,20 @@ def _get_engine_entry_online_slack(engine_state_entry: Any,
     return _get_perf_model_online_slack(perf_model)
 
 
+def _coerce_non_negative_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_non_negative_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def _format_load_statistics_table(
     load_statistics: list[dict[str, Any]] | None,
 ) -> str:
@@ -291,6 +305,28 @@ def _format_load_statistics_table(
     rendered_rows = [_format_row(rows[0]), separator]
     rendered_rows.extend(_format_row(row) for row in rows[1:])
     return "\n".join(rendered_rows)
+
+
+def _format_server_rejection_rates(
+    rejection_rates: dict[int, dict[str, Any]] | None,
+) -> str:
+    if not isinstance(rejection_rates, dict) or not rejection_rates:
+        return "<empty>"
+
+    parts: list[str] = []
+    for device_id in sorted(rejection_rates):
+        stats = rejection_rates.get(device_id, {})
+        if not isinstance(stats, dict):
+            continue
+        n_rejects = _coerce_non_negative_int(stats.get("n_rejects", 0))
+        n_considered = _coerce_non_negative_int(stats.get("n_considered", 0))
+        rejection_rate = _coerce_non_negative_float(
+            stats.get("rejection_rate", 0.0),
+        )
+        parts.append(
+            f"{device_id}:{n_rejects}/{n_considered}={rejection_rate:.3f}"
+        )
+    return " ".join(parts) if parts else "<empty>"
 
 
 def _merge_load_statistics_with_realtime_power(
@@ -1403,7 +1439,8 @@ class LoadStat:
 
         return {device_id: {
             'rejection_rate': per_device_stats[device_id]['n_rejects'] / (per_device_stats[device_id]['n_arrivals'] + 1e-6),
-            'n_considered': per_device_stats[device_id]['n_arrivals']
+            'n_considered': per_device_stats[device_id]['n_arrivals'],
+            'n_rejects': per_device_stats[device_id]['n_rejects'],
         } for device_id in range(self.n_devices)}
     
     def get_batch_utilization(self, window = 5) -> float:
@@ -1569,6 +1606,20 @@ class Router(ABC):
     
     def set_profile_events(self, profile_events: dict):
         self._profile_events = profile_events
+
+    def get_required_history_window_s(self) -> float:
+        return 0.0
+
+    def observe_server_rejection_rates(
+        self,
+        rejection_rates: dict[int, dict[str, Any]],
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        return None
+
+    def get_router_feedback_report(self) -> str | None:
+        return None
 
     def run(self, waiting_requests: List[RequestInstance],
             running_requests: List[RequestInstance]):
@@ -2137,6 +2188,76 @@ class SLOsServeRouter(Router):
         self.model_name = router_kwargs['model_name']
         self.perf_model_task = str(router_kwargs.get('perf_model_task', 'default'))
         self.perf_model_err = float(router_kwargs.get('perf_model_err', 1.0))
+        self.router_safety_margin_s = _coerce_non_negative_float(
+            router_kwargs.get("router_safety_margin", 0.0),
+        )
+        self.router_safety_margin_autotune = bool(
+            router_kwargs.get(
+                "router_safety_margin_autotune",
+                router_kwargs.get("auto_tune_router_safety_margin", False),
+            )
+        )
+        self.router_safety_margin_min_s = _coerce_non_negative_float(
+            router_kwargs.get("router_safety_margin_min", 0.0),
+        )
+        self.router_safety_margin_max_s = max(
+            self.router_safety_margin_min_s,
+            _coerce_non_negative_float(
+                router_kwargs.get(
+                    "router_safety_margin_max",
+                    max(self.router_safety_margin_s, 0.02),
+                ),
+            ),
+        )
+        self.router_safety_margin_s = min(
+            max(self.router_safety_margin_s, self.router_safety_margin_min_s),
+            self.router_safety_margin_max_s,
+        )
+        self.router_safety_margin_step_up_s = _coerce_non_negative_float(
+            router_kwargs.get("router_safety_margin_step_up", 0.001),
+        )
+        self.router_safety_margin_step_down_s = _coerce_non_negative_float(
+            router_kwargs.get("router_safety_margin_step_down", 0.0005),
+        )
+        self.router_safety_margin_window_s = max(
+            1.0,
+            _coerce_non_negative_float(
+                router_kwargs.get("router_safety_margin_window_s", 30.0),
+                default=30.0,
+            ),
+        )
+        self.router_safety_margin_update_interval_s = max(
+            0.1,
+            _coerce_non_negative_float(
+                router_kwargs.get("router_safety_margin_update_interval_s", 5.0),
+                default=5.0,
+            ),
+        )
+        self.router_safety_margin_target_rejection_rate = _coerce_non_negative_float(
+            router_kwargs.get("router_safety_margin_target_rejection_rate", 0.02),
+            default=0.02,
+        )
+        default_decrease_threshold = (
+            0.5 * self.router_safety_margin_target_rejection_rate
+        )
+        self.router_safety_margin_decrease_threshold = _coerce_non_negative_float(
+            router_kwargs.get(
+                "router_safety_margin_decrease_threshold",
+                default_decrease_threshold,
+            ),
+            default=default_decrease_threshold,
+        )
+        self.router_safety_margin_min_samples = max(
+            1,
+            _coerce_non_negative_int(
+                router_kwargs.get("router_safety_margin_min_samples", 10),
+                default=10,
+            ),
+        )
+        self._latest_server_rejection_rates: dict[int, dict[str, Any]] = {}
+        self._latest_server_rejection_rates_ts: float = 0.0
+        self._last_router_safety_margin_update_ts: float = 0.0
+        self._last_router_safety_margin_decision: dict[str, Any] | None = None
         perf_model = PerfModel.get_perf_model(
             self.model_name,
             self.perf_model_task,
@@ -2203,10 +2324,13 @@ class SLOsServeRouter(Router):
         logger.info(
             (
                 "Frontend router perf model initialized: tpot=%s "
-                "scheduling_overhead_s=%s perf_model=%s cpp_planner=%s"
+                "scheduling_overhead_s=%s router_safety_margin_s=%s "
+                "router_safety_margin_autotune=%s perf_model=%s cpp_planner=%s"
             ),
             self.tpot,
             float(router_kwargs.get("scheduling_overhead", 0.0) or 0.0),
+            self.router_safety_margin_s,
+            self.router_safety_margin_autotune,
             perf_model_summary,
             (
                 self.perf_model.get_cpp_planner_config()
@@ -2241,7 +2365,9 @@ class SLOsServeRouter(Router):
             f'use_planner: {self.use_planner}, ablation: {self.ablation}, oracle_mem: {self.oracle_mem}, '
             f'max_decode_length: {self.max_decode_length}, admission_max_decode_length: {self.admission_max_decode_length}, '
             f'perf_model_err: {self.perf_model_err}, hardware_params: {self.hardware_params}, '
-            f'scheduling_overhead: {router_kwargs["scheduling_overhead"]}'
+            f'scheduling_overhead: {router_kwargs["scheduling_overhead"]}, '
+            f'router_safety_margin_s: {self.router_safety_margin_s}, '
+            f'router_safety_margin_autotune: {self.router_safety_margin_autotune}'
         )
 
     def wants_prefetched_engine_states(self) -> bool:
@@ -2252,6 +2378,148 @@ class SLOsServeRouter(Router):
         raw_engine_states: dict[int, dict[str, Any]] | None,
     ) -> None:
         self._prefetched_raw_engine_states = raw_engine_states
+
+    def get_required_history_window_s(self) -> float:
+        return self.router_safety_margin_window_s
+
+    def _normalized_server_rejection_rates(
+        self,
+        rejection_rates: dict[int, dict[str, Any]] | None,
+    ) -> dict[int, dict[str, Any]]:
+        normalized: dict[int, dict[str, Any]] = {}
+        source = rejection_rates if isinstance(rejection_rates, dict) else {}
+        for device_id in range(self.n_devices):
+            raw_stats = source.get(device_id, {})
+            if not isinstance(raw_stats, dict):
+                raw_stats = {}
+            n_considered = _coerce_non_negative_int(
+                raw_stats.get("n_considered", 0),
+            )
+            n_rejects = min(
+                n_considered,
+                _coerce_non_negative_int(raw_stats.get("n_rejects", 0)),
+            )
+            if n_considered > 0:
+                rejection_rate = _coerce_non_negative_float(
+                    raw_stats.get(
+                        "rejection_rate",
+                        n_rejects / max(n_considered, 1),
+                    ),
+                )
+            else:
+                rejection_rate = 0.0
+            normalized[device_id] = {
+                "rejection_rate": rejection_rate,
+                "n_considered": n_considered,
+                "n_rejects": n_rejects,
+            }
+        return normalized
+
+    def _effective_router_safety_margin(self, base_slack_s: float) -> float:
+        return max(float(base_slack_s), 0.0) + max(
+            float(self.router_safety_margin_s),
+            0.0,
+        )
+
+    def observe_server_rejection_rates(
+        self,
+        rejection_rates: dict[int, dict[str, Any]],
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        now_s = time.time() if now is None else float(now)
+        normalized = self._normalized_server_rejection_rates(rejection_rates)
+        self._latest_server_rejection_rates = normalized
+        self._latest_server_rejection_rates_ts = now_s
+
+        if not self.router_safety_margin_autotune:
+            return None
+        if (
+            now_s - self._last_router_safety_margin_update_ts
+            < self.router_safety_margin_update_interval_s
+        ):
+            return None
+
+        eligible = {
+            device_id: stats
+            for device_id, stats in normalized.items()
+            if int(stats["n_considered"]) >= self.router_safety_margin_min_samples
+        }
+        if not eligible:
+            return None
+
+        max_rate = max(
+            float(stats["rejection_rate"]) for stats in eligible.values()
+        )
+        avg_rate = (
+            sum(float(stats["rejection_rate"]) for stats in eligible.values())
+            / max(len(eligible), 1)
+        )
+        old_margin_s = float(self.router_safety_margin_s)
+        new_margin_s = old_margin_s
+        decision = "hold"
+        reason = "within_threshold"
+        if (
+            max_rate > self.router_safety_margin_target_rejection_rate
+            and old_margin_s < self.router_safety_margin_max_s
+        ):
+            new_margin_s = min(
+                self.router_safety_margin_max_s,
+                old_margin_s + self.router_safety_margin_step_up_s,
+            )
+            decision = "up"
+            reason = "max_rate_above_target"
+        elif (
+            max_rate < self.router_safety_margin_decrease_threshold
+            and old_margin_s > self.router_safety_margin_min_s
+        ):
+            new_margin_s = max(
+                self.router_safety_margin_min_s,
+                old_margin_s - self.router_safety_margin_step_down_s,
+            )
+            decision = "down"
+            reason = "max_rate_below_decrease_threshold"
+
+        self.router_safety_margin_s = new_margin_s
+        self._last_router_safety_margin_update_ts = now_s
+        self._last_router_safety_margin_decision = {
+            "timestamp": now_s,
+            "decision": decision,
+            "reason": reason,
+            "old_margin_s": old_margin_s,
+            "new_margin_s": new_margin_s,
+            "max_rate": max_rate,
+            "avg_rate": avg_rate,
+            "eligible_servers": len(eligible),
+            "window_s": self.router_safety_margin_window_s,
+        }
+        return dict(self._last_router_safety_margin_decision)
+
+    def get_router_feedback_report(self) -> str | None:
+        if not self._latest_server_rejection_rates:
+            return None
+        decision = self._last_router_safety_margin_decision or {}
+        decision_name = str(decision.get("decision", "hold"))
+        reason = str(decision.get("reason", "n/a"))
+        max_rate = _coerce_non_negative_float(decision.get("max_rate", 0.0))
+        avg_rate = _coerce_non_negative_float(decision.get("avg_rate", 0.0))
+        eligible_servers = _coerce_non_negative_int(
+            decision.get("eligible_servers", 0),
+        )
+        return (
+            "Router safety margin: "
+            f"current_s={self.router_safety_margin_s:.4f} "
+            f"autotune={self.router_safety_margin_autotune} "
+            f"target_rr={self.router_safety_margin_target_rejection_rate:.3f} "
+            f"decrease_rr={self.router_safety_margin_decrease_threshold:.3f} "
+            f"window_s={self.router_safety_margin_window_s:.1f} "
+            f"eligible_servers={eligible_servers} "
+            f"decision={decision_name} "
+            f"reason={reason} "
+            f"max_rr={max_rate:.3f} "
+            f"avg_rr={avg_rate:.3f} "
+            f"per_server=[{_format_server_rejection_rates(self._latest_server_rejection_rates)}]"
+        )
 
     def _get_decode_length_ub(self, request: RequestInstance) -> int:
         if not self.oracle_mem:
@@ -2410,9 +2678,11 @@ class SLOsServeRouter(Router):
             c_reqs,
             engine_state.num_free_blocks,
             0.0,
-            _get_engine_state_online_slack(
-                engine_state,
-                getattr(self, "perf_model", None),
+            self._effective_router_safety_margin(
+                _get_engine_state_online_slack(
+                    engine_state,
+                    getattr(self, "perf_model", None),
+                ),
             ),
         )
         accepted_ids = set(c_req.id for c_req, is_accepted in zip(c_reqs, is_accepteds) if is_accepted)
@@ -2832,9 +3102,11 @@ class SLOsServeRouter(Router):
             c_reqs,
             num_free_blocks,
             now,
-            _get_engine_entry_online_slack(
-                exec_plan,
-                getattr(self, "perf_model", None),
+            self._effective_router_safety_margin(
+                _get_engine_entry_online_slack(
+                    exec_plan,
+                    getattr(self, "perf_model", None),
+                ),
             ),
         )
         accpeted_ids = [req.id for req, accepted in zip(c_reqs, is_accepteds) if accepted]
@@ -3295,12 +3567,61 @@ class RequestPool:
         self.kv_xfer_delay = 0.05
         self.maximum_ingress = 20 
         self.sem = MaxCapSemaphore(self.maximum_ingress)
-        
+        self._refresh_load_stat_window()
+
     
     @property
     def on(self):
         return (len(self.waiting_pool) + len(self.running_pool)) > 0
-    
+
+    def _required_load_stat_window_s(self) -> float:
+        router_window_s = 0.0
+        get_required_window = getattr(
+            self.router,
+            "get_required_history_window_s",
+            None,
+        )
+        if callable(get_required_window):
+            try:
+                router_window_s = _coerce_non_negative_float(
+                    get_required_window(),
+                )
+            except Exception:
+                router_window_s = 0.0
+        return max(float(self.stat_window), router_window_s)
+
+    def _refresh_load_stat_window(self) -> None:
+        if self.load_stat is None:
+            return
+        self.load_stat.max_window = self._required_load_stat_window_s()
+
+    def _observe_router_rejection_feedback(
+        self,
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        if self.load_stat is None:
+            return None
+        if (
+            type(self.router).observe_server_rejection_rates
+            is Router.observe_server_rejection_rates
+        ):
+            return None
+        required_window_s = self._required_load_stat_window_s()
+        if required_window_s <= 0.0:
+            return None
+        observe = getattr(self.router, "observe_server_rejection_rates", None)
+        if not callable(observe):
+            return None
+        rejection_rates = self.load_stat.get_rejection_rate(
+            window=required_window_s,
+            include_best_effort=False,
+        )
+        try:
+            return observe(rejection_rates, now=now)
+        except TypeError:
+            return observe(rejection_rates)
+
     async def empty(self):
         while len(self.waiting_pool) > 0 or len(self.running_pool) > 0:
             await asyncio.sleep(0.1)
@@ -3316,6 +3637,7 @@ class RequestPool:
                                     request_json['routing_kwargs'])
         self.router.set_load_stat(self.load_stat)
         self.router.set_profile_events(self._profile_events)
+        self._refresh_load_stat_window()
         # self.admission_mode = request_json.get('admission_mode', 'arrival')
         self.routing_overhead = request_json.get('routing_overhead', -1.0)
         self.fallback_policy = request_json.get('routing_fallback_policy', 'asap')
@@ -3349,6 +3671,7 @@ class RequestPool:
         if self.mock_connector:
             self.network.reset(self.n_devices)
         self.load_stat.reset(self.n_devices)
+        self._refresh_load_stat_window()
         self.admission_history: list[dict[str, Any]] = []
         self.routing_overhead = -1.0
         if execplan_bus_actor is not None:
@@ -3795,6 +4118,17 @@ class RequestPool:
                     self._route_best_effort_requests(best_effort_waiting_requests)
             routing_elapsed = time.time() - it_start_time
             now = time.time()
+            margin_adjustment = self._observe_router_rejection_feedback(now=now)
+            if (
+                isinstance(margin_adjustment, dict)
+                and str(margin_adjustment.get("decision")) in {"up", "down"}
+            ):
+                router_feedback_report = self.router.get_router_feedback_report()
+                if router_feedback_report:
+                    logger.info(
+                        "Router safety margin adjusted: %s",
+                        router_feedback_report,
+                    )
             if now >= last_report_at + 10.0:
                 last_report_at = now
                 stats_for_logging = self.load_stat.stats
@@ -3808,6 +4142,9 @@ class RequestPool:
                     routing_elapsed,
                     _format_load_statistics_table(stats_for_logging),
                 )
+                router_feedback_report = self.router.get_router_feedback_report()
+                if router_feedback_report:
+                    logger.info("%s", router_feedback_report)
 
             if len(self.waiting_pool) > 0:
                 self._profile_events.append({

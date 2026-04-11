@@ -33,6 +33,7 @@ SCALAR_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "slo_routing_overhead": (),
     "scheduling_overhead": (),
     "scheduling_safety_margin": (),
+    "router_safety_margin": (),
     "routing_overhead": (),
     "routing_fallback_policy": (),
     "tensor_parallel_size": (),
@@ -273,6 +274,10 @@ def _build_trace_server_router_kwargs(
     if "scheduling_safety_margin" in trace_spec:
         merged["scheduling_safety_margin"] = float(
             trace_spec["scheduling_safety_margin"]
+        )
+    if "router_safety_margin" in trace_spec:
+        merged["router_safety_margin"] = float(
+            trace_spec["router_safety_margin"]
         )
 
     slo_tpots = trace_spec.get("slo_tpots", [])
