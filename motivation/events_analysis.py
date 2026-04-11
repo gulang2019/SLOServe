@@ -1134,6 +1134,10 @@ def build_energy_comparison_metadata(
             "power": {
                 "time_s": np.asarray(power_summary["time"], dtype=np.float64).tolist(),
                 "values_w": np.asarray(power_summary["total_power"], dtype=np.float64).tolist(),
+                "per_device_values_w": {
+                    str(device_id): np.asarray(device_power, dtype=np.float64).tolist()
+                    for device_id, device_power in sorted(power_summary["per_device_power"].items())
+                },
                 "window_s": float(power_window_s),
                 "source": str(power_summary.get("source", "unknown")),
             },
