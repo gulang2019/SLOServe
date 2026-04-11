@@ -44,6 +44,7 @@ logger.setLevel(logging.DEBUG)
 
 FRONTEND_DELAY=0.03
 FRONTEND_HEALTH_CHECK_INTERVAL_S = 5.0
+FRONTEND_HEALTH_CHECK_TIMEOUT_S = 15.0
 REQUEST_TIMEOUT_S = 600.0
 REQUEST_CANCEL_GRACE_S = 5.0
 BENCHMARK_METRIC_WINDOW_S = 1.0
@@ -4588,7 +4589,7 @@ async def _wait_for_server_ready(
 ) -> None:
     deadline = time.time() + timeout_s
     last_error: Exception | None = None
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=FRONTEND_HEALTH_CHECK_TIMEOUT_S) as client:
         while time.time() < deadline:
             try:
                 response = await client.get(f"{endpoint}/health_check")
@@ -4608,7 +4609,7 @@ async def _wait_for_server_ready(
 
 async def _get_server_health(
     endpoint: str,
-    timeout_s: float = 5.0,
+    timeout_s: float = FRONTEND_HEALTH_CHECK_TIMEOUT_S,
 ) -> tuple[bool, str]:
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
