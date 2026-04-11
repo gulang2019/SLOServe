@@ -361,6 +361,28 @@ def _merge_load_statistics_with_power_statistics(
     return merged
 
 
+def _summarize_load_statistics_counts(
+    load_statistics: list[dict[str, Any]] | None,
+) -> dict[str, int]:
+    summary = {
+        "engine_wait": 0,
+        "engine_run": 0,
+    }
+    if not isinstance(load_statistics, list):
+        return summary
+
+    for stats in load_statistics:
+        if not isinstance(stats, dict):
+            continue
+        summary["engine_wait"] += _coerce_non_negative_int(
+            stats.get("n_waitings", 0)
+        )
+        summary["engine_run"] += _coerce_non_negative_int(
+            stats.get("n_running", 0)
+        )
+    return summary
+
+
 def _sorted_metric_columns(fieldnames: list[str], prefix: str) -> list[str]:
     return sorted(
         [name for name in fieldnames if name.startswith(prefix)],
@@ -4183,9 +4205,22 @@ class RequestPool:
                     stats_for_logging,
                     power_statistics,
                 )
+                engine_counts = _summarize_load_statistics_counts(
+                    stats_for_logging,
+                )
+                router_wait = len(self.waiting_pool)
+                router_run = len(self.running_pool)
                 logger.info(
-                    "Routing loop: routing_elapsed=%s\n%s",
+                    "Routing loop: routing_elapsed=%s "
+                    "router(wait=%s, run=%s, total=%s) "
+                    "engine(wait=%s, run=%s, total=%s)\n%s",
                     routing_elapsed,
+                    router_wait,
+                    router_run,
+                    router_wait + router_run,
+                    engine_counts["engine_wait"],
+                    engine_counts["engine_run"],
+                    engine_counts["engine_wait"] + engine_counts["engine_run"],
                     _format_load_statistics_table(stats_for_logging),
                 )
                 router_feedback_report = self.router.get_router_feedback_report()
