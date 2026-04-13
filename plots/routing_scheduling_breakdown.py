@@ -6,7 +6,9 @@ import csv
 import json
 import math
 import sys
+import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -70,6 +72,31 @@ def _progress_bar(
         unit_scale=unit_scale,
         dynamic_ncols=True,
         leave=False,
+    )
+
+
+def _log_phase(message: str, *, run_start_s: float) -> None:
+    elapsed_s = time.monotonic() - run_start_s
+    print(f"[phase +{elapsed_s:8.2f}s] {message}", file=sys.stderr, flush=True)
+
+
+@contextmanager
+def _phase(name: str, *, run_start_s: float) -> Any:
+    phase_start_s = time.monotonic()
+    _log_phase(f"START {name}", run_start_s=run_start_s)
+    try:
+        yield
+    except Exception:
+        phase_elapsed_s = time.monotonic() - phase_start_s
+        _log_phase(
+            f"FAIL  {name} after {phase_elapsed_s:.2f}s",
+            run_start_s=run_start_s,
+        )
+        raise
+    phase_elapsed_s = time.monotonic() - phase_start_s
+    _log_phase(
+        f"END   {name} ({phase_elapsed_s:.2f}s)",
+        run_start_s=run_start_s,
     )
 
 
@@ -1380,11 +1407,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    run_start_s = time.monotonic()
     args = parse_args()
     events_file = args.events_file
     allowed_event_types = {"arrival", "batch"} if args.batch_only else None
-    events = load_events(events_file, allowed_event_types=allowed_event_types)
-    batch_stats = _collect_batch_stats(events)
+    with _phase("load_events", run_start_s=run_start_s):
+        events = load_events(events_file, allowed_event_types=allowed_event_types)
+    _log_phase(
+        f"Loaded {len(events)} events from {events_file}",
+        run_start_s=run_start_s,
+    )
+
+    with _phase("collect_batch_stats", run_start_s=run_start_s):
+        batch_stats = _collect_batch_stats(events)
     if args.batch_only:
         attempts_by_request: dict[str, list[Attempt]] = {}
         summary: dict[str, Any] = {
@@ -1393,27 +1428,39 @@ def main() -> None:
                 "events_loaded": len(events),
             },
         }
+        _log_phase(
+            "Skipping request reconstruction (--batch-only)",
+            run_start_s=run_start_s,
+        )
     else:
-        attempts_by_request = build_attempts(events)
-        summary = summarize_attempts(attempts_by_request)
+        with _phase("build_attempts", run_start_s=run_start_s):
+            attempts_by_request = build_attempts(events)
+        _log_phase(
+            f"Reconstructed {sum(len(v) for v in attempts_by_request.values())} "
+            f"attempts across {len(attempts_by_request)} requests",
+            run_start_s=run_start_s,
+        )
+        with _phase("summarize_attempts", run_start_s=run_start_s):
+            summary = summarize_attempts(attempts_by_request)
 
     output_prefix = args.output_prefix
     if output_prefix is None:
         output_prefix = Path("plots/out") / f"{events_file.stem}.routing_scheduling"
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.batch_only:
-        request_rows: list[dict[str, Any]] = []
-        breakdown_rows = _build_batch_size_rows(batch_stats)
-        tries_distribution_rows: list[dict[str, Any]] = []
-    else:
-        request_rows = summary["request_summaries"]
-        breakdown_rows = _build_combined_breakdown_rows(
-            summary,
-            batch_stats,
-            attempts_by_request,
-        )
-        tries_distribution_rows = _build_tries_distribution_rows(request_rows)
+    with _phase("build_output_rows", run_start_s=run_start_s):
+        if args.batch_only:
+            request_rows: list[dict[str, Any]] = []
+            breakdown_rows = _build_batch_size_rows(batch_stats)
+            tries_distribution_rows: list[dict[str, Any]] = []
+        else:
+            request_rows = summary["request_summaries"]
+            breakdown_rows = _build_combined_breakdown_rows(
+                summary,
+                batch_stats,
+                attempts_by_request,
+            )
+            tries_distribution_rows = _build_tries_distribution_rows(request_rows)
 
     breakdown_csv = output_prefix.with_suffix(".breakdown.csv")
     tries_distribution_csv = output_prefix.with_suffix(".tries_distribution.csv")
@@ -1431,30 +1478,34 @@ def main() -> None:
         if legacy_path.exists():
             legacy_path.unlink()
 
-    _write_csv(breakdown_csv, breakdown_rows)
-    _write_csv(tries_distribution_csv, tries_distribution_rows)
-    with summary_json.open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                **summary,
-                "batch_metrics": batch_stats,
-                "breakdown_rows": breakdown_rows,
-                "request_rows": request_rows,
-                "tries_distribution_rows": tries_distribution_rows,
-            },
-            f,
-            indent=2,
-            sort_keys=True,
-        )
+    with _phase("write_breakdown_csv", run_start_s=run_start_s):
+        _write_csv(breakdown_csv, breakdown_rows)
+    with _phase("write_tries_distribution_csv", run_start_s=run_start_s):
+        _write_csv(tries_distribution_csv, tries_distribution_rows)
+    with _phase("write_summary_json", run_start_s=run_start_s):
+        with summary_json.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    **summary,
+                    "batch_metrics": batch_stats,
+                    "breakdown_rows": breakdown_rows,
+                    "request_rows": request_rows,
+                    "tries_distribution_rows": tries_distribution_rows,
+                },
+                f,
+                indent=2,
+                sort_keys=True,
+            )
     if zip_path is not None:
-        _write_zip(
-            zip_path,
-            [
-                breakdown_csv,
-                tries_distribution_csv,
-                summary_json,
-            ],
-        )
+        with _phase("write_results_zip", run_start_s=run_start_s):
+            _write_zip(
+                zip_path,
+                [
+                    breakdown_csv,
+                    tries_distribution_csv,
+                    summary_json,
+                ],
+            )
 
     print(f"Loaded {len(events)} events from {events_file}")
     if args.batch_only:
