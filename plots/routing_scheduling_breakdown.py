@@ -146,15 +146,15 @@ def _stats(values: list[float]) -> dict[str, float | int | None]:
             "p99": None,
             "max": None,
         }
+    mean = sum(values) / len(values)
     return {
         "count": len(values),
-        "mean": sum(values) / len(values),
+        "mean": mean,
         "std": (
             0.0
             if len(values) == 1
             else math.sqrt(
-                sum((value - (sum(values) / len(values))) ** 2 for value in values)
-                / len(values)
+                sum((value - mean) ** 2 for value in values) / len(values)
             )
         ),
         "min": min(values),
@@ -1028,6 +1028,7 @@ def _stats_row(
 
 
 def _collect_batch_stats(events: list[dict[str, Any]]) -> dict[str, Any]:
+    run_start_s = time.monotonic()
     scheduling_overheads: list[float] = []
     execution_times: list[float] = []
     batch_sizes_by_type: dict[str, list[float]] = {
@@ -1035,39 +1036,42 @@ def _collect_batch_stats(events: list[dict[str, Any]]) -> dict[str, Any]:
         "decode_only": [],
         "mixed": [],
     }
-    prefill_tokens_by_request = _build_request_prefill_tokens(events)
-    for event in _iter_progress(
-        events,
-        desc="Collecting batch stats",
-        total=len(events),
-        unit="event",
-    ):
-        if str(event.get("event_type", "")) != "batch":
-            continue
-        elapsed = _coerce_float(event.get("elapsed"))
-        scheduling_overhead = _coerce_float(event.get("scheduling_overhead"))
-        if elapsed is None or scheduling_overhead is None:
-            continue
-        scheduling_overheads.append(scheduling_overhead)
-        execution_times.append(max(0.0, elapsed - scheduling_overhead))
-        batch_type = _classify_batch_type(event, prefill_tokens_by_request)
-        if batch_type in batch_sizes_by_type:
-            batch_sizes_by_type[batch_type].append(
-                float(len(event.get("req_ids") or []))
-            )
-    return {
-        "batch_scheduling_overhead_s": _stats(scheduling_overheads),
-        "batch_execution_time_s": _stats(execution_times),
-        "batch_size_distribution_metrics": {
-            "prefill_only_batch_size_reqs": _stats(
-                batch_sizes_by_type["prefill_only"]
-            ),
-            "decode_only_batch_size_reqs": _stats(
-                batch_sizes_by_type["decode_only"]
-            ),
-            "mixed_batch_size_reqs": _stats(batch_sizes_by_type["mixed"]),
-        },
-    }
+    with _phase("collect_batch_stats.build_request_prefill_tokens", run_start_s=run_start_s):
+        prefill_tokens_by_request = _build_request_prefill_tokens(events)
+    with _phase("collect_batch_stats.scan_batch_events", run_start_s=run_start_s):
+        for event in _iter_progress(
+            events,
+            desc="Collecting batch stats",
+            total=len(events),
+            unit="event",
+        ):
+            if str(event.get("event_type", "")) != "batch":
+                continue
+            elapsed = _coerce_float(event.get("elapsed"))
+            scheduling_overhead = _coerce_float(event.get("scheduling_overhead"))
+            if elapsed is None or scheduling_overhead is None:
+                continue
+            scheduling_overheads.append(scheduling_overhead)
+            execution_times.append(max(0.0, elapsed - scheduling_overhead))
+            batch_type = _classify_batch_type(event, prefill_tokens_by_request)
+            if batch_type in batch_sizes_by_type:
+                batch_sizes_by_type[batch_type].append(
+                    float(len(event.get("req_ids") or []))
+                )
+    with _phase("collect_batch_stats.reduce_stats", run_start_s=run_start_s):
+        return {
+            "batch_scheduling_overhead_s": _stats(scheduling_overheads),
+            "batch_execution_time_s": _stats(execution_times),
+            "batch_size_distribution_metrics": {
+                "prefill_only_batch_size_reqs": _stats(
+                    batch_sizes_by_type["prefill_only"]
+                ),
+                "decode_only_batch_size_reqs": _stats(
+                    batch_sizes_by_type["decode_only"]
+                ),
+                "mixed_batch_size_reqs": _stats(batch_sizes_by_type["mixed"]),
+            },
+        }
 
 
 def _build_segment_stats_rows(
