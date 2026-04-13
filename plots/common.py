@@ -10,10 +10,13 @@ LABEL_MAP = {
     'atfc / slosserve_planner_ablation-no_global': 'SLO Packer (no global)',
     'atfc / slosserve_planner': 'SLO Packer',
     'atfc / slosserve_planner_oracle_mem': 'SLO Packer (Oracle)',
-    'qlm / round_robin': 'QLM',
-    'vllm / round_robin': 'vLLM+',
+    'qlm / round_robin': 'vLLM+',
+    'vllm / round_robin': 'vLLM',
+    'sarathi+ / round_robin': 'Sarathi+',
     'sarathi / round_robin': 'Sarathi',
     'qlm / llumnix_load': 'Llumnix',
+    'atfc / slosserve_disagg_planner': 'SLO Packer (Disagg)',
+    'qlm / round_robin-disagg': 'vLLM+ (Disagg)'
 }
 
 STYLE_KEY_ALIASES = {
@@ -27,6 +30,9 @@ STYLE_KEY_ALIASES = {
     'SLO-Packer (Oracle)': 'atfc / slosserve_planner_oracle_mem',
     'QLM': 'qlm / round_robin',
     'vLLM+': 'vllm / round_robin',
+    'vLLM (Session-Aware)': 'vllm / round_robin_session',
+    'Sarathi+': 'sarathi+ / round_robin',
+    'Sarathi+ (Session-Aware)': 'sarathi / round_robin_session',
     'Sarathi': 'sarathi / round_robin',
     'llumnix': 'qlm / llumnix_load',
 }
@@ -39,7 +45,10 @@ COLOR_MAP = {
     'atfc / slosserve_planner_oracle_mem': '#145A32',
     'qlm / round_robin': '#E76F51',
     'vllm / round_robin': '#4C78A8',
+    'vllm / round_robin_session': '#1F5AA6',
+    'sarathi+ / round_robin': '#7A5195',
     'sarathi / round_robin': '#B279A2',
+    'sarathi / round_robin_session': '#C44E52',
     'qlm / llumnix_load': '#F58518',
 }
 
@@ -51,7 +60,10 @@ MARKER_MAP = {
     'atfc / slosserve_planner_oracle_mem': '*',
     'qlm / round_robin': 's',
     'vllm / round_robin': '^',
+    'vllm / round_robin_session': 'p',
+    'sarathi+ / round_robin': '<',
     'sarathi / round_robin': 'v',
+    'sarathi / round_robin_session': 'X',
     'qlm / llumnix_load': '>',
 }
 
