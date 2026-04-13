@@ -5,10 +5,72 @@ import argparse
 import csv
 import json
 import math
+import sys
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is optional at runtime.
+    tqdm = None
+
+
+class _NullProgressBar:
+    def __enter__(self) -> "_NullProgressBar":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        return False
+
+    def update(self, _: int | float = 1) -> None:
+        return
+
+    def close(self) -> None:
+        return
+
+
+def _progress_enabled() -> bool:
+    return tqdm is not None and sys.stderr.isatty()
+
+
+def _iter_progress(
+    iterable: Any,
+    *,
+    desc: str,
+    total: int | None = None,
+    unit: str = "item",
+) -> Any:
+    if not _progress_enabled():
+        return iterable
+    return tqdm(
+        iterable,
+        desc=desc,
+        total=total,
+        unit=unit,
+        dynamic_ncols=True,
+        leave=False,
+    )
+
+
+def _progress_bar(
+    *,
+    desc: str,
+    total: int | None = None,
+    unit: str = "item",
+    unit_scale: bool = False,
+) -> Any:
+    if not _progress_enabled():
+        return _NullProgressBar()
+    return tqdm(
+        total=total,
+        desc=desc,
+        unit=unit,
+        unit_scale=unit_scale,
+        dynamic_ncols=True,
+        leave=False,
+    )
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -81,7 +143,12 @@ def _build_request_prefill_tokens(
     events: list[dict[str, Any]]
 ) -> dict[str, int]:
     prefill_tokens_by_request: dict[str, int] = {}
-    for event in events:
+    for event in _iter_progress(
+        events,
+        desc="Indexing prefill tokens",
+        total=len(events),
+        unit="event",
+    ):
         if str(event.get("event_type", "")) != "arrival":
             continue
         request_id_raw = event.get("request_id")
@@ -167,31 +234,47 @@ def load_events(
             payload = json.load(f)
             if not isinstance(payload, list):
                 raise ValueError(f"{path} does not contain a JSON array")
-            events = [event for event in payload if isinstance(event, dict)]
-            if allowed_event_types is None:
-                return events
-            return [
-                event
-                for event in events
-                if str(event.get("event_type", "")) in allowed_event_types
-            ]
+            events: list[dict[str, Any]] = []
+            for event in _iter_progress(
+                payload,
+                desc="Filtering loaded events",
+                total=len(payload),
+                unit="event",
+            ):
+                if not isinstance(event, dict):
+                    continue
+                if (
+                    allowed_event_types is not None
+                    and str(event.get("event_type", "")) not in allowed_event_types
+                ):
+                    continue
+                events.append(event)
+            return events
 
         events: list[dict[str, Any]] = []
-        for line_no, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            item = json.loads(line)
-            if not isinstance(item, dict):
-                raise ValueError(
-                    f"{path}:{line_no} is not a JSON object: {type(item).__name__}"
-                )
-            if (
-                allowed_event_types is not None
-                and str(item.get("event_type", "")) not in allowed_event_types
-            ):
-                continue
-            events.append(item)
+        total_bytes = path.stat().st_size
+        with _progress_bar(
+            desc=f"Loading {path.name}",
+            total=total_bytes,
+            unit="B",
+            unit_scale=True,
+        ) as progress:
+            for line_no, raw_line in enumerate(f, start=1):
+                progress.update(len(raw_line))
+                line = raw_line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        f"{path}:{line_no} is not a JSON object: {type(item).__name__}"
+                    )
+                if (
+                    allowed_event_types is not None
+                    and str(item.get("event_type", "")) not in allowed_event_types
+                ):
+                    continue
+                events.append(item)
         return events
 
 
@@ -372,7 +455,12 @@ def build_attempts(events: list[dict[str, Any]]) -> dict[str, list[Attempt]]:
     routing_by_iter: dict[int, dict[str, float | int | None]] = {}
     last_routing_context: dict[str, float | int | None] | None = None
 
-    for event in events:
+    for event in _iter_progress(
+        events,
+        desc="Reconstructing attempts",
+        total=len(events),
+        unit="event",
+    ):
         event_type = str(event.get("event_type", ""))
         timestamp = _coerce_float(event.get("timestamp"))
 
@@ -630,9 +718,15 @@ def build_request_summaries(
     attempts_by_request: dict[str, list[Attempt]]
 ) -> list[RequestSummary]:
     summaries: list[RequestSummary] = []
-    for request_id, attempts in sorted(
+    sorted_attempts = sorted(
         attempts_by_request.items(),
         key=lambda item: int(item[0]) if item[0].isdigit() else item[0],
+    )
+    for request_id, attempts in _iter_progress(
+        sorted_attempts,
+        desc="Summarizing requests",
+        total=len(sorted_attempts),
+        unit="request",
     ):
         first_router_entry_ts = next(
             (attempt.router_entry_ts for attempt in attempts if attempt.router_entry_ts is not None),
@@ -915,7 +1009,12 @@ def _collect_batch_stats(events: list[dict[str, Any]]) -> dict[str, Any]:
         "mixed": [],
     }
     prefill_tokens_by_request = _build_request_prefill_tokens(events)
-    for event in events:
+    for event in _iter_progress(
+        events,
+        desc="Collecting batch stats",
+        total=len(events),
+        unit="event",
+    ):
         if str(event.get("event_type", "")) != "batch":
             continue
         elapsed = _coerce_float(event.get("elapsed"))
