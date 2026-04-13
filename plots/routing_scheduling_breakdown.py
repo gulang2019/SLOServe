@@ -148,7 +148,11 @@ def _duration(end: float | None, start: float | None) -> float | None:
     return end - start
 
 
-def load_events(path: Path) -> list[dict[str, Any]]:
+def load_events(
+    path: Path,
+    *,
+    allowed_event_types: set[str] | None = None,
+) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as f:
         first_non_ws = None
         while True:
@@ -163,7 +167,14 @@ def load_events(path: Path) -> list[dict[str, Any]]:
             payload = json.load(f)
             if not isinstance(payload, list):
                 raise ValueError(f"{path} does not contain a JSON array")
-            return [event for event in payload if isinstance(event, dict)]
+            events = [event for event in payload if isinstance(event, dict)]
+            if allowed_event_types is None:
+                return events
+            return [
+                event
+                for event in events
+                if str(event.get("event_type", "")) in allowed_event_types
+            ]
 
         events: list[dict[str, Any]] = []
         for line_no, line in enumerate(f, start=1):
@@ -175,6 +186,11 @@ def load_events(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(
                     f"{path}:{line_no} is not a JSON object: {type(item).__name__}"
                 )
+            if (
+                allowed_event_types is not None
+                and str(item.get("event_type", "")) not in allowed_event_types
+            ):
+                continue
             events.append(item)
         return events
 
@@ -1004,6 +1020,22 @@ def _build_segment_stats_rows(
     return rows
 
 
+def _build_batch_size_rows(batch_stats: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for segment, stats in batch_stats["batch_size_distribution_metrics"].items():
+        rows.append(
+            _stats_row(
+                segment,
+                stats,
+                scope="batch_size_distribution",
+                cohort="all_batches",
+                device_id=None,
+                value_unit="requests_per_batch",
+            )
+        )
+    return rows
+
+
 def _build_device_breakdown_rows(
     attempts_by_request: dict[str, list[Attempt]],
 ) -> list[dict[str, Any]]:
@@ -1237,29 +1269,52 @@ def parse_args() -> argparse.Namespace:
             "<output_prefix>.zip when --zip-results is set."
         ),
     )
+    parser.add_argument(
+        "--batch-only",
+        action="store_true",
+        help=(
+            "Skip request-level reconstruction and export only batch-size "
+            "distribution metrics for prefill-only, decode-only, and mixed batches."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     events_file = args.events_file
-    events = load_events(events_file)
-    attempts_by_request = build_attempts(events)
-    summary = summarize_attempts(attempts_by_request)
+    allowed_event_types = {"arrival", "batch"} if args.batch_only else None
+    events = load_events(events_file, allowed_event_types=allowed_event_types)
     batch_stats = _collect_batch_stats(events)
+    if args.batch_only:
+        attempts_by_request: dict[str, list[Attempt]] = {}
+        summary: dict[str, Any] = {
+            "mode": "batch_only",
+            "counts": {
+                "events_loaded": len(events),
+            },
+        }
+    else:
+        attempts_by_request = build_attempts(events)
+        summary = summarize_attempts(attempts_by_request)
 
     output_prefix = args.output_prefix
     if output_prefix is None:
         output_prefix = Path("plots/out") / f"{events_file.stem}.routing_scheduling"
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
 
-    request_rows = summary["request_summaries"]
-    breakdown_rows = _build_combined_breakdown_rows(
-        summary,
-        batch_stats,
-        attempts_by_request,
-    )
-    tries_distribution_rows = _build_tries_distribution_rows(request_rows)
+    if args.batch_only:
+        request_rows: list[dict[str, Any]] = []
+        breakdown_rows = _build_batch_size_rows(batch_stats)
+        tries_distribution_rows: list[dict[str, Any]] = []
+    else:
+        request_rows = summary["request_summaries"]
+        breakdown_rows = _build_combined_breakdown_rows(
+            summary,
+            batch_stats,
+            attempts_by_request,
+        )
+        tries_distribution_rows = _build_tries_distribution_rows(request_rows)
 
     breakdown_csv = output_prefix.with_suffix(".breakdown.csv")
     tries_distribution_csv = output_prefix.with_suffix(".tries_distribution.csv")
@@ -1302,84 +1357,88 @@ def main() -> None:
             ],
         )
 
-    counts = summary["counts"]
     print(f"Loaded {len(events)} events from {events_file}")
-    print(
-        "Requests: "
-        f"total={counts['requests_total']} "
-        f"accepted={counts['accepted_requests']} "
-        f"with_retries={counts['requests_with_retries']}"
-    )
-    print(
-        "Attempts: "
-        f"total={counts['attempts_total']} "
-        f"accepted={counts['accepted_attempts']} "
-        f"rescheduled={counts['rescheduled_attempts']} "
-        f"router_rejected={counts['router_rejected_attempts']}"
-    )
-    print()
-    print(
-        "service_ready = max(router admitted/rescheduling ack, first batch launch), "
-        "where first batch launch = batch.timestamp - batch.elapsed + batch.extra_args.to_launch"
-    )
-    print(
-        "routing_elapsed_s is the raw router-loop elapsed time from the trace. "
-        "queueing_time_s is arrival-router -> routing_start, and "
-        "routing_compute_time_s is routing_start -> routing_finish."
-    )
+    if args.batch_only:
+        print("Batch-only mode: exported batch-size distribution metrics only.")
+    else:
+        counts = summary["counts"]
+        print(
+            "Requests: "
+            f"total={counts['requests_total']} "
+            f"accepted={counts['accepted_requests']} "
+            f"with_retries={counts['requests_with_retries']}"
+        )
+        print(
+            "Attempts: "
+            f"total={counts['attempts_total']} "
+            f"accepted={counts['accepted_attempts']} "
+            f"rescheduled={counts['rescheduled_attempts']} "
+            f"router_rejected={counts['router_rejected_attempts']}"
+        )
+        print()
+        print(
+            "service_ready = max(router admitted/rescheduling ack, first batch launch), "
+            "where first batch launch = batch.timestamp - batch.elapsed + batch.extra_args.to_launch"
+        )
+        print(
+            "routing_elapsed_s is the raw router-loop elapsed time from the trace. "
+            "queueing_time_s is arrival-router -> routing_start, and "
+            "routing_compute_time_s is routing_start -> routing_finish."
+        )
 
-    _print_metric_block(
-        "Accepted Attempt Breakdown",
-        summary["accepted_attempt_metrics"],
-    )
-    _print_metric_block(
-        "Rejected Attempt Breakdown Before Rescheduling",
-        summary["rescheduled_attempt_metrics"],
-    )
-    _print_metric_block(
-        "Rejected Attempt Round Trip",
-        summary["rescheduled_round_trip_metrics"],
-    )
-    _print_metric_block(
-        "Rejected Attempt Engine Breakdown",
-        summary["rescheduled_engine_breakdown_metrics"],
-    )
-    _print_count_metric_block(
-        "Per-Request Attempt Counts",
-        {
-            "attempts_total": summary["request_metrics"]["attempts_total"],
-            "retries_total": summary["request_metrics"]["retries_total"],
-        },
-    )
-    _print_metric_block(
-        "Per-Request Latency Summary",
-        {
-            "time_to_service_ready_s": summary["request_metrics"]["time_to_service_ready_s"],
-            "total_routing_overhead_s": summary["request_metrics"]["total_routing_overhead_s"],
-            "first_serving_batch_scheduling_overhead_s": (
-                summary["request_metrics"]["first_serving_batch_scheduling_overhead_s"]
-            ),
-        },
-    )
-    _print_metric_block(
-        "Batch Timing Summary",
-        {
-            "batch_scheduling_overhead_s": batch_stats["batch_scheduling_overhead_s"],
-            "batch_execution_time_s": batch_stats["batch_execution_time_s"],
-        },
-    )
+        _print_metric_block(
+            "Accepted Attempt Breakdown",
+            summary["accepted_attempt_metrics"],
+        )
+        _print_metric_block(
+            "Rejected Attempt Breakdown Before Rescheduling",
+            summary["rescheduled_attempt_metrics"],
+        )
+        _print_metric_block(
+            "Rejected Attempt Round Trip",
+            summary["rescheduled_round_trip_metrics"],
+        )
+        _print_metric_block(
+            "Rejected Attempt Engine Breakdown",
+            summary["rescheduled_engine_breakdown_metrics"],
+        )
+        _print_count_metric_block(
+            "Per-Request Attempt Counts",
+            {
+                "attempts_total": summary["request_metrics"]["attempts_total"],
+                "retries_total": summary["request_metrics"]["retries_total"],
+            },
+        )
+        _print_metric_block(
+            "Per-Request Latency Summary",
+            {
+                "time_to_service_ready_s": summary["request_metrics"]["time_to_service_ready_s"],
+                "total_routing_overhead_s": summary["request_metrics"]["total_routing_overhead_s"],
+                "first_serving_batch_scheduling_overhead_s": (
+                    summary["request_metrics"]["first_serving_batch_scheduling_overhead_s"]
+                ),
+            },
+        )
+        _print_metric_block(
+            "Batch Timing Summary",
+            {
+                "batch_scheduling_overhead_s": batch_stats["batch_scheduling_overhead_s"],
+                "batch_execution_time_s": batch_stats["batch_execution_time_s"],
+            },
+        )
     _print_count_metric_block(
         "Batch Size Distribution",
         batch_stats["batch_size_distribution_metrics"],
     )
 
-    for request_id in args.request_id:
-        attempts = attempts_by_request.get(str(request_id))
-        if not attempts:
-            print()
-            print(f"Request {request_id}: not found")
-            continue
-        _print_request_detail(str(request_id), attempts)
+    if not args.batch_only:
+        for request_id in args.request_id:
+            attempts = attempts_by_request.get(str(request_id))
+            if not attempts:
+                print()
+                print(f"Request {request_id}: not found")
+                continue
+            _print_request_detail(str(request_id), attempts)
 
     print()
     print(f"Wrote {breakdown_csv}")
