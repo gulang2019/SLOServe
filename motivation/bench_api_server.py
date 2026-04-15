@@ -279,6 +279,9 @@ def _build_concise_result_row(
             "n_device": result.get("n_device", result.get("effective_n_device")),
             "average_n_server": average_n_server,
             "fast_sched_baseline_bsz": result.get("fast_sched_baseline_bsz"),
+            "benchmark_decode_length_offset": result.get(
+                "benchmark_decode_length_offset"
+            ),
         },
         "policy": {
             "routing": result.get("routing_policy"),
@@ -1233,6 +1236,7 @@ class Problem:
     best_effort_max_inflight: int = 0
     mock_engine_device_mem_bytes: int | None = None
     fast_sched_baseline_bsz: int | None = None
+    benchmark_decode_length_offset: int = 0
      
     # profit model 
     profit_per_input_token: float = 0.0
@@ -1687,6 +1691,7 @@ def _print_benchmark_slo_violation_grid_tables(df: pd.DataFrame) -> None:
             "perf_model_piecewise_breakpoints",
             "enable_session_replay",
             "session_pause_s",
+            "benchmark_decode_length_offset",
         ]
         if column in grid_df.columns
     ]
@@ -2075,6 +2080,38 @@ def _apply_trace_arrival_limit(
     cutoff_time = start_time + float(trace_arrival_limit_s)
     keep_count = bisect.bisect_right(arrival_times, cutoff_time)
     return list(requests[:keep_count]), list(arrival_times[:keep_count])
+
+
+def _normalize_benchmark_decode_length_offset(
+    decode_length_offset: int | None,
+) -> int:
+    if decode_length_offset is None:
+        return 0
+    normalized = int(decode_length_offset)
+    if normalized < 0:
+        raise ValueError(
+            "benchmark_decode_length_offset must be non-negative, "
+            f"got {decode_length_offset}"
+        )
+    return normalized
+
+
+def _apply_benchmark_decode_length_offset(
+    requests: list[Request],
+    *,
+    decode_length_offset: int | None,
+) -> list[Request]:
+    normalized_offset = _normalize_benchmark_decode_length_offset(
+        decode_length_offset
+    )
+    adjusted_requests: list[Request] = []
+    for request in requests:
+        adjusted_request = copy.copy(request)
+        adjusted_request.output_length = (
+            int(adjusted_request.output_length) + normalized_offset
+        )
+        adjusted_requests.append(adjusted_request)
+    return adjusted_requests
 
 
 def _build_request_payload(
@@ -4662,6 +4699,10 @@ async def main(
         load_scale=problem.load_scale,
         window=problem.window,
     )
+    requests = _apply_benchmark_decode_length_offset(
+        requests,
+        decode_length_offset=problem.benchmark_decode_length_offset,
+    )
     loaded_trace_request_count = len(requests)
     requests, arrival_times = _apply_trace_arrival_limit(
         requests,
@@ -4681,6 +4722,11 @@ async def main(
             "trace_arrival_limit:",
             f"{float(problem.trace_arrival_limit_s):.3f}s",
             f"kept_requests={arrival_limited_request_count}",
+        )
+    if int(problem.benchmark_decode_length_offset) > 0:
+        print(
+            "benchmark_decode_length_offset:",
+            int(problem.benchmark_decode_length_offset),
         )
     print('arrival_times:', arrival_times[0], '->', arrival_times[-1])
     arrival_base_time = arrival_times[0]
@@ -5791,6 +5837,17 @@ def _trace_arrival_limit_suffix(trace_arrival_limit_s: float | None) -> str:
     return f"_arrlim{_compact_suffix_number(trace_arrival_limit_s)}s"
 
 
+def _benchmark_decode_length_offset_suffix(
+    benchmark_decode_length_offset: int | None,
+) -> str:
+    normalized_offset = _normalize_benchmark_decode_length_offset(
+        benchmark_decode_length_offset
+    )
+    if normalized_offset <= 0:
+        return ""
+    return f"_dloff{normalized_offset}"
+
+
 def _baseline_cap_suffix(baseline_decode_cap: int | None) -> str:
     if baseline_decode_cap is None:
         return ""
@@ -6102,6 +6159,7 @@ def build_problems(
     frontend_dedicated_client_per_request: bool = False,
     enable_best_effort_tier: bool = False,
     best_effort_max_inflight: int = 0,
+    benchmark_decode_length_offset: int = 0,
 ):
     scheduling_policy, routing_policy, admission_output_length_mode = (
         _resolve_policy_admission_output_length_mode(
@@ -6121,8 +6179,14 @@ def build_problems(
         enable_session_replay,
         session_pause_s,
     )
+    benchmark_decode_length_offset = _normalize_benchmark_decode_length_offset(
+        benchmark_decode_length_offset
+    )
     trace_arrival_limit_suffix = _trace_arrival_limit_suffix(
         trace_arrival_limit_s
+    )
+    benchmark_decode_length_suffix = _benchmark_decode_length_offset_suffix(
+        benchmark_decode_length_offset
     )
     baseline_cap_suffix = _baseline_cap_suffix(baseline_decode_cap)
     fast_sched_baseline_bsz_suffix = _fast_sched_baseline_bsz_suffix(
@@ -6174,6 +6238,7 @@ def build_problems(
         f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
         f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
         f'{session_replay_suffix}{trace_arrival_limit_suffix}'
+        f'{benchmark_decode_length_suffix}'
         f'{baseline_cap_suffix}{fast_sched_baseline_bsz_suffix}'
         f'{mock_engine_device_mem_suffix}{clock_monitor_suffix}'
         f'{perf_model_regression_suffix}{frontend_httpx_suffix}{best_effort_suffix}')
@@ -6185,6 +6250,10 @@ def build_problems(
         model_name=model_name,
         load_scale=load_scale,
         window=window,
+    )
+    requests = _apply_benchmark_decode_length_offset(
+        requests,
+        decode_length_offset=benchmark_decode_length_offset,
     )
     requests, arrival_times = _apply_trace_arrival_limit(
         requests,
@@ -6234,6 +6303,10 @@ def build_problems(
         'admission_output_length: '
         f'mode={admission_output_length_mode}, '
         f'value={admission_output_length}'
+    )
+    print(
+        'benchmark_decode_length_offset: '
+        f'{benchmark_decode_length_offset}'
     )
     from SLOsServe.perf_model import PerfModel
     perf_model = PerfModel.get_perf_model(model_name, perf_model_task)
@@ -6698,6 +6771,7 @@ def build_problems(
             int(fast_sched_baseline_bsz)
             if fast_sched_baseline_bsz is not None else None
         ),
+        benchmark_decode_length_offset = benchmark_decode_length_offset,
         frontend_httpx_max_connections = frontend_httpx_max_connections,
         frontend_httpx_max_keepalive_connections = (
             frontend_httpx_max_keepalive_connections
@@ -6767,12 +6841,16 @@ def run(
     frontend_dedicated_client_per_request: bool,
     enable_best_effort_tier: bool = False,
     best_effort_max_inflight: int = 0,
+    benchmark_decode_length_offset: int = 0,
     disable_independent_slo_grid_report: bool = False,
     concise_logging: bool = False,
     update_clients: bool = True,
 ):
     admission_output_length_mode = _normalize_admission_output_length_mode(
         admission_output_length_mode
+    )
+    benchmark_decode_length_offset = _normalize_benchmark_decode_length_offset(
+        benchmark_decode_length_offset
     )
     original_log_level = logger.level
     output_dir = os.path.abspath(output_dir)
@@ -6805,7 +6883,9 @@ def run(
         _trace_name = trace
         burstiness_level = 0.0
     experiment_dir = os.path.abspath(
-        f"{output_dir}/{model_name_easy}_{profit}_{_trace_name}_{window}_{admission_mode}_{slo_routing_overhead}")
+        f"{output_dir}/{model_name_easy}_{profit}_{_trace_name}_{window}_"
+        f"{admission_mode}_{slo_routing_overhead}"
+        f"{_benchmark_decode_length_offset_suffix(benchmark_decode_length_offset)}")
     os.makedirs(experiment_dir, exist_ok=True)
     
     print('--Problem Grid--')
@@ -6818,6 +6898,10 @@ def run(
     print(f"trace: {trace}")
     print(f"window: {window}")
     print(f"trace_arrival_limit_s: {trace_arrival_limit_s}")
+    print(
+        "benchmark_decode_length_offset: "
+        f"{benchmark_decode_length_offset}"
+    )
     print(f"load_scales: {load_scales}")
     print(f"n_devices: {n_devices}")
     print(f"tensor_parallel_size: {tensor_parallel_size}")
@@ -6918,6 +7002,7 @@ def run(
                     r.get('enable_session_replay', False),
                     r.get('session_pause_s', 0.0),
                     r.get('trace_arrival_limit_s'),
+                    r.get('benchmark_decode_length_offset', 0),
                     r.get('frontend_httpx_max_connections'),
                     r.get('frontend_httpx_max_keepalive_connections'),
                     r.get('frontend_dedicated_client_per_request', False),
@@ -6994,6 +7079,7 @@ def run(
             enable_session_replay,
             session_pause_s,
             trace_arrival_limit_s,
+            benchmark_decode_length_offset,
             frontend_httpx_max_connections,
             frontend_httpx_max_keepalive_connections,
             frontend_dedicated_client_per_request,
@@ -7117,6 +7203,9 @@ def run(
                         ),
                         enable_best_effort_tier=enable_best_effort_tier,
                         best_effort_max_inflight=best_effort_max_inflight,
+                        benchmark_decode_length_offset=(
+                            benchmark_decode_length_offset
+                        ),
                     )
                 summary_problem = summary_problems[0] if summary_problems else None
                 _print_concise_result_row(
@@ -7209,6 +7298,7 @@ def run(
             ),
             enable_best_effort_tier=enable_best_effort_tier,
             best_effort_max_inflight=best_effort_max_inflight,
+            benchmark_decode_length_offset=benchmark_decode_length_offset,
         )
         if not len(problems):
             logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
@@ -7298,6 +7388,9 @@ def run(
             ),
             'admission_output_length_mode': resolved_admission_output_length_mode,
             'admission_output_length': problems[0].admission_output_length,
+            'benchmark_decode_length_offset': (
+                problems[0].benchmark_decode_length_offset
+            ),
             'enable_session_replay': enable_session_replay,
             'session_pause_s': session_pause_s,
             'trace_arrival_limit_s': trace_arrival_limit_s,
@@ -7758,6 +7851,16 @@ if __name__ == '__main__':
             'many seconds of the selected window start'
         ),
     )
+    parser.add_argument(
+        '--benchmark_decode_length_offset',
+        '--decode_length_offset',
+        type=int,
+        default=0,
+        help=(
+            'add this many decode tokens to every benchmark request '
+            'output_length before admission sizing and request replay'
+        ),
+    )
     parser.add_argument('--n_devices', type=int, default=[1,2,4,8], nargs='+', help = 'list of logical replicas to run')
     parser.add_argument('--tensor_parallel_size', type=int, default=1, help='number of GPUs per logical replica')
     parser.add_argument('--load_scales', type=float, default=[0.5,1.0,2.0,3.0,4.0], nargs='+', help = 'list of load scales (we rescale the arrival rate by load scale, higher load scale means higher query per second)')
@@ -8075,6 +8178,9 @@ if __name__ == '__main__':
                 ),
                 enable_best_effort_tier = args.enable_best_effort_tier,
                 best_effort_max_inflight = args.best_effort_max_inflight,
+                benchmark_decode_length_offset = (
+                    args.benchmark_decode_length_offset
+                ),
                 disable_independent_slo_grid_report = (
                     args.disable_independent_slo_grid_report
                 ),
@@ -8197,6 +8303,9 @@ if __name__ == '__main__':
                 ),
                 'enable_best_effort_tier': args.enable_best_effort_tier,
                 'best_effort_max_inflight': args.best_effort_max_inflight,
+                'benchmark_decode_length_offset': (
+                    args.benchmark_decode_length_offset
+                ),
                 'disable_independent_slo_grid_report': (
                     args.disable_independent_slo_grid_report
                 ),
