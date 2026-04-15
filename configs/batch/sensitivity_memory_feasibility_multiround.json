@@ -1,0 +1,26 @@
+{
+  "experiment_name": "sensitivity_memory_feasibility_multiround",
+  "server_clients": "0-15",
+  "extends": [
+    "base.json"
+  ],
+  "policies": [
+    "round_robin_session:atfc",
+    "slosserve_8_planner_mem_p90:atfc_mem_p90",
+    "slosserve_8_planner_mem_p95:atfc_mem_p95",
+    "slosserve_8_planner_mem_p99:atfc_mem_p99",
+    "slosserve_8_planner:atfc",
+    "slosserve_8_planner_oracle_mem:atfc"
+  ],
+  "traces": [
+    "sharegpt_chat:azure_chat"
+  ],
+  "configs": {
+    "sharegpt_chat:azure_chat": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [16]
+    }
+  },
+  "extra_args": "--enable_session_replay --session_pause_s 5.0"
+}
