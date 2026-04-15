@@ -1,0 +1,12 @@
+{
+  "experiment_name": "disagg_mixed_offset200_device_shard1",
+  "extends": [
+    "disagg_mixed_offset200_base.json"
+  ],
+  "output_dir": "experiments_disagg_mixed_offset200/device_shard1",
+  "configs": {
+    "azure_chat_23:azure_chat_23+azure_code_23:azure_code_23": {
+      "n_devices": [8, 7]
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "experiment_name": "disagg_mixed_offset200",
+  "extends": [
+    "base.json"
+  ],
+  "policies": [
+    "round_robin-disagg-d1:qlm",
+    "round_robin-disagg-d2:qlm",
+    "round_robin-disagg-d3:qlm",
+    "round_robin-disagg-d4:qlm",
+    "slosserve_disagg_planner:atfc"
+  ],
+  "traces": [
+    "azure_chat_23:azure_chat_23+azure_code_23:azure_code_23"
+  ],
+  "configs": {
+    "azure_chat_23:azure_chat_23+azure_code_23:azure_code_23": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [8, 7, 6, 5],
+      "slo_tpot": [0.025],
+      "extra_args": [
+        "--benchmark_decode_length_offset",
+        "200"
+      ],
+      "perf_model_err": 1.05,
+      "scheduling_safety_margin": 0.002,
+      "ttft_slo_scale": 5.0
+    }
+  },
+  "output_dir": "experiments_disagg_mixed_offset200/all"
+}

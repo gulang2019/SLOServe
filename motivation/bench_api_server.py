@@ -290,6 +290,7 @@ def _build_concise_result_row(
                 "admission_output_length_mode"
             ),
             "admission_output_length": result.get("admission_output_length"),
+            "strict_pd_separation": result.get("strict_pd_separation"),
         },
         "slo": {
             "ttft": {
@@ -1237,6 +1238,7 @@ class Problem:
     mock_engine_device_mem_bytes: int | None = None
     fast_sched_baseline_bsz: int | None = None
     benchmark_decode_length_offset: int = 0
+    strict_pd_separation: bool = False
      
     # profit model 
     profit_per_input_token: float = 0.0
@@ -1692,6 +1694,7 @@ def _print_benchmark_slo_violation_grid_tables(df: pd.DataFrame) -> None:
             "enable_session_replay",
             "session_pause_s",
             "benchmark_decode_length_offset",
+            "strict_pd_separation",
         ]
         if column in grid_df.columns
     ]
@@ -5848,6 +5851,10 @@ def _benchmark_decode_length_offset_suffix(
     return f"_dloff{normalized_offset}"
 
 
+def _strict_pd_separation_suffix(strict_pd_separation: bool) -> str:
+    return "_strictpd1" if bool(strict_pd_separation) else ""
+
+
 def _baseline_cap_suffix(baseline_decode_cap: int | None) -> str:
     if baseline_decode_cap is None:
         return ""
@@ -6160,6 +6167,7 @@ def build_problems(
     enable_best_effort_tier: bool = False,
     best_effort_max_inflight: int = 0,
     benchmark_decode_length_offset: int = 0,
+    strict_pd_separation: bool = False,
 ):
     scheduling_policy, routing_policy, admission_output_length_mode = (
         _resolve_policy_admission_output_length_mode(
@@ -6187,6 +6195,10 @@ def build_problems(
     )
     benchmark_decode_length_suffix = _benchmark_decode_length_offset_suffix(
         benchmark_decode_length_offset
+    )
+    strict_pd_separation = bool(strict_pd_separation)
+    strict_pd_separation_suffix = _strict_pd_separation_suffix(
+        strict_pd_separation
     )
     baseline_cap_suffix = _baseline_cap_suffix(baseline_decode_cap)
     fast_sched_baseline_bsz_suffix = _fast_sched_baseline_bsz_suffix(
@@ -6238,7 +6250,7 @@ def build_problems(
         f'{n_device}_tp{tensor_parallel_size}_{admission_mode}_'
         f'{ttft_slo_scale}_{slo_tpot}_{routing_fallback_policy}'
         f'{session_replay_suffix}{trace_arrival_limit_suffix}'
-        f'{benchmark_decode_length_suffix}'
+        f'{benchmark_decode_length_suffix}{strict_pd_separation_suffix}'
         f'{baseline_cap_suffix}{fast_sched_baseline_bsz_suffix}'
         f'{mock_engine_device_mem_suffix}{clock_monitor_suffix}'
         f'{perf_model_regression_suffix}{frontend_httpx_suffix}{best_effort_suffix}')
@@ -6308,6 +6320,7 @@ def build_problems(
         'benchmark_decode_length_offset: '
         f'{benchmark_decode_length_offset}'
     )
+    print(f'strict_pd_separation: {strict_pd_separation}')
     from SLOsServe.perf_model import PerfModel
     perf_model = PerfModel.get_perf_model(model_name, perf_model_task)
     loaded_perf_model_params = perf_model.describe_hardware_params()
@@ -6517,7 +6530,11 @@ def build_problems(
         if len(_args) >= 2:
             assert _args[1] == 'disagg'
             if len(_args) >= 3:
-                opt_n_prefill_devices = int(_args[2])
+                if _args[2].startswith('d'):
+                    opt_n_decode_devices = int(_args[2][1:])
+                    opt_n_prefill_devices = group_size - opt_n_decode_devices
+                else:
+                    opt_n_prefill_devices = int(_args[2])
             else:
                 opt_n_prefill_devices = int(optimal_prefill_ratio * group_size)
             opt_n_prefill_devices = min(max(opt_n_prefill_devices, 1), n_device - 1)
@@ -6677,6 +6694,7 @@ def build_problems(
                 'is_pd_disagg': True,
                 'n_prefill_per_group': n_prefill_server_per_group,
                 'max_decode_bs': default_capped_baseline_tokens,
+                'strict_pd_separation': strict_pd_separation,
                 "enable_rerouting": True,
                 'use_planner': use_planner,
                 'ablation': ablation_no_global
@@ -6772,6 +6790,7 @@ def build_problems(
             if fast_sched_baseline_bsz is not None else None
         ),
         benchmark_decode_length_offset = benchmark_decode_length_offset,
+        strict_pd_separation = strict_pd_separation,
         frontend_httpx_max_connections = frontend_httpx_max_connections,
         frontend_httpx_max_keepalive_connections = (
             frontend_httpx_max_keepalive_connections
@@ -6842,6 +6861,7 @@ def run(
     enable_best_effort_tier: bool = False,
     best_effort_max_inflight: int = 0,
     benchmark_decode_length_offset: int = 0,
+    strict_pd_separation: bool = False,
     disable_independent_slo_grid_report: bool = False,
     concise_logging: bool = False,
     update_clients: bool = True,
@@ -6852,6 +6872,7 @@ def run(
     benchmark_decode_length_offset = _normalize_benchmark_decode_length_offset(
         benchmark_decode_length_offset
     )
+    strict_pd_separation = bool(strict_pd_separation)
     original_log_level = logger.level
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -6885,7 +6906,8 @@ def run(
     experiment_dir = os.path.abspath(
         f"{output_dir}/{model_name_easy}_{profit}_{_trace_name}_{window}_"
         f"{admission_mode}_{slo_routing_overhead}"
-        f"{_benchmark_decode_length_offset_suffix(benchmark_decode_length_offset)}")
+        f"{_benchmark_decode_length_offset_suffix(benchmark_decode_length_offset)}"
+        f"{_strict_pd_separation_suffix(strict_pd_separation)}")
     os.makedirs(experiment_dir, exist_ok=True)
     
     print('--Problem Grid--')
@@ -6902,6 +6924,7 @@ def run(
         "benchmark_decode_length_offset: "
         f"{benchmark_decode_length_offset}"
     )
+    print(f"strict_pd_separation: {strict_pd_separation}")
     print(f"load_scales: {load_scales}")
     print(f"n_devices: {n_devices}")
     print(f"tensor_parallel_size: {tensor_parallel_size}")
@@ -7003,6 +7026,7 @@ def run(
                     r.get('session_pause_s', 0.0),
                     r.get('trace_arrival_limit_s'),
                     r.get('benchmark_decode_length_offset', 0),
+                    r.get('strict_pd_separation', False),
                     r.get('frontend_httpx_max_connections'),
                     r.get('frontend_httpx_max_keepalive_connections'),
                     r.get('frontend_dedicated_client_per_request', False),
@@ -7080,6 +7104,7 @@ def run(
             session_pause_s,
             trace_arrival_limit_s,
             benchmark_decode_length_offset,
+            strict_pd_separation,
             frontend_httpx_max_connections,
             frontend_httpx_max_keepalive_connections,
             frontend_dedicated_client_per_request,
@@ -7206,6 +7231,7 @@ def run(
                         benchmark_decode_length_offset=(
                             benchmark_decode_length_offset
                         ),
+                        strict_pd_separation=strict_pd_separation,
                     )
                 summary_problem = summary_problems[0] if summary_problems else None
                 _print_concise_result_row(
@@ -7299,6 +7325,7 @@ def run(
             enable_best_effort_tier=enable_best_effort_tier,
             best_effort_max_inflight=best_effort_max_inflight,
             benchmark_decode_length_offset=benchmark_decode_length_offset,
+            strict_pd_separation=strict_pd_separation,
         )
         if not len(problems):
             logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
@@ -7391,6 +7418,7 @@ def run(
             'benchmark_decode_length_offset': (
                 problems[0].benchmark_decode_length_offset
             ),
+            'strict_pd_separation': problems[0].strict_pd_separation,
             'enable_session_replay': enable_session_replay,
             'session_pause_s': session_pause_s,
             'trace_arrival_limit_s': trace_arrival_limit_s,
@@ -7861,6 +7889,16 @@ if __name__ == '__main__':
             'output_length before admission sizing and request replay'
         ),
     )
+    parser.add_argument(
+        '--strict_pd_separation',
+        '--strict-pd-separation',
+        action='store_true',
+        default=False,
+        help=(
+            'for disaggregated slosserve planner routing, keep prefill and '
+            'decode requests within their assigned group regions'
+        ),
+    )
     parser.add_argument('--n_devices', type=int, default=[1,2,4,8], nargs='+', help = 'list of logical replicas to run')
     parser.add_argument('--tensor_parallel_size', type=int, default=1, help='number of GPUs per logical replica')
     parser.add_argument('--load_scales', type=float, default=[0.5,1.0,2.0,3.0,4.0], nargs='+', help = 'list of load scales (we rescale the arrival rate by load scale, higher load scale means higher query per second)')
@@ -8181,6 +8219,7 @@ if __name__ == '__main__':
                 benchmark_decode_length_offset = (
                     args.benchmark_decode_length_offset
                 ),
+                strict_pd_separation = args.strict_pd_separation,
                 disable_independent_slo_grid_report = (
                     args.disable_independent_slo_grid_report
                 ),
@@ -8306,6 +8345,7 @@ if __name__ == '__main__':
                 'benchmark_decode_length_offset': (
                     args.benchmark_decode_length_offset
                 ),
+                'strict_pd_separation': args.strict_pd_separation,
                 'disable_independent_slo_grid_report': (
                     args.disable_independent_slo_grid_report
                 ),
