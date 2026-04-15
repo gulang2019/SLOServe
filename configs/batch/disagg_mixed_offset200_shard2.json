@@ -1,12 +1,11 @@
 {
-  "experiment_name": "disagg_mixed_offset200_device_shard2",
+  "experiment_name": "disagg_mixed_offset200_policy_shard2",
   "extends": [
     "disagg_mixed_offset200_base.json"
   ],
-  "output_dir": "experiments_disagg_mixed_offset200/device_shard2",
-  "configs": {
-    "azure_chat_23:azure_chat_23+azure_code_23:azure_code_23": {
-      "n_devices": [6, 5]
-    }
-  }
+  "policies": [
+    "slosserve_disagg_planner:atfc",
+    "round_robin-disagg-d3:qlm"
+  ],
+  "output_dir": "experiments_disagg_mixed_offset200/policy_shard2"
 }
