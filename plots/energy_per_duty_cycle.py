@@ -67,9 +67,11 @@ class RunPoint:
     energy_per_duty_pct: float
     energy_per_duty_fraction: float
     energy_source: str
+    energy_scope: str
     rps: float | None
     load_scale: float | None
     n_device: int
+    analysis_device_index: int | None
     prefill_devices: tuple[int, ...]
     observation_window: str
     observation_start_s: float
@@ -491,6 +493,7 @@ def _compute_prefill_duty(
     *,
     start_time: float,
     end_time: float,
+    device_index: int | None,
 ) -> tuple[float, float, float, tuple[int, ...], float]:
     run_duration_s = max(0.0, end_time - start_time)
     if run_duration_s <= 0.0:
@@ -504,6 +507,8 @@ def _compute_prefill_duty(
         device_id = _as_int(event.get("device_id"))
         interval = _batch_interval(event)
         if device_id is None or interval is None:
+            continue
+        if device_index is not None and device_id != device_index:
             continue
         clipped_start = max(start_time, interval[0])
         clipped_end = min(end_time, interval[1])
@@ -526,8 +531,12 @@ def _compute_prefill_duty(
     union_busy_seconds = sum(
         end - start for start, end in _merge_intervals(all_prefill_intervals)
     )
-    duty_cycle_pct = 100.0 * busy_seconds / (run_duration_s * len(prefill_devices))
-    duty_cycle_union_pct = 100.0 * union_busy_seconds / run_duration_s
+    if device_index is None:
+        duty_cycle_pct = 100.0 * busy_seconds / (run_duration_s * len(prefill_devices))
+        duty_cycle_union_pct = 100.0 * union_busy_seconds / run_duration_s
+    else:
+        duty_cycle_pct = 100.0 * busy_seconds / run_duration_s
+        duty_cycle_union_pct = duty_cycle_pct
     return (
         run_duration_s,
         min(100.0, duty_cycle_pct),
@@ -659,6 +668,7 @@ def _compute_run_point(
     *,
     window_size: float,
     observation_window: str,
+    device_index: int | None,
 ) -> RunPoint | None:
     if not metadata.event_file.exists():
         raise FileNotFoundError(f"Missing event file: {metadata.event_file}")
@@ -678,27 +688,48 @@ def _compute_run_point(
             batches,
             start_time=start_time,
             end_time=end_time,
+            device_index=device_index,
         )
     )
     n_device = _infer_n_device(batches, metadata.n_device)
+    if device_index is not None and (device_index < 0 or device_index >= max(n_device, 1)):
+        return None
 
-    energy_j, _per_device_energy, has_measured_energy = _compute_measured_energy(
+    measured_energy_j, measured_per_device_energy, has_measured_energy = _compute_measured_energy(
         events,
         start_time=start_time,
         end_time=end_time,
     )
-    energy_source = "measured"
-    if not has_measured_energy or energy_j <= 0.0:
-        energy_j, _per_device_energy = _compute_state_based_energy(
-            batches,
-            n_device=n_device,
-            start_time=start_time,
-            end_time=end_time,
-            window_size=window_size,
-        )
-        energy_source = "state_based"
 
-    if duty_pct <= 0.0:
+    if device_index is None:
+        energy_j = measured_energy_j
+        energy_source = "measured"
+        energy_scope = "total"
+        if not has_measured_energy or energy_j <= 0.0:
+            energy_j, _state_per_device_energy = _compute_state_based_energy(
+                batches,
+                n_device=n_device,
+                start_time=start_time,
+                end_time=end_time,
+                window_size=window_size,
+            )
+            energy_source = "state_based"
+    else:
+        energy_j = measured_per_device_energy.get(device_index, 0.0)
+        energy_source = "measured_device"
+        energy_scope = f"device-{device_index}"
+        if not has_measured_energy or energy_j <= 0.0:
+            _state_energy_j, state_per_device_energy = _compute_state_based_energy(
+                batches,
+                n_device=n_device,
+                start_time=start_time,
+                end_time=end_time,
+                window_size=window_size,
+            )
+            energy_j = state_per_device_energy.get(device_index, 0.0)
+            energy_source = "state_based_device"
+
+    if duty_pct <= 0.0 or energy_j <= 0.0:
         return None
 
     method = metadata.method
@@ -712,9 +743,11 @@ def _compute_run_point(
         energy_per_duty_pct=energy_j / duty_pct,
         energy_per_duty_fraction=energy_j / (duty_pct / 100.0),
         energy_source=energy_source,
+        energy_scope=energy_scope,
         rps=metadata.rps,
         load_scale=metadata.load_scale,
         n_device=n_device,
+        analysis_device_index=device_index,
         prefill_devices=prefill_devices,
         observation_window=selected_window,
         observation_start_s=start_time,
@@ -738,7 +771,9 @@ def _write_csv(points: list[RunPoint], csv_path: Path) -> None:
         "energy_per_duty_pct",
         "energy_per_duty_fraction",
         "energy_source",
+        "energy_scope",
         "n_device",
+        "analysis_device_index",
         "prefill_devices",
         "observation_window",
         "observation_start_s",
@@ -763,7 +798,11 @@ def _write_csv(points: list[RunPoint], csv_path: Path) -> None:
                     "energy_per_duty_pct": point.energy_per_duty_pct,
                     "energy_per_duty_fraction": point.energy_per_duty_fraction,
                     "energy_source": point.energy_source,
+                    "energy_scope": point.energy_scope,
                     "n_device": point.n_device,
+                    "analysis_device_index": (
+                        "" if point.analysis_device_index is None else point.analysis_device_index
+                    ),
                     "prefill_devices": " ".join(str(device_id) for device_id in point.prefill_devices),
                     "observation_window": point.observation_window,
                     "observation_start_s": point.observation_start_s,
@@ -774,7 +813,12 @@ def _write_csv(points: list[RunPoint], csv_path: Path) -> None:
             )
 
 
-def _plot(points: list[RunPoint], output_stem: Path) -> None:
+def _plot(
+    points: list[RunPoint],
+    output_stem: Path,
+    *,
+    device_index: int | None,
+) -> None:
     plt = _get_plotting_dependencies()
     _apply_paper_style(plt)
 
@@ -805,8 +849,12 @@ def _plot(points: list[RunPoint], output_stem: Path) -> None:
             markersize=style.get("markersize", 7.5),
         )
 
-    ax.set_xlabel("Prefill Engine Duty Cycle (%)")
-    ax.set_ylabel("Energy / Duty Cycle (J / %-point)")
+    if device_index is None:
+        ax.set_xlabel("Prefill Engine Duty Cycle (%)")
+        ax.set_ylabel("Energy / Duty Cycle (J / %-point)")
+    else:
+        ax.set_xlabel(f"Device {device_index} Prefill Duty Cycle (%)")
+        ax.set_ylabel(f"Device {device_index} Energy / Duty Cycle (J / %-point)")
     ax.set_facecolor("white")
     ax.grid(
         axis="y",
@@ -879,6 +927,18 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--device-index",
+        "--device-id",
+        dest="device_index",
+        type=int,
+        default=None,
+        help=(
+            "Restrict the analysis to one device index. Duty cycle uses only that "
+            "device's prefill intervals, and energy uses that device's measured or "
+            "state-modeled energy."
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=DEFAULT_OUTPUT_STEM,
@@ -889,6 +949,9 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if args.device_index is not None and args.device_index < 0:
+        raise SystemExit("--device-index must be non-negative.")
+
     metadata = _collect_metadata(args)
     if not metadata:
         raise SystemExit(
@@ -902,6 +965,7 @@ def main() -> None:
             item,
             window_size=args.window_size,
             observation_window=args.observation_window,
+            device_index=args.device_index,
         )
         if point is None:
             skipped += 1
@@ -913,7 +977,7 @@ def main() -> None:
 
     points.sort(key=lambda point: (point.method, point.duty_cycle_pct, str(point.event_file)))
     _write_csv(points, args.output.with_suffix(".csv"))
-    _plot(points, args.output)
+    _plot(points, args.output, device_index=args.device_index)
 
     print(f"Wrote {args.output.with_suffix('.png')}")
     print(f"Wrote {args.output.with_suffix('.pdf')}")
