@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 DEFAULT_OUTPUT_STEM = Path("figs/energy_per_duty_cycle")
 DEFAULT_WINDOW_SIZE_S = 1.0
 IDLE_POWER_W = 70.0
+REPO_PATH_MARKER = "SLOServe/"
 
 STATE_POWER_COEFFS = {
     "decode_active": 89.341,
@@ -177,15 +178,28 @@ def _load_result_rows(results_jsonl: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _truncate_to_repo_relative_path(raw_path: str) -> Path | None:
+    normalized = raw_path.replace("\\", "/")
+    if REPO_PATH_MARKER not in normalized:
+        return None
+    return Path(normalized.split(REPO_PATH_MARKER, maxsplit=1)[1])
+
+
 def _resolve_event_file(raw_path: str, *, results_jsonl: Path | None = None) -> Path:
+    repo_relative_path = _truncate_to_repo_relative_path(raw_path)
     event_file = Path(raw_path).expanduser()
-    if event_file.exists():
-        return event_file.resolve()
-    if results_jsonl is not None:
-        candidate = (results_jsonl.parent / raw_path).expanduser()
+    candidates: list[Path] = []
+    if repo_relative_path is not None:
+        candidates.append(repo_relative_path)
+    candidates.append(event_file)
+    if results_jsonl is not None and not event_file.is_absolute():
+        candidates.append((results_jsonl.parent / event_file).expanduser())
+
+    for candidate in candidates:
         if candidate.exists():
-            return candidate.resolve()
-    return event_file.resolve()
+            return candidate
+
+    return repo_relative_path if repo_relative_path is not None else event_file
 
 
 def _method_from_row(row: dict[str, Any]) -> str:
