@@ -277,6 +277,30 @@ def _log_mock_engine_perf_models(
     )
 
 
+def _abort_scheduler_request_for_mock(scheduler: Any, request_id: str) -> bool:
+    requests = getattr(scheduler, "requests", {})
+    if request_id not in requests:
+        return False
+
+    from vllm.v1.request import RequestStatus
+
+    if hasattr(scheduler, "finish_requests"):
+        scheduler.finish_requests(request_id, RequestStatus.FINISHED_ABORTED)
+    elif hasattr(scheduler, "reject_requests"):
+        scheduler.reject_requests(request_id)
+    else:
+        logger.warning(
+            "Cannot abort request %s because scheduler has no finish/reject API",
+            request_id,
+        )
+        return False
+
+    planner = getattr(scheduler, "atfc_planner", None)
+    if planner is not None and hasattr(planner, "finish_request"):
+        planner.finish_request(request_id)
+    return True
+
+
 @ray.remote(max_concurrency=1024)
 class MockEngineCore:
     def __init__(self,
@@ -468,7 +492,16 @@ class MockEngineCore:
         self._profile_events.clear()
 
     async def abort_request(self, request_id: str):
-        self.scheduler.abort_requests([request_id])
+        if not _abort_scheduler_request_for_mock(self.scheduler, request_id):
+            return
+        self.n_finished_reqs += 1
+        self._profile_events.append({
+            "event_type": "finish",
+            "request_id": request_id,
+            "timestamp": time.time(),
+            "finish_reason": "aborted",
+            "rejection_reason": "migration",
+        })
 
     async def loop(self):
         try:
@@ -1079,6 +1112,15 @@ class MockEngine:
         return await self.engine_core.get_load_statistics.remote(n)
 
     async def abort(self, request_id: str):
+        q = self._local_queues.get(request_id)
+        if q is not None:
+            q.put_nowait({
+                "request_id": request_id,
+                "new_token_ids": [],
+                "finish_reason": "aborted",
+                "stop_reason": "migration",
+                "num_computed_tokens": None,
+            })
         await self.engine_core.abort_request.remote(request_id)
     
     async def check_health(self) -> dict[str, Any]:

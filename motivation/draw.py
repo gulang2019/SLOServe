@@ -467,16 +467,16 @@ def draw_single_gpu():
     #     **kwargs)
 
 
-    draw('experiments/Gemma-3-27B-IT_constant_sharegpt_code:azure_code_23_3979:4579_anytime', 'Gemma27B-Code',
-        _ax = axes[2],
-        title_text = 'Gemma27B-Code', xright = 5.6,
-        **kwargs
-    )
+    # draw('experiments/Gemma-3-27B-IT_constant_sharegpt_code:azure_code_23_3979:4579_anytime', 'Gemma27B-Code',
+    #     _ax = axes[2],
+    #     title_text = 'Gemma27B-Code', xright = 5.6,
+    #     **kwargs
+    # )
 
-    draw('experiments/Gemma-3-27B-IT_constant_sharegpt_chat:azure_chat_23_601:1201_anytime', 'Gemma27B-Chat', 
-        _ax = axes[3],
-        title_text = 'Gemma27B-Chat',
-        **kwargs)
+    # draw('experiments/Gemma-3-27B-IT_constant_sharegpt_chat:azure_chat_23_601:1201_anytime', 'Gemma27B-Chat', 
+    #     _ax = axes[3],
+    #     title_text = 'Gemma27B-Chat',
+    #     **kwargs)
     for ax in axes[1:]: ax.set_ylabel('')
 
     # draw('experiments/Gemma-3-27B-IT_constant_arxiv_summary:burstgpt_GPT-4_Conversation_450:551_anytime/',

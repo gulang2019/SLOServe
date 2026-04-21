@@ -30,6 +30,16 @@ class Event:
     timestamp: float
     device_id: int = 0
     extra_args: dict = field(default_factory=dict)
+    source_decode_device_id: Optional[int] = None
+    target_decode_device_id: Optional[int] = None
+    target_decode_start: Optional[int] = None
+    prefill_device_id: Optional[int] = None
+    n_requests: Optional[int] = None
+    request_targets: Optional[dict] = None
+    num_generated_tokens: Optional[int] = None
+    num_computed_tokens: Optional[int] = None
+    n_buffered_chunks: Optional[int] = None
+    reason: Optional[str] = None
     
 @dataclass(kw_only=True)
 class ReqEvent(Event):
@@ -989,7 +999,7 @@ def _compute_avg_batch_tokens_series(
     return bins[:-1] - start_time, avg_tokens
 
 
-ENERGY_COMPARISON_METADATA_VERSION = 1
+ENERGY_COMPARISON_METADATA_VERSION = 2
 
 
 def _normalize_energy_comparison_event_files(
@@ -1121,6 +1131,7 @@ def build_energy_comparison_metadata(
             n_device=n_device,
             window_size=power_window_s,
         )
+        active_devices = _count_active_devices_from_power_summary(power_summary)
         arrival_time_axis, arrival_counts = _compute_global_arrival_series(events, arrival_window_s)
         violation_time_axis, violation_counts = _compute_slo_violation_series(
             reqs,
@@ -1140,6 +1151,13 @@ def build_energy_comparison_metadata(
                 },
                 "window_s": float(power_window_s),
                 "source": str(power_summary.get("source", "unknown")),
+            },
+            "active_devices": {
+                "time_s": np.asarray(power_summary["time"], dtype=np.float64).tolist(),
+                "values": np.asarray(active_devices, dtype=np.int64).tolist(),
+                "window_s": float(power_window_s),
+                "idle_power_w": 70.0,
+                "derived_from": "power.per_device_values_w",
             },
             "arrivals": {
                 "time_s": np.asarray(arrival_time_axis, dtype=np.float64).tolist(),
@@ -1602,6 +1620,25 @@ def compare_schedulers(
     ]
     num_graphs = len(results) + 1
     fig, axes = plt.subplots(num_graphs, figsize=(16, 5 * num_graphs))
+
+    def _log_x_floor(values):
+        positives = [float(value) for value in values if float(value) > 0]
+        if not positives:
+            return 1e-3
+        return min(positives) / 10.0
+
+    def _clip_log_x(value, floor):
+        return max(float(value), floor)
+
+    def apply_log_x(axis, values):
+        axis.set_xscale('log')
+        floor = _log_x_floor(values)
+        axis.set_xlim(left=floor, right=max(float(value) for value in values))
+        return floor
+
+    def format_scheduler_label(label):
+        return label.replace('vLLM+', 'vLLM (priority)')
+
     # Plot rolling loads (Requests) on left y-axis
     ax = axes[0]
     reqs = results[0]['reqs']
@@ -1609,19 +1646,25 @@ def compare_schedulers(
     window_starts, window_ends, min_prefill_servers, min_decode_servers, min_tot_servers = zip(*min_intervals)
     _, _, max_prefill_servers, max_decode_servers, max_tot_servers = zip(*max_intervals)
     prev_we, prev_ms = None, None
+    top_axis_floor = _log_x_floor(list(window_starts) + list(window_ends))
     for ws, we, ms in zip(window_starts, window_ends, min_tot_servers):
-        ax.hlines(ms, ws, we, color='black', linewidth=2, label='lower bound' if ws == window_starts[0] else "")
+        x_start = _clip_log_x(ws, top_axis_floor)
+        x_end = _clip_log_x(we, top_axis_floor)
+        ax.hlines(ms, x_start, x_end, color='black', linewidth=2, label='lower bound' if ws == window_starts[0] else "")
         if prev_we is not None and prev_we == ws:  # connect contiguous intervals
-            ax.vlines(ws, prev_ms, ms, color='black', linewidth=2)
+            ax.vlines(x_start, prev_ms, ms, color='black', linewidth=2)
         prev_we, prev_ms = we, ms
     prev_we, prev_ms = None, None
     for ws, we, ms in zip(window_starts, window_ends, max_tot_servers):
-        ax.hlines(ms, ws, we, color='black', linewidth=2, label='upper bound' if ws == window_starts[0] else "", linestyle="--")
+        x_start = _clip_log_x(ws, top_axis_floor)
+        x_end = _clip_log_x(we, top_axis_floor)
+        ax.hlines(ms, x_start, x_end, color='black', linewidth=2, label='upper bound' if ws == window_starts[0] else "", linestyle="--")
         if prev_we is not None and prev_we == ws:  # connect contiguous intervals
-            ax.vlines(ws, prev_ms, ms, color='black', linewidth=2, linestyle="--")
+            ax.vlines(x_start, prev_ms, ms, color='black', linewidth=2, linestyle="--")
         prev_we, prev_ms = we, ms
     # for result in results:
     #     plot_num_active_servers(result['events'], ax.twinx(), label = result['scheduler_name'])
+    apply_log_x(ax, list(window_starts) + list(window_ends))
     ax.grid(True)
     ax.legend(loc='upper right', frameon=True)
     ax.set_ylabel('# Servers Required', fontsize=24)
@@ -1643,25 +1686,36 @@ def compare_schedulers(
     for idx, (ax, result) in enumerate(zip(axes[1:], results)):
         reqs = result['reqs']
         scheduler_name = result['scheduler_name']
+        display_name = format_scheduler_label(scheduler_name)
         time, num_violations = compute_window_stats(list(reqs.values()), slo_ttft_fn, slo_tpot)
         print(f'{scheduler_name} num_violations: {sum(num_violations)}')
         prev_time = None
         prev_value = None
+        subplot_x_values = []
         for i in range(len(time)):
             if i == len(time) - 1:
                 t_next = time[i] + (time[i] - time[i-1] if i > 0 else 1)
             else:
                 t_next = time[i + 1]
+            subplot_x_values.extend([time[i], t_next])
+        subplot_floor = _log_x_floor(subplot_x_values)
+        for i in range(len(time)):
+            if i == len(time) - 1:
+                t_next = time[i] + (time[i] - time[i-1] if i > 0 else 1)
+            else:
+                t_next = time[i + 1]
+            x_start = _clip_log_x(time[i], subplot_floor)
+            x_end = _clip_log_x(t_next, subplot_floor)
             # Draw horizontal line for this interval
-            ax.hlines(num_violations[i], time[i], t_next, color='black', linewidth=2, label=scheduler_name if i == 0 else "")
+            ax.hlines(num_violations[i], x_start, x_end, color='black', linewidth=2, label=display_name if i == 0 else "")
             # Draw a vertical line to connect this to previous value (for step look)
             if prev_time is not None:
-                ax.vlines(time[i], prev_value, num_violations[i], color='black', linewidth=2)
+                ax.vlines(x_start, prev_value, num_violations[i], color='black', linewidth=2)
             prev_time = t_next
             prev_value = num_violations[i]
-        ax.set_title(scheduler_name)
+        ax.set_title(display_name)
         ax.tick_params(axis='y', labelsize=18)
-        sched, routing = split_scheduler_name(scheduler_name)
+        sched, routing = split_scheduler_name(display_name)
         ax.set_ylabel(f'# Violation', fontsize=24)
         ax.set_ylim(0, 50)
         ax.grid(True)
@@ -1669,6 +1723,8 @@ def compare_schedulers(
         # Use only a single (shared) twin axis, and set its ylabel and ylim only once
         ax_effective = ax.twinx()
         plot_num_effective_tokens(result['events'], reqs, ax_effective)
+        apply_log_x(ax, subplot_x_values)
+        apply_log_x(ax_effective, subplot_x_values)
         # ax_effective.set_ylabel("Num scheduled tokens (per window)")
         ax_effective.set_ylim(0, 60000)
 

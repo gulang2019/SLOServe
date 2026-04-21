@@ -291,6 +291,9 @@ def _build_concise_result_row(
             ),
             "admission_output_length": result.get("admission_output_length"),
             "strict_pd_separation": result.get("strict_pd_separation"),
+            "enable_decode_compaction": result.get(
+                "enable_decode_compaction"
+            ),
         },
         "slo": {
             "ttft": {
@@ -1239,6 +1242,8 @@ class Problem:
     fast_sched_baseline_bsz: int | None = None
     benchmark_decode_length_offset: int = 0
     strict_pd_separation: bool = False
+    enable_decode_compaction: bool = False
+    decode_compaction_interval_s: float = 1.0
      
     # profit model 
     profit_per_input_token: float = 0.0
@@ -1695,6 +1700,8 @@ def _print_benchmark_slo_violation_grid_tables(df: pd.DataFrame) -> None:
             "session_pause_s",
             "benchmark_decode_length_offset",
             "strict_pd_separation",
+            "enable_decode_compaction",
+            "decode_compaction_interval_s",
         ]
         if column in grid_df.columns
     ]
@@ -6058,6 +6065,68 @@ def _split_policy_admission_output_length_suffix(
     return policy_name[: match.start()], mode
 
 
+def _extract_slosserve_threshold_admission_limit(
+    tokens: list[str],
+    policy_name: str,
+) -> tuple[list[str], int | None]:
+    cleaned_tokens: list[str] = []
+    threshold: int | None = None
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        token_lower = token.lower()
+        match = re.fullmatch(r"thresh(?:old)?(\d+)", token_lower)
+        if match is not None:
+            parsed_threshold = int(match.group(1))
+            if threshold is not None and threshold != parsed_threshold:
+                raise ValueError(
+                    "Conflicting threshold admission limits in "
+                    f"routing policy: {policy_name}"
+                )
+            threshold = parsed_threshold
+            idx += 1
+            continue
+
+        if token_lower in {"thresh", "threshold"}:
+            if idx + 1 >= len(tokens):
+                raise ValueError(
+                    "Missing numeric threshold after "
+                    f"{token!r} in routing policy: {policy_name}"
+                )
+            try:
+                parsed_threshold = int(tokens[idx + 1])
+            except ValueError as exc:
+                raise ValueError(
+                    "Invalid numeric threshold after "
+                    f"{token!r} in routing policy: {policy_name}"
+                ) from exc
+            if threshold is not None and threshold != parsed_threshold:
+                raise ValueError(
+                    "Conflicting threshold admission limits in "
+                    f"routing policy: {policy_name}"
+                )
+            threshold = parsed_threshold
+            idx += 2
+            continue
+
+        if token_lower.startswith("thresh"):
+            raise ValueError(
+                "Invalid threshold admission token "
+                f"{token!r} in routing policy: {policy_name}. "
+                "Use threshK with numeric K, for example thresh32."
+            )
+
+        cleaned_tokens.append(token)
+        idx += 1
+
+    if threshold is not None and threshold < 0:
+        raise ValueError(
+            "Threshold admission limit must be non-negative in "
+            f"routing policy: {policy_name}"
+        )
+    return cleaned_tokens, threshold
+
+
 def _resolve_policy_admission_output_length_mode(
     scheduling_policy: str,
     routing_policy: str,
@@ -6168,6 +6237,8 @@ def build_problems(
     best_effort_max_inflight: int = 0,
     benchmark_decode_length_offset: int = 0,
     strict_pd_separation: bool = False,
+    enable_decode_compaction: bool = False,
+    decode_compaction_interval_s: float = 1.0,
 ):
     scheduling_policy, routing_policy, admission_output_length_mode = (
         _resolve_policy_admission_output_length_mode(
@@ -6197,6 +6268,8 @@ def build_problems(
         benchmark_decode_length_offset
     )
     strict_pd_separation = bool(strict_pd_separation)
+    enable_decode_compaction = bool(enable_decode_compaction)
+    decode_compaction_interval_s = float(decode_compaction_interval_s)
     strict_pd_separation_suffix = _strict_pd_separation_suffix(
         strict_pd_separation
     )
@@ -6321,6 +6394,11 @@ def build_problems(
         f'{benchmark_decode_length_offset}'
     )
     print(f'strict_pd_separation: {strict_pd_separation}')
+    print(
+        'decode_compaction: '
+        f'enabled={enable_decode_compaction}, '
+        f'interval_s={decode_compaction_interval_s}'
+    )
     from SLOsServe.perf_model import PerfModel
     perf_model = PerfModel.get_perf_model(model_name, perf_model_task)
     loaded_perf_model_params = perf_model.describe_hardware_params()
@@ -6388,6 +6466,7 @@ def build_problems(
     ablation_no_global = False
     ablation_no_local = False
     oracle_mem = False
+    threshold_admission_request_limit = None
     scheduling_kwargss = []
     if scheduling_policy == 'vllm':
         scheduling_kwargss.append({
@@ -6639,6 +6718,7 @@ def build_problems(
         # - slosserve_<n_group>[_<n_lb>]
         # - slosserve[_<n_group>[_<n_lb>]]_(disagg|diagg)_<n_prefill_per_group>
         # - any above + _planner suffix (planner path enabled)
+        # - any above + _threshK suffix (request-count admission cap)
         # - any above + _oracle_mem suffix (use per-request decode length for memory bounds)
         # - any above + _ablation_no_global suffix (without any global admission)
         # - any above + _ablation_no_local suffix (ATFC accepts regardless of local feasibility)
@@ -6669,6 +6749,12 @@ def build_problems(
         if 'ablation' in _args:
             ablation_no_global = True
             _args = [x for x in _args if x != 'ablation']
+        _args, threshold_admission_request_limit = (
+            _extract_slosserve_threshold_admission_limit(
+                _args,
+                routing_policy,
+            )
+        )
         disagg_tokens = [tok for tok in ('disagg', 'diagg') if tok in _args]
         if disagg_tokens:
             disagg_idx = min(_args.index(tok) for tok in disagg_tokens)
@@ -6699,6 +6785,10 @@ def build_problems(
                 'use_planner': use_planner,
                 'ablation': ablation_no_global
             }
+            if threshold_admission_request_limit is not None:
+                extra_kwargs['threshold_admission_request_limit'] = (
+                    threshold_admission_request_limit
+                )
         else:
             numeric_fields = _args[1:]
             if len(numeric_fields) >= 1:
@@ -6710,7 +6800,7 @@ def build_problems(
                     f"Too many numeric fields in slosserve routing policy: {routing_policy}"
                 )
 
-        routing_kwargss.append({
+        slosserve_routing_kwargs = {
             "max_decode_length": max_output_length,
             "admission_max_decode_length": admission_output_length,
             "enable_rescheduling": True,
@@ -6726,18 +6816,33 @@ def build_problems(
             'oracle_mem': oracle_mem,
             'ablation': ablation_no_global
             # 'routing_overhead': slo_routing_overhead
-        } | extra_kwargs)
+        } | extra_kwargs
+        if threshold_admission_request_limit is not None:
+            slosserve_routing_kwargs.setdefault(
+                "threshold_admission_request_limit",
+                threshold_admission_request_limit,
+            )
+        routing_kwargss.append(slosserve_routing_kwargs)
 
     if 'atfc' in scheduling_policy:
         for sch_kwargs in scheduling_kwargss:
             sch_kwargs['ablation_no_local'] = ablation_no_local
             sch_kwargs['oracle_mem'] = oracle_mem or ('oracle_mem' in scheduling_policy)
+            if threshold_admission_request_limit is not None:
+                sch_kwargs['threshold_admission_request_limit'] = (
+                    threshold_admission_request_limit
+                )
 
     for routing_kwargs in routing_kwargss:
         if isinstance(routing_kwargs, dict):
             routing_kwargs.setdefault("perf_model_task", perf_model_task)
             routing_kwargs.setdefault("kv_xfer_delay", kv_xfer_delay)
             routing_kwargs.setdefault("perf_model_err", perf_model_err)
+            if enable_decode_compaction:
+                routing_kwargs["enable_decode_compaction"] = True
+                routing_kwargs["decode_compaction_interval_s"] = (
+                    decode_compaction_interval_s
+                )
     
     return [Problem(
         model_name = model_name,
@@ -6791,6 +6896,8 @@ def build_problems(
         ),
         benchmark_decode_length_offset = benchmark_decode_length_offset,
         strict_pd_separation = strict_pd_separation,
+        enable_decode_compaction = enable_decode_compaction,
+        decode_compaction_interval_s = decode_compaction_interval_s,
         frontend_httpx_max_connections = frontend_httpx_max_connections,
         frontend_httpx_max_keepalive_connections = (
             frontend_httpx_max_keepalive_connections
@@ -6862,6 +6969,8 @@ def run(
     best_effort_max_inflight: int = 0,
     benchmark_decode_length_offset: int = 0,
     strict_pd_separation: bool = False,
+    enable_decode_compaction: bool = False,
+    decode_compaction_interval_s: float = 1.0,
     disable_independent_slo_grid_report: bool = False,
     concise_logging: bool = False,
     update_clients: bool = True,
@@ -6873,6 +6982,8 @@ def run(
         benchmark_decode_length_offset
     )
     strict_pd_separation = bool(strict_pd_separation)
+    enable_decode_compaction = bool(enable_decode_compaction)
+    decode_compaction_interval_s = float(decode_compaction_interval_s)
     original_log_level = logger.level
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -6925,6 +7036,11 @@ def run(
         f"{benchmark_decode_length_offset}"
     )
     print(f"strict_pd_separation: {strict_pd_separation}")
+    print(
+        'decode_compaction: '
+        f'enabled={enable_decode_compaction}, '
+        f'interval_s={decode_compaction_interval_s}'
+    )
     print(f"load_scales: {load_scales}")
     print(f"n_devices: {n_devices}")
     print(f"tensor_parallel_size: {tensor_parallel_size}")
@@ -7027,6 +7143,8 @@ def run(
                     r.get('trace_arrival_limit_s'),
                     r.get('benchmark_decode_length_offset', 0),
                     r.get('strict_pd_separation', False),
+                    r.get('enable_decode_compaction', False),
+                    r.get('decode_compaction_interval_s', 1.0),
                     r.get('frontend_httpx_max_connections'),
                     r.get('frontend_httpx_max_keepalive_connections'),
                     r.get('frontend_dedicated_client_per_request', False),
@@ -7105,6 +7223,8 @@ def run(
             trace_arrival_limit_s,
             benchmark_decode_length_offset,
             strict_pd_separation,
+            enable_decode_compaction,
+            decode_compaction_interval_s,
             frontend_httpx_max_connections,
             frontend_httpx_max_keepalive_connections,
             frontend_dedicated_client_per_request,
@@ -7232,6 +7352,10 @@ def run(
                             benchmark_decode_length_offset
                         ),
                         strict_pd_separation=strict_pd_separation,
+                        enable_decode_compaction=enable_decode_compaction,
+                        decode_compaction_interval_s=(
+                            decode_compaction_interval_s
+                        ),
                     )
                 summary_problem = summary_problems[0] if summary_problems else None
                 _print_concise_result_row(
@@ -7326,6 +7450,8 @@ def run(
             best_effort_max_inflight=best_effort_max_inflight,
             benchmark_decode_length_offset=benchmark_decode_length_offset,
             strict_pd_separation=strict_pd_separation,
+            enable_decode_compaction=enable_decode_compaction,
+            decode_compaction_interval_s=decode_compaction_interval_s,
         )
         if not len(problems):
             logger.error(f'No problems found for {load_scale=}, {n_device=}, {scheduling_policy=}, {routing_policy=}, {ttft_slo_scale=}, {slo_tpot}')
@@ -7419,6 +7545,10 @@ def run(
                 problems[0].benchmark_decode_length_offset
             ),
             'strict_pd_separation': problems[0].strict_pd_separation,
+            'enable_decode_compaction': problems[0].enable_decode_compaction,
+            'decode_compaction_interval_s': (
+                problems[0].decode_compaction_interval_s
+            ),
             'enable_session_replay': enable_session_replay,
             'session_pause_s': session_pause_s,
             'trace_arrival_limit_s': trace_arrival_limit_s,
@@ -7899,6 +8029,20 @@ if __name__ == '__main__':
             'decode requests within their assigned group regions'
         ),
     )
+    parser.add_argument(
+        '--enable_decode_compaction',
+        '--enable-decode-compaction',
+        action='store_true',
+        default=False,
+        help='enable router-side decode compaction migration for SLOsServe',
+    )
+    parser.add_argument(
+        '--decode_compaction_interval_s',
+        '--decode-compaction-interval-s',
+        type=float,
+        default=1.0,
+        help='minimum seconds between decode compaction planning attempts',
+    )
     parser.add_argument('--n_devices', type=int, default=[1,2,4,8], nargs='+', help = 'list of logical replicas to run')
     parser.add_argument('--tensor_parallel_size', type=int, default=1, help='number of GPUs per logical replica')
     parser.add_argument('--load_scales', type=float, default=[0.5,1.0,2.0,3.0,4.0], nargs='+', help = 'list of load scales (we rescale the arrival rate by load scale, higher load scale means higher query per second)')
@@ -8220,6 +8364,10 @@ if __name__ == '__main__':
                     args.benchmark_decode_length_offset
                 ),
                 strict_pd_separation = args.strict_pd_separation,
+                enable_decode_compaction = args.enable_decode_compaction,
+                decode_compaction_interval_s = (
+                    args.decode_compaction_interval_s
+                ),
                 disable_independent_slo_grid_report = (
                     args.disable_independent_slo_grid_report
                 ),
@@ -8346,6 +8494,10 @@ if __name__ == '__main__':
                     args.benchmark_decode_length_offset
                 ),
                 'strict_pd_separation': args.strict_pd_separation,
+                'enable_decode_compaction': args.enable_decode_compaction,
+                'decode_compaction_interval_s': (
+                    args.decode_compaction_interval_s
+                ),
                 'disable_independent_slo_grid_report': (
                     args.disable_independent_slo_grid_report
                 ),

@@ -24,6 +24,20 @@ def parse_client_spec(raw_clients: str | None) -> list[str]:
             if end < start:
                 return []
             return [f"r{i}" for i in range(start, end + 1)]
+        if (
+            len(left) > 1
+            and left[0] == "r"
+            and left[1:].isdigit()
+            and (
+                right.isdigit()
+                or (len(right) > 1 and right[0] == "r" and right[1:].isdigit())
+            )
+        ):
+            start = int(left[1:])
+            end = int(right[1:] if right.startswith("r") else right)
+            if end < start:
+                return []
+            return [f"r{i}" for i in range(start, end + 1)]
 
     if ":" in raw_clients and "," not in raw_clients:
         left, right = raw_clients.split(":", 1)

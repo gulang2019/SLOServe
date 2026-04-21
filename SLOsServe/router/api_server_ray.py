@@ -150,11 +150,27 @@ def _coerce_non_negative_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _coerce_non_negative_int(value: Any, default: int = 0) -> int:
     try:
         return max(0, int(value))
     except (TypeError, ValueError):
         return default
+
+
+def _coerce_optional_non_negative_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _format_load_statistics_table(
@@ -216,12 +232,33 @@ def _format_load_statistics_table(
             "kind": "float",
             "agg": "blank",
         },
+        {
+            "label": "recover",
+            "key": "backend_recovery_state",
+            "align": "right",
+            "kind": "int",
+            "agg": "sum",
+        },
+        {
+            "label": "reg",
+            "key": "backend_regular_count",
+            "align": "right",
+            "kind": "int",
+            "agg": "sum",
+        },
+        {
+            "label": "reg_rej",
+            "key": "backend_rejected_regular_count",
+            "align": "right",
+            "kind": "int",
+            "agg": "sum",
+        },
     ]
     if not isinstance(load_statistics, list) or not load_statistics:
         return (
             "dev | wait | run | free | eff_free | oom | arr_oom | post_oom | power_w | avg_power_w | "
             "ctrl_est_ms | ctrl_elap_ms | ctrl_avg_ms | ctrl_last_ms | ctrl_n | "
-            "ctrl_slk_ms\n<empty>"
+            "ctrl_slk_ms | recover | reg | reg_rej\n<empty>"
         )
 
     def _numeric_value(stats: dict[str, Any], key: str, kind: str) -> int | float:
@@ -478,6 +515,73 @@ class WorkerEnergyProfiler:
                 parsed.append(int(token))
         return parsed
 
+    def _energy_telemetry_summary(self) -> dict[str, Any]:
+        meter = self._meter
+        backend = "none"
+        if meter is not None:
+            if getattr(meter, "_nvml", None) is not None:
+                backend = "NVML"
+            elif getattr(meter, "_rocm", None) is not None:
+                backend = "ROCm"
+
+        try:
+            recorder_interval_s = float(self.interval_s)
+        except (TypeError, ValueError):
+            recorder_interval_s = 0.0
+        recorder_sample_hz = (
+            1.0 / recorder_interval_s if recorder_interval_s > 0.0 else 0.0
+        )
+        try:
+            meter_sample_hz = float(getattr(meter, "sample_hz", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            meter_sample_hz = 0.0
+
+        handles = list(getattr(meter, "_handles", []) or [])
+        counter_supported = bool(getattr(meter, "_counter_supported", False))
+        running = bool(getattr(meter, "_running", False))
+        if counter_supported:
+            method = "total_energy_counter"
+            method_sample_hz = recorder_sample_hz
+        elif backend != "none" and handles and running:
+            method = "power_sampling_fallback"
+            method_sample_hz = meter_sample_hz
+        else:
+            method = "disabled"
+            method_sample_hz = 0.0
+
+        return {
+            "backend": backend,
+            "method": method,
+            "method_sample_hz": method_sample_hz,
+            "recorder_interval_s": recorder_interval_s,
+            "recorder_sample_hz": recorder_sample_hz,
+            "meter_sample_hz": meter_sample_hz,
+            "counter_supported": counter_supported,
+            "running": running,
+            "handle_count": len(handles),
+        }
+
+    def _log_energy_telemetry_summary(self) -> None:
+        summary = self._energy_telemetry_summary()
+        logger.info(
+            "Worker energy telemetry selected: device=%s physical_gpus=%s "
+            "backend=%s method=%s method_sample_hz=%.3f "
+            "recorder_sample_hz=%.3f recorder_interval_s=%.3f "
+            "meter_sample_hz=%.3f counter_supported=%s handle_count=%s "
+            "csv_path=%s",
+            self.device_id,
+            self.physical_gpu_ids,
+            summary["backend"],
+            summary["method"],
+            summary["method_sample_hz"],
+            summary["recorder_sample_hz"],
+            summary["recorder_interval_s"],
+            summary["meter_sample_hz"],
+            summary["counter_supported"],
+            summary["handle_count"],
+            self.csv_path,
+        )
+
     def _start(self, csv_path: str | None) -> None:
         self.csv_path = csv_path
         if self.csv_path:
@@ -492,13 +596,14 @@ class WorkerEnergyProfiler:
         )
         self._recorder.start()
         self._started = True
+        self._log_energy_telemetry_summary()
 
     def ensure_live(self) -> None:
         if self._started:
             return
         self._start(None)
         logger.info(
-            "Started worker realtime power sampler for device %s on physical GPUs %s",
+            "Started worker realtime energy profiler for device %s on physical GPUs %s",
             self.device_id,
             self.physical_gpu_ids,
         )
@@ -1177,7 +1282,7 @@ async def stream_service_response_engine(
 async def abort_request(client_idx: int, request_id: str):
     assert engine_actors is not None
     actor = engine_actors[client_idx]
-    await actor.engine_actor.abort.remote(request_id)
+    await actor.engine_actor.abort_request.remote(request_id)
 
 # =========================
 # Router & Request types
@@ -1191,6 +1296,7 @@ class RequestState(Enum):
     DECODE_REJECTED_WAITING = 5
     DECODE_FINISHED = 6
     TIMEOUT = 7
+    MIGRATED = 8
 
     def __lt__(self, other):
         if isinstance(other, RequestState):
@@ -1235,6 +1341,12 @@ class RequestInstance:
         
         self._state: dict[str, Any] = {}
         self.kv_transfer_params: dict[str, Any] | None = None
+        self.is_migration_request = False
+        self.migration_parent = None
+        self.migration_child = None
+        self.migration_in_progress = False
+        self.migration_buffer: list[dict[str, Any]] = []
+        self.migration_committed = False
         
         # Staled Request State
         self.num_computed_tokens = 0
@@ -1328,14 +1440,50 @@ class RequestInstance:
             ) or 0
         )
 
+    def copy_resume_state_from(self, source: 'RequestInstance') -> None:
+        self.generated_token_ids = list(source.generated_token_ids)
+        self.generated_text = source.generated_text
+        self.num_computed_tokens = source.num_computed_tokens
+        self.timestamps = list(source.timestamps)
+
+    def fork_for_decode_migration(self, target_decode_device_id: int):
+        new_request = RequestInstance(
+            request_id=f'{self.request_id}',
+            payload=copy.deepcopy(self.payload),
+            response_queue=self.response_queue,
+            arrival_time=self.arrival_time,
+        )
+        new_request.state = RequestState.PREFILL_FINISHED
+        new_request.prefill_device_id = self.prefill_device_id
+        new_request.decode_device_id = target_decode_device_id
+        new_request.admission_stat = (
+            copy.deepcopy(self.admission_stat)
+            if self.admission_stat is not None else None
+        )
+        new_request.rejection_prob = self.rejection_prob
+        new_request.kv_transfer_params = None
+        new_request.payload.pop("kv_transfer_params", None)
+        new_request.payload.setdefault("vllm_xargs", {}).pop(
+            "kv_transfer_params",
+            None,
+        )
+        new_request.copy_resume_state_from(self)
+        new_request.is_migration_request = True
+        new_request.migration_parent = self
+        return new_request
+
     
     @property
     def is_slo_violation(self):
-        input_length = int(self.payload['vllm_xargs']['input_length'])
-        prefill_ddl = float(self.payload['vllm_xargs']['prefill_ddl'])
-        slo_tpot = float(self.payload['vllm_xargs']['slo_tpot'])
-        output_length = int(self.payload['vllm_xargs']['output_length'])
-        expected_timestamps = [(input_length, prefill_ddl)]
+        return self.get_slo_violation_snapshot(now=float("inf")) is not None
+
+    def _expected_slo_timestamps(self) -> list[tuple[int, float, str]]:
+        extra_args = self.payload['vllm_xargs']
+        input_length = int(extra_args['input_length'])
+        prefill_ddl = float(extra_args['prefill_ddl'])
+        slo_tpot = float(extra_args['slo_tpot'])
+        output_length = int(extra_args['output_length'])
+        expected_timestamps = [(input_length, prefill_ddl, "ttft")]
         if self.thinking_length > 0:
             offsets = range(self.thinking_length, self.thinking_length + output_length)
         else:
@@ -1344,17 +1492,57 @@ class RequestInstance:
             expected_timestamps.append((
                 input_length + offset,
                 prefill_ddl + offset * slo_tpot,
+                "tpot",
             ))
+        return expected_timestamps
+
+    def get_slo_violation_snapshot(
+        self,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Return details for the first SLO deadline this request has missed."""
+        if now is None:
+            now = time.time()
         idx = 0
-        for n_token, t in expected_timestamps:
-            while idx < len(self.timestamps) and self.timestamps[idx][0] < n_token: 
+        for n_token, deadline, violation in self._expected_slo_timestamps():
+            while idx < len(self.timestamps) and self.timestamps[idx][0] < n_token:
                 idx += 1
-            if idx == len(self.timestamps):
-                # violation
-                return True 
-            if self.timestamps[idx][1] > t:
-                return True 
-        return False 
+            if idx < len(self.timestamps):
+                observed_tokens, observed_time = self.timestamps[idx]
+                if observed_time > deadline:
+                    return {
+                        "violation": violation,
+                        "request_id": self.request_id,
+                        "state": self.state.name,
+                        "service_tier": self.service_tier,
+                        "initial_service_tier": self.initial_service_tier,
+                        "expected_num_computed_tokens": n_token,
+                        "num_computed_tokens": max(
+                            int(self.num_computed_tokens),
+                            int(observed_tokens),
+                        ),
+                        "deadline": deadline,
+                        "observed_timestamp": observed_time,
+                        "now": now,
+                        "lateness_s": observed_time - deadline,
+                    }
+                continue
+            if now > deadline:
+                return {
+                    "violation": violation,
+                    "request_id": self.request_id,
+                    "state": self.state.name,
+                    "service_tier": self.service_tier,
+                    "initial_service_tier": self.initial_service_tier,
+                    "expected_num_computed_tokens": n_token,
+                    "num_computed_tokens": int(self.num_computed_tokens),
+                    "deadline": deadline,
+                    "observed_timestamp": None,
+                    "now": now,
+                    "lateness_s": now - deadline,
+                }
+            return None
+        return None
                  
 
     def fork(self):
@@ -1368,7 +1556,13 @@ class RequestInstance:
         return new_request
             
     def is_finished(self):
-        return self.state in [RequestState.DECODE_FINISHED, RequestState.TIMEOUT, RequestState.PREFILL_REJECTED, RequestState.DECODE_REJECTED]
+        return self.state in [
+            RequestState.DECODE_FINISHED,
+            RequestState.TIMEOUT,
+            RequestState.PREFILL_REJECTED,
+            RequestState.DECODE_REJECTED,
+            RequestState.MIGRATED,
+        ]
 
     def update_state(self, key: str, value: Any):
         self._state[key] = value
@@ -2350,12 +2544,28 @@ class SLOsServeRouter(Router):
         self.n_lb = router_kwargs.get('n_lb', 1)
         self.use_planner = router_kwargs.get('use_planner', False)
         self.ablation = router_kwargs.get('ablation', False)
+        self.threshold_admission_request_limit = (
+            _coerce_optional_non_negative_int(
+                router_kwargs.get("threshold_admission_request_limit")
+            )
+        )
         self.oracle_mem = router_kwargs.get('oracle_mem', router_kwargs.get('is_oracle', False))
+        self.enable_decode_compaction = bool(
+            router_kwargs.get("enable_decode_compaction", False)
+        )
+        self.decode_compaction_interval_s = float(
+            router_kwargs.get("decode_compaction_interval_s", 1.0)
+        )
+        self._last_decode_compaction_ts = 0.0
+        self._decode_migration_plan: dict[str, int] = {}
         assert self.group_size >= 1
         assert self.n_devices % self.group_size == 0 
         self.n_group = self.n_devices // self.group_size
         assert self.n_lb >= 1 and self.n_lb <= self.group_size
         self.is_pd_disagg = router_kwargs.get('is_pd_disagg', False)
+        self.strict_pd_separation = bool(
+            router_kwargs.get('strict_pd_separation', False)
+        )
         assert not self.is_pd_disagg or router_kwargs.get('enable_rerouting', False) == True 
         self.n_prefill_or_mixed_per_group = self.group_size
         if self.is_pd_disagg:
@@ -2423,6 +2633,9 @@ class SLOsServeRouter(Router):
             f'SLOServeRouter: n_group: {self.n_group}, n_lb: {self.n_lb}, '
             f'group_size: {self.group_size}, n_prefill_or_mixed: {self.n_prefill_or_mixed_per_group}, '
             f'use_planner: {self.use_planner}, ablation: {self.ablation}, oracle_mem: {self.oracle_mem}, '
+            f'threshold_admission_request_limit: {self.threshold_admission_request_limit}, '
+            f'strict_pd_separation: {self.strict_pd_separation}, '
+            f'enable_decode_compaction: {self.enable_decode_compaction}, '
             f'max_decode_length: {self.max_decode_length}, admission_max_decode_length: {self.admission_max_decode_length}, '
             f'perf_model_err: {self.perf_model_err}, hardware_params: {self.hardware_params}, '
             f'scheduling_overhead: {router_kwargs["scheduling_overhead"]}, '
@@ -2438,6 +2651,11 @@ class SLOsServeRouter(Router):
         raw_engine_states: dict[int, dict[str, Any]] | None,
     ) -> None:
         self._prefetched_raw_engine_states = raw_engine_states
+
+    def consume_decode_migration_plan(self) -> dict[str, int]:
+        plan = dict(getattr(self, "_decode_migration_plan", {}))
+        self._decode_migration_plan = {}
+        return plan
 
     def get_required_history_window_s(self) -> float:
         return self.router_safety_margin_window_s
@@ -2620,6 +2838,86 @@ class SLOsServeRouter(Router):
         if home_prefill_device != did:
             return 0
         return cached_tokens
+
+    def _uses_threshold_admission(self) -> bool:
+        return self.threshold_admission_request_limit is not None
+
+    def _threshold_applies_to_device_requests(
+        self,
+        running_requests: List[RequestInstance],
+        waiting_requests: List[RequestInstance],
+        mode: str,
+    ) -> bool:
+        if not self._uses_threshold_admission() or mode != "decode_only":
+            return False
+        requests = [
+            req for req in (list(running_requests) + list(waiting_requests))
+            if not req.is_finished()
+        ]
+        return bool(requests) and all(req.is_decode for req in requests)
+
+    def _threshold_counts_request(self, request: RequestInstance) -> bool:
+        return request.service_tier != "best_effort" and not request.is_finished()
+
+    def _run_threshold_admission(
+        self,
+        did: int,
+        running_requests: List[RequestInstance],
+        waiting_requests: List[RequestInstance],
+        mode: str,
+    ) -> List[RequestInstance] | None:
+        if not self._threshold_applies_to_device_requests(
+            running_requests,
+            waiting_requests,
+            mode,
+        ):
+            return None
+
+        limit = int(self.threshold_admission_request_limit or 0)
+        active_count = sum(
+            1 for req in running_requests
+            if self._threshold_counts_request(req)
+        )
+        remaining_regular_slots = max(0, limit - active_count)
+        accepted_ids: list[str] = []
+        remained_waiting_requests: list[RequestInstance] = []
+
+        for req in waiting_requests:
+            if req.admitted:
+                remained_waiting_requests.append(req)
+                continue
+
+            counts_against_threshold = self._threshold_counts_request(req)
+            if counts_against_threshold and remaining_regular_slots <= 0:
+                remained_waiting_requests.append(req)
+                continue
+
+            if mode in ('normal', 'prefill_only'):
+                req.prefill_device_id = did
+            if mode in ('normal', 'decode_only', 'decode_migration'):
+                req.decode_device_id = did
+            req.admitted = True
+            running_requests.append(req)
+            accepted_ids.append(req.request_id)
+            if counts_against_threshold:
+                remaining_regular_slots -= 1
+
+        if DUMP_ADM and hasattr(self, '_profile_events'):
+            self._profile_events.append({
+                'event_type': 'global_admission',
+                'device_id': did,
+                'timestamp': time.time(),
+                'extra_args': {
+                    'mode': mode,
+                    'policy': 'threshold',
+                    'threshold_admission_request_limit': limit,
+                    'active_count_before': active_count,
+                    'accepted_ids': accepted_ids,
+                    'rejected_count': len(remained_waiting_requests),
+                },
+            })
+
+        return remained_waiting_requests
     
     def _run_pre_adm_planner(
         self, 
@@ -2638,12 +2936,21 @@ class SLOsServeRouter(Router):
         t_start = time.perf_counter()
         if not len(waiting_requests):
             return []
+
+        threshold_result = self._run_threshold_admission(
+            did,
+            running_requests=running_requests,
+            waiting_requests=waiting_requests,
+            mode=mode,
+        )
+        if threshold_result is not None:
+            return threshold_result
         
         if self.ablation:
             for req in waiting_requests:
                 if mode in ('normal', 'prefill_only'):
                     req.prefill_device_id = did
-                if mode in ('normal', 'decode_only'):
+                if mode in ('normal', 'decode_only', 'decode_migration'):
                     req.decode_device_id = did
                 req.admitted = True
                 running_requests.append(req)
@@ -2673,15 +2980,29 @@ class SLOsServeRouter(Router):
                 continue
             prefill_ddl, input_length, profit, prefill_mem, _ = self.get_req_data(req)
             if mode == 'prefill_only': prefill_ddl -= self.kv_xfer_delay
-            if mode == 'decode_only':
+            if mode == 'decode_migration':
+                input_length = req.num_prompt_tokens + req.num_generated_tokens
+                prefill_mem = math.ceil(input_length / self.block_size)
+                num_computed = 0
+                decode_length_ub = req.remaining_output_tokens
+                slo_tpot = float(
+                    req.payload.get('vllm_xargs', {}).get('slo_tpot', self.tpot)
+                )
+                prefill_ddl = prefill_ddl + (
+                    max(req.num_generated_tokens, 0) + 1
+                ) * slo_tpot
+            elif mode == 'decode_only':
                 num_computed = req.num_prompt_tokens
+                decode_length_ub = self._get_decode_length_ub(req)
             else:
                 num_computed = max(
                     self._effective_cached_tokens(req, did, mode),
                     req.num_computed_tokens if req.num_generated_tokens > 0 else 0,
                 )
-            decode_length_ub = self._get_decode_length_ub(req)
+                decode_length_ub = self._get_decode_length_ub(req)
             remaining_prompt_tokens = max(req.num_prompt_tokens - num_computed, 0)
+            if mode == 'decode_migration':
+                remaining_prompt_tokens = input_length
             n_block_ub = math.ceil((remaining_prompt_tokens + decode_length_ub) / self.block_size)
             c_reqs.append(
                 SLOsServe_C.Request(
@@ -2791,7 +3112,7 @@ class SLOsServeRouter(Router):
             if req.request_id in accepted_set:
                 if mode in ('normal', 'prefill_only'):
                     req.prefill_device_id = did
-                if mode in ('normal', 'decode_only'):
+                if mode in ('normal', 'decode_only', 'decode_migration'):
                     req.decode_device_id = did
                 req.admitted = True
                 running_requests.append(req)
@@ -2962,14 +3283,165 @@ class SLOsServeRouter(Router):
                 _compute_engine_state(exec_plan, engine_state)
         return engine_states
 
+    def _route_decode_requests_with_planner(
+        self,
+        *,
+        group_end: int,
+        decode_start: int,
+        waiting_decode_requests: list[list[RequestInstance]],
+        running_requests_by_device: list[list[RequestInstance]],
+        engine_states: dict[int, EngineState],
+        mode: str = "decode_only",
+    ) -> set[int]:
+        touched_decode_devices: set[int] = set()
+        for did in range(group_end - 1, decode_start - 1, -1):
+            waiting_before = {
+                id(req)
+                for req in waiting_decode_requests[did]
+                if (
+                    req.admitted is None
+                    and not getattr(req, "is_migration_request", False)
+                )
+            }
+            remained_waiting_requests = self._run_pre_adm_planner(
+                did,
+                running_requests=running_requests_by_device[did],
+                waiting_requests=waiting_decode_requests[did],
+                engine_state=engine_states.get(did, None),
+                mode=mode,
+            )
+            remained_ids = {id(req) for req in remained_waiting_requests}
+            if waiting_before - remained_ids:
+                touched_decode_devices.add(did)
+            if did > decode_start:
+                waiting_decode_requests[did - 1].extend(
+                    remained_waiting_requests
+                )
+        return touched_decode_devices
+
+    def _maybe_plan_decode_compaction_for_group(
+        self,
+        *,
+        group_start: int,
+        group_end: int,
+        running_requests_by_device: list[list[RequestInstance]],
+        engine_states: dict[int, EngineState],
+        real_decode_touched_devices: set[int],
+    ) -> None:
+        if (
+            not getattr(self, "enable_decode_compaction", False)
+            or not self.is_pd_disagg
+            or not getattr(self, "use_planner", False)
+        ):
+            return
+        now = time.time()
+        if (
+            now - getattr(self, "_last_decode_compaction_ts", 0.0)
+            < getattr(self, "decode_compaction_interval_s", 1.0)
+        ):
+            return
+
+        active_decode_dids: list[int] = []
+        for did in range(group_start, group_end):
+            if any(
+                req.is_decode
+                and not getattr(req, "is_migration_request", False)
+                and not req.is_finished()
+                for req in running_requests_by_device[did]
+            ):
+                active_decode_dids.append(did)
+        if not active_decode_dids:
+            return
+
+        current_lowest_decode_did = min(active_decode_dids)
+        touched_above = sorted(
+            did for did in real_decode_touched_devices
+            if did > current_lowest_decode_did
+        )
+        if (
+            current_lowest_decode_did in real_decode_touched_devices
+            or not touched_above
+        ):
+            return
+
+        target_decode_start = touched_above[0]
+        source_requests = [
+            req for req in running_requests_by_device[current_lowest_decode_did]
+            if (
+                req.is_decode
+                and req.decode_device_id == current_lowest_decode_did
+                and not getattr(req, "is_migration_request", False)
+                and req.migration_child is None
+                and not req.migration_in_progress
+                and not req.is_finished()
+                and req.remaining_output_tokens > 0
+            )
+        ]
+        if not source_requests:
+            return
+
+        migration_waiting = [[] for _ in range(self.n_devices)]
+        migration_shadows: list[RequestInstance] = []
+        for parent in source_requests:
+            shadow = parent.fork_for_decode_migration(-1)
+            migration_shadows.append(shadow)
+            migration_waiting[group_end - 1].append(shadow)
+
+        dry_running_by_device = [
+            list(requests) for requests in running_requests_by_device
+        ]
+        self._route_decode_requests_with_planner(
+            group_end=group_end,
+            decode_start=target_decode_start,
+            waiting_decode_requests=migration_waiting,
+            running_requests_by_device=dry_running_by_device,
+            engine_states=engine_states,
+            mode="decode_migration",
+        )
+
+        accepted_shadows = [
+            shadow for shadow in migration_shadows
+            if shadow.admitted and shadow.decode_device_id >= target_decode_start
+        ]
+        if len(accepted_shadows) != len(migration_shadows):
+            return
+
+        for shadow in accepted_shadows:
+            parent = shadow.migration_parent
+            if parent is not None:
+                self._decode_migration_plan[parent.request_id] = (
+                    shadow.decode_device_id
+                )
+        self._last_decode_compaction_ts = now
+        if hasattr(self, "_profile_events"):
+            self._profile_events.append({
+                "event_type": "decode_migration_plan",
+                "timestamp": time.time(),
+                "device_id": -1,
+                "source_decode_device_id": current_lowest_decode_did,
+                "target_decode_start": target_decode_start,
+                "n_requests": len(accepted_shadows),
+                "request_targets": {
+                    shadow.request_id: shadow.decode_device_id
+                    for shadow in accepted_shadows
+                },
+            })
+
     def run_with_planner(self, waiting_requests: List[RequestInstance],
             running_requests: List[RequestInstance]):
         # logger.info(f'exec_plans: {exec_plans}')
         # logger.info(f'fetch exec plans takes {elapsed_fetch_exec_plan}s')
+        if not hasattr(self, "_decode_migration_plan"):
+            self._decode_migration_plan = {}
+        else:
+            self._decode_migration_plan.clear()
 
         raw_engine_states = self._prefetched_raw_engine_states
         self._prefetched_raw_engine_states = None
         engine_states = self.get_engine_states(raw_engine_states)
+        strict_pd_separation = bool(
+            self.is_pd_disagg and getattr(self, "strict_pd_separation", False)
+        )
         if DUMP_ADM and hasattr(self, '_profile_events'):
             self._profile_events.append({
                 'event_type': 'engine_states',
@@ -3010,40 +3482,82 @@ class SLOsServeRouter(Router):
                             self.lb_indices_per_group[self.group_idx] + 1
                         ) % self.n_lb
                         self.group_idx = (self.group_idx + 1) % self.n_group
-                elif (req.prefill_device_id + 1) % self.group_size: 
-                    did = req.prefill_device_id + 1
                 else:
-                    # begin the next cycle
-                    did = req.prefill_device_id // self.group_size * self.group_size
-                # if did is not None: 
-                waiting_prefill_or_normal_requests[did].append(req)
+                    group_start = (
+                        req.prefill_device_id // self.group_size
+                    ) * self.group_size
+                    next_did = req.prefill_device_id + 1
+                    if (
+                        strict_pd_separation
+                        and next_did
+                        >= group_start + self.n_prefill_or_mixed_per_group
+                    ):
+                        did = None
+                    elif next_did % self.group_size:
+                        did = next_did
+                    else:
+                        # begin the next cycle
+                        did = group_start
+                if did is not None:
+                    waiting_prefill_or_normal_requests[did].append(req)
             else:
                 assert req.prefill_device_id >= 0
                 if req.decode_device_id == -1:
                     # Keep decode in the same group (node) as prefill to avoid cross-node traffic.
                     did = (req.prefill_device_id // self.group_size) * self.group_size + self.group_size - 1
-                elif req.decode_device_id % self.group_size:
-                    did = req.decode_device_id - 1 
                 else:
-                    # begin the next cycle
-                    did = req.decode_device_id + self.group_size - 1
+                    decode_group_start = (
+                        req.decode_device_id // self.group_size
+                    ) * self.group_size
+                    local_decode_idx = req.decode_device_id - decode_group_start
+                    if strict_pd_separation:
+                        lowest_decode_idx = self.n_prefill_or_mixed_per_group
+                        if local_decode_idx > lowest_decode_idx:
+                            did = req.decode_device_id - 1
+                        else:
+                            # begin the next decode-only cycle
+                            did = decode_group_start + self.group_size - 1
+                    elif req.decode_device_id % self.group_size:
+                        did = req.decode_device_id - 1
+                    else:
+                        # begin the next cycle
+                        did = req.decode_device_id + self.group_size - 1
                 # if did is not None: 
                 waiting_decode_requests[did].append(req)
         
         for group_i in range(self.n_group):
+            group_start = self.group_size * group_i
+            group_end = self.group_size * (group_i + 1)
+            prefill_end = (
+                group_start + self.n_prefill_or_mixed_per_group
+                if strict_pd_separation
+                else group_end
+            )
+            decode_start = (
+                group_start + self.n_prefill_or_mixed_per_group
+                if strict_pd_separation
+                else group_start
+            )
             if self.is_pd_disagg:
-                for did in range(self.group_size * (group_i + 1) - 1, self.group_size * group_i - 1, -1):
-                    remained_waiting_requests = self._run_pre_adm_planner(
-                        did,
-                        running_requests=running_requests_by_device[did],
-                        waiting_requests= waiting_decode_requests[did],
-                        engine_state=engine_states.get(did, None),
-                        mode = 'decode_only'
+                real_decode_touched_devices = (
+                    self._route_decode_requests_with_planner(
+                        group_end=group_end,
+                        decode_start=decode_start,
+                        waiting_decode_requests=waiting_decode_requests,
+                        running_requests_by_device=running_requests_by_device,
+                        engine_states=engine_states,
+                        mode="decode_only",
                     )
-                    if did != self.group_size * group_i:
-                        waiting_decode_requests[did - 1].extend(remained_waiting_requests)
+                )
+                self._maybe_plan_decode_compaction_for_group(
+                    group_start=group_start,
+                    group_end=group_end,
+                    running_requests_by_device=running_requests_by_device,
+                    engine_states=engine_states,
+                    real_decode_touched_devices=real_decode_touched_devices,
+                )
             
-            for did in range(self.group_size * group_i, self.group_size * (group_i + 1)):
+            for did in range(group_start, prefill_end):
                 waiting_requests = waiting_prefill_or_normal_requests[did]
                 if not len(waiting_requests):
                     continue
@@ -3054,7 +3568,7 @@ class SLOsServeRouter(Router):
                     engine_state=engine_states.get(did, None),
                     mode = 'normal' if not self.is_pd_disagg else 'prefill_only'
                 )
-                if (did + 1) != (self.group_size * (group_i + 1)):
+                if (did + 1) < prefill_end:
                     waiting_prefill_or_normal_requests[did + 1].extend(remained_waiting_requests)
             
 
@@ -3627,6 +4141,7 @@ class RequestPool:
         self.kv_xfer_delay = 0.05
         self.maximum_ingress = 20 
         self.sem = MaxCapSemaphore(self.maximum_ingress)
+        self._backend_recovery_state_by_device: dict[int, bool] = {}
         self._refresh_load_stat_window()
 
     
@@ -3734,6 +4249,7 @@ class RequestPool:
         self._refresh_load_stat_window()
         self.admission_history: list[dict[str, Any]] = []
         self.routing_overhead = -1.0
+        self._backend_recovery_state_by_device = {}
         if execplan_bus_actor is not None:
             execplan_bus_actor.reset.remote()
 
@@ -3835,6 +4351,176 @@ class RequestPool:
             "decode_device_id": decode_device_id,
             "device_id": -1,
         })
+
+    def _enqueue_decode_migrations(self, plan: dict[str, int]) -> None:
+        if not plan:
+            return
+        parents_by_id = {
+            request.request_id: request
+            for request in self.running_pool
+            if (
+                request.is_decode
+                and not getattr(request, "is_migration_request", False)
+                and not request.is_finished()
+            )
+        }
+        for request_id, target_decode_device_id in plan.items():
+            parent = parents_by_id.get(request_id)
+            if parent is None or parent.migration_child is not None:
+                continue
+            if parent.decode_device_id == target_decode_device_id:
+                continue
+            parent.migration_in_progress = True
+            parent.migration_committed = False
+            parent.migration_buffer.clear()
+            child = parent.fork_for_decode_migration(int(target_decode_device_id))
+            child.admitted = True
+            parent.migration_child = child
+            self.waiting_pool.append(child)
+            self._profile_events.append({
+                "event_type": "decode_migration_start",
+                "timestamp": time.time(),
+                "device_id": -1,
+                "request_id": request_id,
+                "prefill_device_id": parent.prefill_device_id,
+                "source_decode_device_id": parent.decode_device_id,
+                "target_decode_device_id": child.decode_device_id,
+                "num_generated_tokens": parent.num_generated_tokens,
+                "num_computed_tokens": parent.num_computed_tokens,
+            })
+
+    async def _rollback_decode_migration(
+        self,
+        child: RequestInstance,
+        reason: str | None = None,
+    ) -> None:
+        parent = child.migration_parent
+        if parent is None:
+            return
+        if parent.migration_child is child:
+            parent.migration_child = None
+        parent.migration_in_progress = False
+        parent.migration_committed = False
+        for buffered in parent.migration_buffer:
+            await parent.response_queue.put(buffered)
+        n_buffered = len(parent.migration_buffer)
+        parent.migration_buffer.clear()
+        child.migration_parent = None
+        self._profile_events.append({
+            "event_type": "decode_migration_rollback",
+            "timestamp": time.time(),
+            "device_id": -1,
+            "request_id": child.request_id,
+            "prefill_device_id": child.prefill_device_id,
+            "source_decode_device_id": parent.decode_device_id,
+            "target_decode_device_id": child.decode_device_id,
+            "n_buffered_chunks": n_buffered,
+            "reason": reason,
+        })
+
+    async def _finish_pending_decode_migration_parent(
+        self,
+        parent: RequestInstance,
+    ) -> None:
+        if not parent.migration_in_progress:
+            return
+        child = parent.migration_child
+        parent.migration_in_progress = False
+        parent.migration_committed = False
+        parent.migration_child = None
+        for buffered in parent.migration_buffer:
+            await parent.response_queue.put(buffered)
+        n_buffered = len(parent.migration_buffer)
+        parent.migration_buffer.clear()
+        if child is not None:
+            child.migration_parent = None
+        self._profile_events.append({
+            "event_type": "decode_migration_rollback",
+            "timestamp": time.time(),
+            "device_id": -1,
+            "request_id": parent.request_id,
+            "prefill_device_id": parent.prefill_device_id,
+            "source_decode_device_id": parent.decode_device_id,
+            "target_decode_device_id": (
+                child.decode_device_id if child is not None else -1
+            ),
+            "n_buffered_chunks": n_buffered,
+            "reason": "parent_finished_before_child_commit",
+        })
+
+    def _migration_parent_is_active(self, child: RequestInstance) -> bool:
+        parent = child.migration_parent
+        return bool(
+            parent is not None
+            and parent.migration_child is child
+            and parent.migration_in_progress
+            and not parent.is_finished()
+        )
+
+    def _record_silent_decode_finish(
+        self,
+        request: RequestInstance,
+        *,
+        is_rejection: bool = False,
+        rejection_reason: str | None = None,
+    ) -> None:
+        if request.decode_device_id < 0:
+            return
+        if is_rejection:
+            self.load_stat.add_event({
+                'type': 'reject',
+                'timestamp': time.time(),
+                'device_id': request.decode_device_id,
+                'request_id': request.request_id,
+                'service_tier': request.service_tier,
+                'rejection_reason': rejection_reason,
+            })
+            return
+        self.load_stat.add_event({
+            'type': 'finish',
+            'timestamp': time.time(),
+            'device_id': request.decode_device_id,
+            'request_id': request.request_id,
+            'is_rejection': False,
+            'is_slo_violation': request.is_slo_violation,
+            'service_tier': request.service_tier,
+        })
+
+    async def _commit_decode_migration(self, child: RequestInstance) -> bool:
+        parent = child.migration_parent
+        if not self._migration_parent_is_active(child):
+            return False
+        assert parent is not None
+        parent.migration_committed = True
+        parent.migration_in_progress = False
+        parent.migration_buffer.clear()
+        self._record_silent_decode_finish(parent)
+        self.update_req_state(parent, RequestState.MIGRATED)
+        await abort_request(parent.decode_device_id, parent.request_id)
+        self._profile_events.append({
+            "event_type": "decode_migration_commit",
+            "timestamp": time.time(),
+            "device_id": -1,
+            "request_id": child.request_id,
+            "prefill_device_id": child.prefill_device_id,
+            "source_decode_device_id": parent.decode_device_id,
+            "target_decode_device_id": child.decode_device_id,
+            "num_generated_tokens": child.num_generated_tokens,
+            "num_computed_tokens": child.num_computed_tokens,
+        })
+        return True
+
+    async def _abort_stale_migration_child(
+        self,
+        child: RequestInstance,
+        generator: AsyncGenerator | None = None,
+    ) -> None:
+        if generator is not None:
+            await abort_request(child.decode_device_id, child.request_id)
+            async for _ in generator:
+                pass
+        self._record_silent_decode_finish(child)
+        self.update_req_state(child, RequestState.MIGRATED)
 
     async def _emit_request_error(self, request: RequestInstance, reason: str, exc: Exception | None = None):
         error_type = type(exc).__name__ if exc is not None else "RuntimeError"
@@ -4142,12 +4828,97 @@ class RequestPool:
             if request.service_tier != 'best_effort'
         ]
 
+    def _log_backend_recovery_states(
+        self,
+        load_statistics: list[dict[str, Any]] | None,
+        now: float | None = None,
+    ) -> None:
+        if now is None:
+            now = time.time()
+        if not hasattr(self, "_backend_recovery_state_by_device"):
+            self._backend_recovery_state_by_device = {}
+        if not isinstance(load_statistics, list):
+            return
+        for device_id, stats in enumerate(load_statistics[:self.n_devices]):
+            if not isinstance(stats, dict):
+                continue
+            checked = _coerce_non_negative_int(
+                stats.get("backend_admission_checked", 0)
+            )
+            recovery = bool(
+                checked
+                and _coerce_non_negative_int(
+                    stats.get("backend_recovery_state", 0)
+                )
+            )
+            was_recovery = self._backend_recovery_state_by_device.get(
+                device_id,
+                False,
+            )
+            if recovery == was_recovery:
+                continue
+            self._backend_recovery_state_by_device[device_id] = recovery
+            regular_count = _coerce_non_negative_int(
+                stats.get("backend_regular_count", 0)
+            )
+            accepted_count = _coerce_non_negative_int(
+                stats.get("backend_accepted_regular_count", 0)
+            )
+            rejected_count = _coerce_non_negative_int(
+                stats.get("backend_rejected_regular_count", 0)
+            )
+            earliest_laxity_ms = _coerce_float(
+                stats.get("backend_earliest_deadline_laxity_ms", 0.0)
+            )
+            event = {
+                "event_type": (
+                    "backend_recovery_start"
+                    if recovery else
+                    "backend_recovery_end"
+                ),
+                "timestamp": now,
+                "device_id": device_id,
+                "extra_args": {
+                    "backend_admission_checked": checked,
+                    "backend_recovery_state": int(recovery),
+                    "backend_regular_feasible": _coerce_non_negative_int(
+                        stats.get("backend_regular_feasible", 1)
+                    ),
+                    "backend_regular_count": regular_count,
+                    "backend_accepted_regular_count": accepted_count,
+                    "backend_rejected_regular_count": rejected_count,
+                    "backend_earliest_deadline_laxity_ms": earliest_laxity_ms,
+                },
+            }
+            self._profile_events.append(event)
+            if recovery:
+                logger.warning(
+                    "Backend admission entered recovery: device=%s "
+                    "regular=%s accepted=%s rejected=%s "
+                    "earliest_deadline_laxity_ms=%.3f",
+                    device_id,
+                    regular_count,
+                    accepted_count,
+                    rejected_count,
+                    earliest_laxity_ms,
+                )
+            else:
+                logger.info(
+                    "Backend admission left recovery: device=%s "
+                    "regular=%s accepted=%s rejected=%s",
+                    device_id,
+                    regular_count,
+                    accepted_count,
+                    rejected_count,
+                )
+
     async def routing_loop(self):
         next_load_statistics_time = time.time()
         next_auto_scaling_time = time.time()
         get_load_statistics_task = None 
         load_statistics = await self.get_load_statistics()
         self.load_stat.update(load_statistics)
+        self._log_backend_recovery_states(load_statistics, now=time.time())
         await self._get_power_statistics()
         routing_iter = 0
         last_report_at = time.time() - 10.0
@@ -4192,6 +4963,15 @@ class RequestPool:
                     )
                 if best_effort_waiting_requests:
                     self._route_best_effort_requests(best_effort_waiting_requests)
+                consume_decode_migration_plan = getattr(
+                    self.router,
+                    "consume_decode_migration_plan",
+                    None,
+                )
+                if callable(consume_decode_migration_plan):
+                    self._enqueue_decode_migrations(
+                        consume_decode_migration_plan()
+                    )
             routing_elapsed = time.time() - it_start_time
             now = time.time()
             margin_adjustment = self._observe_router_rejection_feedback(now=now)
@@ -4275,6 +5055,10 @@ class RequestPool:
                 load_statistics = get_load_statistics_task.result()
                 get_load_statistics_task = None
                 self.load_stat.update(load_statistics)
+                self._log_backend_recovery_states(
+                    load_statistics,
+                    now=time.time(),
+                )
             
             to_get_stats = time.time() - it_start_time
                 
@@ -4445,7 +5229,8 @@ class RequestPool:
                 if request.state in [RequestState.PREFILL_REJECTED,
                                      RequestState.DECODE_REJECTED,
                                      RequestState.DECODE_FINISHED,
-                                     RequestState.TIMEOUT]:
+                                     RequestState.TIMEOUT,
+                                     RequestState.MIGRATED]:
                     finished_requests.append(request)
 
             self.changed_requests.clear()
@@ -4714,6 +5499,15 @@ class RequestPool:
         is_rejected = False
         attempted_prefill_device_id = request.prefill_device_id
         attempted_decode_device_id = request.decode_device_id
+        if request.is_migration_request:
+            if not self._migration_parent_is_active(request):
+                self._record_silent_decode_finish(request)
+                self.update_req_state(request, RequestState.MIGRATED)
+                return
+            assert request.migration_parent is not None
+            request.copy_resume_state_from(request.migration_parent)
+            request.kv_transfer_params = None
+            request.payload.pop("kv_transfer_params", None)
         request.sync_resume_state()
         admitted, generator, rejection_reason = await stream_service_response_engine(
             request.decode_device_id,
@@ -4721,6 +5515,18 @@ class RequestPool:
             request_id=request.request_id,
         )
         if not admitted: 
+            if request.is_migration_request:
+                await self._rollback_decode_migration(
+                    request,
+                    rejection_reason,
+                )
+                self._record_silent_decode_finish(
+                    request,
+                    is_rejection=True,
+                    rejection_reason=rejection_reason,
+                )
+                self.update_req_state(request, RequestState.MIGRATED)
+                return
             request.rejection_reason = rejection_reason
             logger.debug(f"Request {request.request_id} was rejected at decode stage")
             is_rejected = True
@@ -4751,6 +5557,15 @@ class RequestPool:
                 )
                 await request.response_queue.put(None)
             return 
+
+        if request.is_migration_request:
+            if not await self._commit_decode_migration(request):
+                await self._rollback_decode_migration(
+                    request,
+                    "migration_parent_inactive_after_child_admission",
+                )
+                await self._abort_stale_migration_child(request, generator)
+                return
             
         stream_rejection_reason: str | None = None
         async for data in generator:
@@ -4763,8 +5578,20 @@ class RequestPool:
                     stream_rejection_reason,
                 ):
                     continue
+            if request.migration_committed:
+                continue
+            if request.migration_in_progress:
+                request.migration_buffer.append(data)
+                continue
             if not is_rejected or _is_rejection_payload(data):
                 await request.response_queue.put(data)
+
+        if request.migration_committed:
+            if request.state != RequestState.MIGRATED:
+                self.update_req_state(request, RequestState.MIGRATED)
+            return
+        if request.migration_in_progress and not request.is_migration_request:
+            await self._finish_pending_decode_migration_parent(request)
 
         if stream_rejection_reason is not None:
             self.load_stat.add_event({

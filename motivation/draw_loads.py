@@ -1,16 +1,35 @@
 import argparse
 import math
 import os
+import sys
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import ticker
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from Dataset.dataset import ArrivalTimes, Requests
 from SLOsServe.perf_model import PerfModel, get_easy_name
 
 FIGDIR = "figs/loads"
 os.makedirs(FIGDIR, exist_ok=True)
+
+REQUIRED_SERVER_COMPONENTS = ("total", "prefill", "decode")
+REQUIRED_SERVER_COMPONENT_CHOICES = (*REQUIRED_SERVER_COMPONENTS, "split")
+REQUIRED_SERVER_COMPONENT_LABELS = {
+    "total": "Required servers",
+    "prefill": "Prefill required servers",
+    "decode": "Decode required servers",
+}
+REQUIRED_SERVER_COMPONENT_STYLES = {
+    "total": {"color": "black", "linewidth": 2.2, "linestyle": "-"},
+    "prefill": {"color": "#2A9D8F", "linewidth": 2.6, "linestyle": "--"},
+    "decode": {"color": "#F4A261", "linewidth": 2.6, "linestyle": "-."},
+}
 
 PAPER_STYLE = {
     "font.family": "serif",
@@ -72,6 +91,44 @@ def count_intervals(intervals: list[tuple[float, float, float, str]],
         for i in range(2, 5):
             window_stat[i] /= window
     return [tuple(window_stat) for window_stat in windows]
+
+
+def _required_server_key(component: str) -> str:
+    if component not in REQUIRED_SERVER_COMPONENTS:
+        raise ValueError(f"Unsupported required-server component: {component}")
+    return f"{component}_required_servers"
+
+
+def _required_server_values(trace: dict, component: str) -> np.ndarray:
+    key = _required_server_key(component)
+    if key in trace:
+        return np.asarray(trace[key])
+    if component == "total":
+        return np.asarray(trace["required_servers"])
+    raise KeyError(f"Trace does not contain {key!r}")
+
+
+def _summary_component(required_server_component: str) -> str:
+    if required_server_component not in REQUIRED_SERVER_COMPONENT_CHOICES:
+        raise ValueError(
+            f"Unsupported required-server component: {required_server_component}"
+        )
+    return "total" if required_server_component == "split" else required_server_component
+
+
+def _plotted_components(required_server_component: str) -> tuple[str, ...]:
+    if required_server_component == "split":
+        return REQUIRED_SERVER_COMPONENTS
+    if required_server_component in REQUIRED_SERVER_COMPONENTS:
+        return (required_server_component,)
+    raise ValueError(f"Unsupported required-server component: {required_server_component}")
+
+
+def _required_server_axis_label(required_server_component: str) -> str:
+    if required_server_component == "split":
+        return "Required Servers"
+    label = REQUIRED_SERVER_COMPONENT_LABELS[required_server_component]
+    return label[:1].upper() + label[1:]
 
 
 def build_required_server_intervals(arrival_times_name: str,
@@ -151,13 +208,21 @@ def build_required_server_trace_from_intervals(intervals: list[tuple[float, floa
     if not max_intervals:
         raise ValueError("No interval statistics produced")
 
-    window_starts, window_ends, _, _, max_tot_servers = zip(*max_intervals)
-    required_servers = np.ceil(np.asarray(max_tot_servers)).astype(int)
+    window_starts, window_ends, prefill_servers, decode_servers, total_servers = zip(*max_intervals)
+    prefill_required_servers = np.ceil(np.asarray(prefill_servers)).astype(int)
+    decode_required_servers = np.ceil(np.asarray(decode_servers)).astype(int)
+    total_required_servers = np.ceil(np.asarray(total_servers)).astype(int)
 
     return {
         "window_starts": np.asarray(window_starts, dtype=float),
         "window_ends": np.asarray(window_ends, dtype=float),
-        "required_servers": required_servers,
+        "required_servers": total_required_servers,
+        "total_required_servers": total_required_servers,
+        "prefill_required_servers": prefill_required_servers,
+        "decode_required_servers": decode_required_servers,
+        "total_server_load": np.asarray(total_servers, dtype=float),
+        "prefill_server_load": np.asarray(prefill_servers, dtype=float),
+        "decode_server_load": np.asarray(decode_servers, dtype=float),
         "trace_window": trace_window,
         "max_decode_batch_size": max_decode_batch_size,
     }
@@ -241,7 +306,7 @@ def _plot_cdf(ax, values: np.ndarray, label: str, linestyle: str = "-"):
     ax.step(sorted_values, y, where="post", label=label, color="black", linestyle=linestyle, linewidth=3.2)
 
 
-def plot_required_server_distribution(ax, values: np.ndarray):
+def plot_required_server_distribution(ax, values: np.ndarray, component: str = "total"):
     values = np.asarray(values, dtype=float)
     if len(values) == 0:
         raise ValueError("No required-server values to plot")
@@ -267,7 +332,8 @@ def plot_required_server_distribution(ax, values: np.ndarray):
     ax.axvline(avg, color="royalblue", linestyle="-", linewidth=2.8, label=f"Avg {avg:.2f}")
     ax.axvline(p95, color="darkorange", linestyle="--", linewidth=2.8, label=f"P95 {p95:.2f}")
     ax.axvline(p99, color="crimson", linestyle=":", linewidth=3.0, label=f"P99 {p99:.2f}")
-    ax.set_xlabel("Required Servers (1s Window)")
+    component_label = REQUIRED_SERVER_COMPONENT_LABELS[component]
+    ax.set_xlabel(f"{component_label.title()} (1s Window)")
     ax.set_ylabel("Fraction of Windows")
     ax.yaxis.set_major_formatter(ticker.PercentFormatter(xmax=1.0, decimals=0))
     ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
@@ -306,11 +372,13 @@ def summarize_highlight_region(window_starts: np.ndarray,
 
 def plot_headroom_figure(trace: dict,
                          provisioning_summaries: list[dict],
-                         distribution_trace: dict,
+                         distribution_trace: dict | None,
                          output_path: str,
                          title: str,
                          highlight_start: float | None = None,
-                         highlight_end: float | None = None):
+                         highlight_end: float | None = None,
+                         top_figure_only: bool = False,
+                         required_server_component: str = "total"):
     if not provisioning_summaries:
         raise ValueError("No provisioning summaries to plot")
 
@@ -321,7 +389,8 @@ def plot_headroom_figure(trace: dict,
 
     window_starts = trace["window_starts"]
     window_ends = trace["window_ends"]
-    required_servers = trace["required_servers"]
+    summary_component = _summary_component(required_server_component)
+    required_servers = _required_server_values(trace, summary_component)
 
     highlight_summary = representative
     if highlight_start is not None and highlight_end is not None:
@@ -333,25 +402,52 @@ def plot_headroom_figure(trace: dict,
             highlight_end,
         )
 
-    fig, (ax_ts, ax_dist) = plt.subplots(
-        2,
-        1,
-        figsize=(14, 8),
-        gridspec_kw={"height_ratios": [2.2, 1.15]},
-        constrained_layout=True,
-    )
+    if top_figure_only:
+        fig, ax_ts = plt.subplots(
+            1,
+            1,
+            figsize=(14, 5.2),
+            constrained_layout=True,
+        )
+        ax_dist = None
+    else:
+        fig, (ax_ts, ax_dist) = plt.subplots(
+            2,
+            1,
+            figsize=(14, 8),
+            gridspec_kw={"height_ratios": [2.2, 1.15]},
+            constrained_layout=True,
+        )
 
     step_x = np.append(window_starts, window_ends[-1])
-    step_y = np.append(required_servers, required_servers[-1])
-    ax_ts.step(step_x, step_y, where="post", color="black", linewidth=2.2, label="Required servers")
+    visible_series = []
+    for component in _plotted_components(required_server_component):
+        component_values = _required_server_values(trace, component)
+        visible_series.append(component_values)
+        step_y = np.append(component_values, component_values[-1])
+        style = REQUIRED_SERVER_COMPONENT_STYLES[component]
+        ax_ts.step(
+            step_x,
+            step_y,
+            where="post",
+            color=style["color"],
+            linewidth=style["linewidth"],
+            linestyle=style["linestyle"],
+            label=REQUIRED_SERVER_COMPONENT_LABELS[component],
+        )
     ax_ts.axvspan(highlight_summary["start"], highlight_summary["end"], color="gold", alpha=0.16, zorder=0)
+    summary_label_prefix = (
+        ""
+        if required_server_component == "total"
+        else f"{summary_component.title()} "
+    )
     ax_ts.hlines(
         highlight_summary["peak"],
         highlight_summary["start"],
         highlight_summary["end"],
         color="red",
         linewidth=3.0,
-        label="Window peak",
+        label=f"{summary_label_prefix}window peak",
     )
     ax_ts.hlines(
         highlight_summary["avg"],
@@ -360,13 +456,15 @@ def plot_headroom_figure(trace: dict,
         color="royalblue",
         linewidth=3.0,
         linestyle="--",
-        label="Window average",
+        label=f"{summary_label_prefix}window average",
     )
-    y_span = max(1.0, float(np.max(required_servers)) - float(np.min(required_servers)))
+    visible_min = min(float(np.min(values)) for values in visible_series)
+    visible_max = max(float(np.max(values)) for values in visible_series)
+    y_span = max(1.0, visible_max - visible_min)
     x_annot = highlight_summary["start"] + 0.05 * (highlight_summary["end"] - highlight_summary["start"])
-    peak_y = min(float(np.max(required_servers)) - 0.03 * y_span, highlight_summary["peak"] + 0.08 * y_span)
+    peak_y = min(visible_max - 0.03 * y_span, highlight_summary["peak"] + 0.08 * y_span)
     avg_y = max(
-        float(np.min(required_servers)) + 0.12 * y_span,
+        visible_min + 0.12 * y_span,
         highlight_summary["avg"] + 0.06 * y_span,
     )
     ax_ts.text(
@@ -387,25 +485,34 @@ def plot_headroom_figure(trace: dict,
         fontsize=22,
         bbox={"facecolor": "white", "edgecolor": "0.35", "linewidth": 1.2, "alpha": 0.96},
     )
-    ax_ts.set_ylabel("Required Servers")
+    ax_ts.set_ylabel(_required_server_axis_label(required_server_component))
     ax_ts.set_xlabel("Time (s)")
     ax_ts.set_xlim(window_starts[0], window_ends[-1])
     ax_ts.yaxis.set_major_locator(ticker.MaxNLocator(nbins=7, integer=True))
     ax_ts.grid(True, alpha=0.25)
     ax_ts.legend(loc="upper right", frameon=True, facecolor="white", framealpha=0.95)
 
-    dist_mask = (
-        (distribution_trace["window_ends"] > highlight_summary["start"]) &
-        (distribution_trace["window_starts"] < highlight_summary["end"])
-    )
-    if not np.any(dist_mask):
-        raise ValueError("Highlighted interval does not overlap the 1s distribution trace")
-    plot_required_server_distribution(ax_dist, distribution_trace["required_servers"][dist_mask])
+    if not top_figure_only:
+        if distribution_trace is None:
+            raise ValueError("distribution_trace is required unless top_figure_only=True")
+        dist_mask = (
+            (distribution_trace["window_ends"] > highlight_summary["start"]) &
+            (distribution_trace["window_starts"] < highlight_summary["end"])
+        )
+        if not np.any(dist_mask):
+            raise ValueError("Highlighted interval does not overlap the 1s distribution trace")
+        dist_values = _required_server_values(distribution_trace, summary_component)
+        plot_required_server_distribution(
+            ax_dist,
+            dist_values[dist_mask],
+            component=summary_component,
+        )
 
-    ax_ts.text(0.5, -0.20, "(a) Required Servers Over Time", transform=ax_ts.transAxes,
-               ha="center", va="top", fontsize=22)
-    ax_dist.text(0.5, -0.40, "(b) Distribution of Required Servers in Highlighted 1s Windows", transform=ax_dist.transAxes,
-                 ha="center", va="top", fontsize=22)
+        ax_ts.text(0.5, -0.20, "(a) Required Servers Over Time", transform=ax_ts.transAxes,
+                   ha="center", va="top", fontsize=22)
+        dist_component_label = REQUIRED_SERVER_COMPONENT_LABELS[summary_component]
+        ax_dist.text(0.5, -0.40, f"(b) Distribution of {dist_component_label.title()} in Highlighted 1s Windows", transform=ax_dist.transAxes,
+                     ha="center", va="top", fontsize=22)
 
     output_dir = os.path.dirname(output_path)
     if output_dir:
@@ -431,7 +538,9 @@ def generate_motivation_figure(arrival_times_name: str,
                                time_start: float | None = None,
                                time_end: float | None = None,
                                highlight_start: float | None = None,
-                               highlight_end: float | None = None) -> dict:
+                               highlight_end: float | None = None,
+                               top_figure_only: bool = False,
+                               required_server_component: str = "total") -> dict:
     intervals, max_decode_batch_size = build_required_server_intervals(
         arrival_times_name=arrival_times_name,
         requests_name=requests_name,
@@ -446,11 +555,13 @@ def generate_motivation_figure(arrival_times_name: str,
         time_end=time_end,
     )
     trace = build_required_server_trace_from_intervals(intervals, trace_window, max_decode_batch_size)
-    distribution_trace = build_required_server_trace_from_intervals(intervals, 1.0, max_decode_batch_size)
+    distribution_trace = None
+    if not top_figure_only:
+        distribution_trace = build_required_server_trace_from_intervals(intervals, 1.0, max_decode_batch_size)
     summaries = summarize_provisioning_windows(
         trace["window_starts"],
         trace["window_ends"],
-        trace["required_servers"],
+        _required_server_values(trace, _summary_component(required_server_component)),
         provisioning_window=provisioning_window,
     )
     easy_name = get_easy_name(model_name)
@@ -468,10 +579,13 @@ def generate_motivation_figure(arrival_times_name: str,
         title="",
         highlight_start=highlight_start,
         highlight_end=highlight_end,
+        top_figure_only=top_figure_only,
+        required_server_component=required_server_component,
     )
 
     representative = max(summaries, key=lambda item: (item["peak_to_avg"], item["peak"], item["avg"]))
     print(f"Saved {output_path}")
+    print(f"Required-server component: {required_server_component}")
     print(
         "Representative window:",
         f"start={representative['start']:.1f}s",
@@ -486,6 +600,7 @@ def generate_motivation_figure(arrival_times_name: str,
         "distribution_trace": distribution_trace,
         "provisioning_summaries": summaries,
         "output_path": output_path,
+        "required_server_component": required_server_component,
     }
 
 
@@ -504,8 +619,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-end", type=float, default=None)
     parser.add_argument("--highlight-start", type=float, default=None)
     parser.add_argument("--highlight-end", type=float, default=None)
+    parser.add_argument("--top-figure-only", action="store_true")
     parser.add_argument("--load-scale", type=float, default=1.0)
     parser.add_argument("--slo-constant", type=float, default=0.2)
+    parser.add_argument(
+        "--required-server-component",
+        choices=REQUIRED_SERVER_COMPONENT_CHOICES,
+        default="total",
+        help=(
+            "Required-server series to summarize and plot. Use 'split' to overlay "
+            "total, prefill, and decode while keeping total for peak/avg summaries."
+        ),
+    )
     parser.add_argument("--output-path", default=None)
     return parser.parse_args()
 
@@ -529,6 +654,8 @@ def main():
         time_end=args.time_end,
         highlight_start=args.highlight_start,
         highlight_end=args.highlight_end,
+        top_figure_only=args.top_figure_only,
+        required_server_component=args.required_server_component,
     )
 
 

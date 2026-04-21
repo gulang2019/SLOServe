@@ -28,6 +28,13 @@ DEFAULT_LOAD_STATS = {
     "control_time_delta_last_ms": 0.0,
     "control_time_delta_samples": 0,
     "control_online_slack_ms": 0.0,
+    "backend_admission_checked": 0,
+    "backend_recovery_state": 0,
+    "backend_regular_feasible": 1,
+    "backend_regular_count": 0,
+    "backend_accepted_regular_count": 0,
+    "backend_rejected_regular_count": 0,
+    "backend_earliest_deadline_laxity_ms": 0.0,
 }
 
 
