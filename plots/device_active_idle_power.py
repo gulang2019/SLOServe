@@ -470,6 +470,64 @@ def _write_csv(rows: list[dict[str, Any]], csv_path: Path) -> None:
         writer.writerows(rows)
 
 
+def _format_bar_label(value: float, *, unit: str) -> str:
+    if not math.isfinite(value):
+        return ""
+    if unit == "s":
+        return f"{value:.1f}"
+    if unit == "W":
+        return f"{value:.0f}"
+    if abs(value) >= 1000.0:
+        return f"{value / 1000.0:.1f}k"
+    return f"{value:.0f}"
+
+
+def _annotate_grouped_bars(
+    ax,
+    bars,
+    *,
+    unit: str,
+    y_offset_points: float = 2.0,
+) -> None:
+    for bar in bars:
+        height = float(bar.get_height())
+        label = _format_bar_label(height, unit=unit)
+        if not label:
+            continue
+        ax.annotate(
+            label,
+            xy=(bar.get_x() + bar.get_width() / 2.0, height),
+            xytext=(0, y_offset_points),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            rotation=90,
+            clip_on=False,
+        )
+
+
+def _annotate_stacked_bars(ax, bars, values: list[float], *, unit: str) -> None:
+    for bar, value in zip(bars, values):
+        height = float(bar.get_height())
+        if height <= 0.0:
+            continue
+        label = _format_bar_label(float(value), unit=unit)
+        if not label:
+            continue
+        y = float(bar.get_y()) + height / 2.0
+        ax.annotate(
+            label,
+            xy=(bar.get_x() + bar.get_width() / 2.0, y),
+            ha="center",
+            va="center",
+            fontsize=8,
+            rotation=90,
+            color="white" if bar.get_facecolor()[0] < 0.55 else "black",
+            clip_on=True,
+        )
+
+
 def _plot(rows: list[dict[str, Any]], metadata: dict[str, Any], png_path: Path) -> None:
     plt = _get_plotting_dependencies()
     _apply_paper_style(plt)
@@ -503,45 +561,57 @@ def _plot(rows: list[dict[str, Any]], metadata: dict[str, Any], png_path: Path) 
     )
     x_positions = list(range(len(device_ids)))
 
-    time_ax.bar(x_positions, active_times, color="#4C78A8", label="Active")
-    time_ax.bar(x_positions, idle_times, bottom=active_times, color="#B8B8B8", label="Idle")
+    active_time_bars = time_ax.bar(x_positions, active_times, color="#4C78A8", label="Active")
+    idle_time_bars = time_ax.bar(
+        x_positions,
+        idle_times,
+        bottom=active_times,
+        color="#B8B8B8",
+        label="Idle",
+    )
+    _annotate_stacked_bars(time_ax, active_time_bars, active_times, unit="s")
+    _annotate_stacked_bars(time_ax, idle_time_bars, idle_times, unit="s")
     time_ax.set_title("Time Breakdown")
     time_ax.set_ylabel("Time (s)")
     time_ax.legend(frameon=False, ncol=2)
 
     width = 0.38
-    energy_ax.bar(
+    active_energy_bars = energy_ax.bar(
         [x - width / 2 for x in x_positions],
         active_energies,
         width=width,
         color="#2E7D32",
         label="Active",
     )
-    energy_ax.bar(
+    idle_energy_bars = energy_ax.bar(
         [x + width / 2 for x in x_positions],
         idle_energies,
         width=width,
         color="#E76F51",
         label="Idle",
     )
+    _annotate_grouped_bars(energy_ax, active_energy_bars, unit="J")
+    _annotate_grouped_bars(energy_ax, idle_energy_bars, unit="J")
     energy_ax.set_title("Energy Breakdown")
     energy_ax.set_ylabel("Energy (J)")
     energy_ax.legend(frameon=False, ncol=2)
 
-    power_ax.bar(
+    active_power_bars = power_ax.bar(
         [x - width / 2 for x in x_positions],
         active_powers,
         width=width,
         color="#2E7D32",
         label="Active",
     )
-    power_ax.bar(
+    idle_power_bars = power_ax.bar(
         [x + width / 2 for x in x_positions],
         idle_powers,
         width=width,
         color="#E76F51",
         label="Idle",
     )
+    _annotate_grouped_bars(power_ax, active_power_bars, unit="W")
+    _annotate_grouped_bars(power_ax, idle_power_bars, unit="W")
     power_ax.set_title("Power Breakdown")
     power_ax.set_ylabel("Average Power (W)")
     power_ax.set_xlabel("Device Index")
