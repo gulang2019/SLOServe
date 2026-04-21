@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, asdict
 import numpy as np
 import pprint
 import json
+import csv
 import io
 import math
 import re
@@ -54,6 +55,22 @@ BENCHMARK_ENERGY_RUN_START_DELAY_S = 30.0
 BENCHMARK_ENERGY_LAST_ARRIVAL_DELAY_S = 30.0
 DEFAULT_REPORT_TTFT_SLO_SCALES = (2.0, 3.0, 5.0, 7.0, 10.0)
 DEFAULT_REPORT_SLO_TPOTS = (0.015, 0.025, 0.05, 0.10, 0.2)
+PER_DEVICE_ACTIVE_IDLE_POWER_CSV_FIELDS = [
+    "device_id",
+    "active_power_w",
+    "idle_power_w",
+    "active_minus_idle_power_w",
+    "configured_idle_power_w",
+    "active_energy_j",
+    "idle_energy_j",
+    "active_duration_s",
+    "idle_duration_s",
+    "active_window_count",
+    "idle_window_count",
+    "active_sample_count",
+    "idle_sample_count",
+    "idle_power_source",
+]
 
 from SLOsServe.perf_model import (
     PerfModel,
@@ -313,6 +330,16 @@ def _build_concise_result_row(
             "rejection_reason_counts": rejection_reason_counts,
             "cache_hit_rate": cache_hit_rate,
             "energy_consumption": result.get("energy_consumption"),
+        },
+        "power": {
+            "per_device_active_w": result.get("per_device_active_power_w"),
+            "per_device_idle_w": result.get("per_device_idle_power_w"),
+            "per_device_active_minus_idle_w": result.get(
+                "per_device_active_minus_idle_power_w"
+            ),
+            "per_device_active_idle_power_file": result.get(
+                "per_device_active_idle_power_file"
+            ),
         },
         "batching": {
             "average_batch_size": result.get(
@@ -1753,6 +1780,7 @@ def _maybe_report_independent_slo_grid(
     output_prefix: str | Path,
     report_ttft_slo_scales: list[float],
     report_slo_tpots: list[float],
+    ttft_overhead: float = 0.0,
     context: Dict[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
     reqs_path = Path(reqs_file)
@@ -1767,6 +1795,7 @@ def _maybe_report_independent_slo_grid(
         reqs_path,
         ttft_slo_scales=[float(value) for value in report_ttft_slo_scales],
         slo_tpots=[float(value) for value in report_slo_tpots],
+        ttft_overhead=float(ttft_overhead),
         output_prefix=output_prefix,
     )
 
@@ -3262,6 +3291,207 @@ def _summarize_active_request_windows(
     }
 
 
+def _compute_per_device_active_windows(
+    events: List[Dict[str, Any] | Any],
+    *,
+    n_devices: int,
+    start_time: float,
+    end_time: float,
+    window_size: float,
+) -> Dict[int, np.ndarray]:
+    bins = _make_time_bins(start_time, end_time, window_size)
+    n_windows = len(bins) - 1
+    active_windows = {
+        device_id: np.zeros(n_windows, dtype=bool)
+        for device_id in range(max(0, int(n_devices)))
+    }
+
+    for event in events:
+        if _event_value(event, "event_type") != "batch":
+            continue
+        try:
+            device_id = int(_event_value(event, "device_id", -1))
+        except (TypeError, ValueError):
+            continue
+        if device_id not in active_windows:
+            continue
+        try:
+            batch_end = float(_event_value(event, "timestamp", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        try:
+            elapsed = max(0.0, float(_event_value(event, "elapsed", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            elapsed = 0.0
+
+        if elapsed > 0.0:
+            batch_start = batch_end - elapsed
+        else:
+            batch_start = batch_end
+            batch_end = batch_start + min(1e-9, float(window_size))
+        if batch_end <= start_time or batch_start >= end_time:
+            continue
+
+        left = max(0, int(np.floor((batch_start - start_time) / window_size)))
+        right = min(
+            n_windows,
+            int(np.ceil((batch_end - start_time) / window_size)),
+        )
+        if right <= left:
+            if 0 <= left < n_windows:
+                right = left + 1
+            else:
+                continue
+        active_windows[device_id][left:right] = True
+
+    return active_windows
+
+
+def _optional_float(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def _summarize_per_device_active_idle_power(
+    power_summary: Dict[str, Any],
+    active_windows: Dict[int, np.ndarray],
+    *,
+    n_devices: int,
+    window_size: float,
+    configured_idle_power_w: float,
+) -> Dict[str, Any]:
+    per_device_power = power_summary.get("per_device_power", {})
+    rows: list[dict[str, Any]] = []
+
+    for device_id in range(max(0, int(n_devices))):
+        raw_power_values = per_device_power.get(device_id)
+        if raw_power_values is None:
+            raw_power_values = per_device_power.get(str(device_id), [])
+        power_values = np.asarray(
+            raw_power_values,
+            dtype=np.float64,
+        )
+        active_mask = np.asarray(
+            active_windows.get(device_id, np.zeros(0, dtype=bool)),
+            dtype=bool,
+        )
+        n_windows = min(power_values.size, active_mask.size)
+        if n_windows > 0:
+            power_values = power_values[:n_windows]
+            active_mask = active_mask[:n_windows]
+            finite_mask = np.isfinite(power_values)
+        else:
+            power_values = np.asarray([], dtype=np.float64)
+            active_mask = np.asarray([], dtype=bool)
+            finite_mask = np.asarray([], dtype=bool)
+
+        active_sample_mask = active_mask & finite_mask
+        idle_sample_mask = (~active_mask) & finite_mask
+        active_window_count = int(np.sum(active_mask)) if n_windows else 0
+        idle_window_count = int(n_windows - active_window_count)
+        active_sample_count = int(np.sum(active_sample_mask))
+        idle_sample_count = int(np.sum(idle_sample_mask))
+        active_duration_s = float(active_sample_count * window_size)
+        idle_duration_s = float(idle_sample_count * window_size)
+        active_energy_j = float(np.sum(power_values[active_sample_mask]) * window_size)
+        idle_energy_j = float(np.sum(power_values[idle_sample_mask]) * window_size)
+
+        active_power_w = (
+            active_energy_j / active_duration_s
+            if active_duration_s > 0.0
+            else None
+        )
+        if idle_duration_s > 0.0:
+            idle_power_w = idle_energy_j / idle_duration_s
+            idle_power_source = "measured"
+        else:
+            idle_power_w = float(configured_idle_power_w)
+            idle_power_source = "configured_fallback"
+        active_minus_idle_power_w = (
+            active_power_w - idle_power_w
+            if active_power_w is not None and idle_power_w is not None
+            else None
+        )
+
+        rows.append({
+            "device_id": int(device_id),
+            "active_power_w": _optional_float(active_power_w),
+            "idle_power_w": _optional_float(idle_power_w),
+            "active_minus_idle_power_w": _optional_float(active_minus_idle_power_w),
+            "configured_idle_power_w": float(configured_idle_power_w),
+            "active_energy_j": float(active_energy_j),
+            "idle_energy_j": float(idle_energy_j),
+            "active_duration_s": float(active_duration_s),
+            "idle_duration_s": float(idle_duration_s),
+            "active_window_count": active_window_count,
+            "idle_window_count": idle_window_count,
+            "active_sample_count": active_sample_count,
+            "idle_sample_count": idle_sample_count,
+            "idle_power_source": idle_power_source,
+        })
+
+    return {
+        "per_device_active_idle_power": rows,
+        "per_device_active_power_w": [
+            row["active_power_w"] for row in rows
+        ],
+        "per_device_idle_power_w": [
+            row["idle_power_w"] for row in rows
+        ],
+        "per_device_active_minus_idle_power_w": [
+            row["active_minus_idle_power_w"] for row in rows
+        ],
+        "per_device_active_energy_j": [
+            row["active_energy_j"] for row in rows
+        ],
+        "per_device_idle_energy_j": [
+            row["idle_energy_j"] for row in rows
+        ],
+        "per_device_active_duration_s": [
+            row["active_duration_s"] for row in rows
+        ],
+        "per_device_idle_duration_s": [
+            row["idle_duration_s"] for row in rows
+        ],
+    }
+
+
+def _format_watts_for_log(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.2f}W"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _format_per_device_active_idle_power_log(
+    rows: Any,
+) -> str | None:
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    parts: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        device_id = row.get("device_id")
+        active_power = _format_watts_for_log(row.get("active_power_w"))
+        idle_power = _format_watts_for_log(row.get("idle_power_w"))
+        delta_power = _format_watts_for_log(row.get("active_minus_idle_power_w"))
+        idle_source = row.get("idle_power_source")
+        if idle_source == "configured_fallback":
+            idle_power = f"{idle_power} configured"
+        parts.append(
+            f"d{device_id}: active={active_power}, idle={idle_power}, "
+            f"delta={delta_power}"
+        )
+    if not parts:
+        return None
+    return "Per-device active/idle power: " + "; ".join(parts)
+
+
 def _summarize_boxplot(values: List[float], *, label: str) -> Dict[str, Any] | None:
     if not values:
         return None
@@ -4134,6 +4364,22 @@ def _write_json_artifact(path: str | Path, payload: Dict[str, Any]) -> str:
     return str(artifact_path)
 
 
+def _write_csv_artifact(
+    path: str | Path,
+    rows: List[Dict[str, Any]],
+    *,
+    fieldnames: List[str],
+) -> str:
+    artifact_path = Path(path)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    with artifact_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field) for field in fieldnames})
+    return str(artifact_path)
+
+
 def save_benchmark_figures_from_result_row(
     result: Dict[str, Any],
     output_prefix: str | Path,
@@ -4250,6 +4496,20 @@ def _summarize_benchmark_energy_and_figures(
         end_time=end_time,
         n_device=n_devices,
     )
+    per_device_active_windows = _compute_per_device_active_windows(
+        events,
+        n_devices=n_devices,
+        start_time=start_time,
+        end_time=end_time,
+        window_size=window_size,
+    )
+    per_device_active_idle_power = _summarize_per_device_active_idle_power(
+        power_summary,
+        per_device_active_windows,
+        n_devices=n_devices,
+        window_size=window_size,
+        configured_idle_power_w=idle_power_per_replica,
+    )
     active_server_counts = np.asarray(active_server_counts, dtype=np.int64)
 
     n_windows = min(
@@ -4301,6 +4561,11 @@ def _summarize_benchmark_energy_and_figures(
         f"{output_prefix}.memory_occupancy_over_time.json",
         memory_occupancy_summary,
     )
+    active_idle_power_file = _write_csv_artifact(
+        f"{output_prefix}.per_device_active_idle_power.csv",
+        per_device_active_idle_power["per_device_active_idle_power"],
+        fieldnames=PER_DEVICE_ACTIVE_IDLE_POWER_CSV_FIELDS,
+    )
 
     replay = {
         "window_size_seconds": float(window_size),
@@ -4311,6 +4576,9 @@ def _summarize_benchmark_energy_and_figures(
         "window_time_pct_vs_active_requests": window_time_pct_summary,
         "power_vs_active_servers": active_servers_summary,
         "power_vs_batch_tokens": batch_tokens_summary,
+        "per_device_active_idle_power": (
+            per_device_active_idle_power["per_device_active_idle_power"]
+        ),
     }
     figure_paths = save_benchmark_figures_from_result_row(
         {
@@ -4334,6 +4602,8 @@ def _summarize_benchmark_energy_and_figures(
         "benchmark_power_source": str(power_summary.get("source", "measured")),
         "benchmark_figure_replay": replay,
         "memory_occupancy_over_time_file": memory_occupancy_file,
+        "per_device_active_idle_power_file": active_idle_power_file,
+        **per_device_active_idle_power,
         **figure_paths,
     }
 
@@ -5606,6 +5876,14 @@ async def main(
         arrival_times=arrival_times,
     )
     extra_metrics.update(benchmark_energy_figure_metrics)
+    active_idle_power_log = _format_per_device_active_idle_power_log(
+        extra_metrics.get("per_device_active_idle_power")
+    )
+    if active_idle_power_log is not None and not problem.concise_logging:
+        print(active_idle_power_log)
+    active_idle_power_file = extra_metrics.get("per_device_active_idle_power_file")
+    if active_idle_power_file is not None and not problem.concise_logging:
+        print(f"Saved per-device active/idle power CSV to {active_idle_power_file}")
     arrival_duration_s = (
         float(arrival_times[-1] - arrival_times[0])
         if len(arrival_times) > 1 else 0.0
@@ -7378,6 +7656,7 @@ def run(
                         ),
                         report_ttft_slo_scales=report_ttft_slo_scales,
                         report_slo_tpots=report_slo_tpots,
+                        ttft_overhead=slo_routing_overhead,
                         context={
                             "trace": trace,
                             "load_scale": load_scale,
@@ -7389,6 +7668,7 @@ def run(
                             "routing_policy": display_routing_policy,
                             "benchmark_ttft_slo_scale": ttft_slo_scale,
                             "benchmark_slo_tpot": slo_tpot,
+                            "ttft_overhead": slo_routing_overhead,
                             "source": "cache",
                         },
                     )
@@ -7635,6 +7915,10 @@ def run(
             result['memory_occupancy_over_time_file'] = (
                 f'{problems[0].store_prefix}.memory_occupancy_over_time.json'
             )
+        if result.get('per_device_active_idle_power_file') is not None:
+            result['per_device_active_idle_power_file'] = (
+                f'{problems[0].store_prefix}.per_device_active_idle_power.csv'
+            )
         if 'perf_model_error_summary' in best_result.results:
             result['perf_model_error_summary'] = best_result.results[
                 'perf_model_error_summary']
@@ -7772,6 +8056,10 @@ def run(
         dst = f'{problems[0].store_prefix}.memory_occupancy_over_time.json'
         if os.path.exists(src):
             os.system(f'cp {src} {dst}')
+        src = f'{best_result.event_file}.per_device_active_idle_power.csv'
+        dst = f'{problems[0].store_prefix}.per_device_active_idle_power.csv'
+        if os.path.exists(src):
+            os.system(f'cp {src} {dst}')
         if clock_monitor_recommendation is not None:
             clock_monitor_recommendation = dict(clock_monitor_recommendation)
             clock_monitor_recommendation['reqs_file'] = str(canonical_reqs_file)
@@ -7796,6 +8084,7 @@ def run(
                 output_prefix=f'{problems[0].store_prefix}.report_slo_grid',
                 report_ttft_slo_scales=report_ttft_slo_scales,
                 report_slo_tpots=report_slo_tpots,
+                ttft_overhead=problems[0].slo_routing_overhead,
                 context={
                     "trace": trace,
                     "load_scale": load_scale,
@@ -7805,6 +8094,7 @@ def run(
                     "routing_policy": display_routing_policy,
                     "benchmark_ttft_slo_scale": ttft_slo_scale,
                     "benchmark_slo_tpot": slo_tpot,
+                    "ttft_overhead": problems[0].slo_routing_overhead,
                 },
             )
         if report_slo_grid_summary is not None:
