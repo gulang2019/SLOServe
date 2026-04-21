@@ -17,6 +17,7 @@ try:
         _batch_events,
         _batch_interval,
         _batch_kind_for_power,
+        _infer_method_from_event_file,
         _infer_n_device,
         _load_json_events,
         _load_result_rows,
@@ -36,6 +37,7 @@ except ModuleNotFoundError:
         _batch_events,
         _batch_interval,
         _batch_kind_for_power,
+        _infer_method_from_event_file,
         _infer_n_device,
         _load_json_events,
         _load_result_rows,
@@ -292,14 +294,14 @@ def _select_result_row(
     raise ValueError(f"No usable row with event_file found in {results_jsonl}.")
 
 
-def _build_rows(
-    results_jsonl: Path,
+def _build_rows_from_event_file(
+    event_file: Path,
     *,
-    row_index: int | None,
+    results_jsonl: Path | None,
+    result_row_index: int | None,
+    result_row: dict[str, Any],
     observation_window: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    selected_index, result_row = _select_result_row(results_jsonl, row_index=row_index)
-    event_file = _resolve_event_file(str(result_row["event_file"]), results_jsonl=results_jsonl)
     if not event_file.exists():
         raise FileNotFoundError(f"Missing event file: {event_file}")
 
@@ -343,7 +345,11 @@ def _build_rows(
         end_time=end_time,
     )
 
-    method = _method_from_row(result_row)
+    method = (
+        str(result_row.get("method") or "")
+        or _method_from_row(result_row)
+        or _infer_method_from_event_file(event_file)
+    )
     duration = max(0.0, end_time - start_time)
     output_rows: list[dict[str, Any]] = []
     for device_id in range(n_device):
@@ -352,8 +358,8 @@ def _build_rows(
         idle_time = float(row["idle_time_s"])
         output_rows.append(
             {
-                "results_jsonl": _repo_relative_path(results_jsonl),
-                "result_row_index": selected_index,
+                "results_jsonl": "" if results_jsonl is None else _repo_relative_path(results_jsonl),
+                "result_row_index": "" if result_row_index is None else result_row_index,
                 "method": method,
                 "event_file": _repo_relative_path(event_file),
                 "rps": "" if result_row.get("rps") is None else result_row.get("rps"),
@@ -383,12 +389,51 @@ def _build_rows(
 
     metadata = {
         "results_jsonl": results_jsonl,
-        "result_row_index": selected_index,
+        "result_row_index": result_row_index,
         "event_file": event_file,
         "method": method,
         "observation_window": selected_window,
     }
     return output_rows, metadata
+
+
+def _build_rows(
+    results_jsonl: Path,
+    *,
+    row_index: int | None,
+    observation_window: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    selected_index, result_row = _select_result_row(results_jsonl, row_index=row_index)
+    event_file = _resolve_event_file(str(result_row["event_file"]), results_jsonl=results_jsonl)
+    return _build_rows_from_event_file(
+        event_file,
+        results_jsonl=results_jsonl,
+        result_row_index=selected_index,
+        result_row=result_row,
+        observation_window=observation_window,
+    )
+
+
+def _build_rows_for_direct_event_file(
+    event_file: Path,
+    *,
+    n_device: int | None,
+    method: str,
+    observation_window: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    resolved_event_file = _resolve_event_file(str(event_file), results_jsonl=None)
+    result_row: dict[str, Any] = {}
+    if n_device is not None:
+        result_row["n_device"] = n_device
+    if method:
+        result_row["method"] = method
+    return _build_rows_from_event_file(
+        resolved_event_file,
+        results_jsonl=None,
+        result_row_index=None,
+        result_row=result_row,
+        observation_window=observation_window,
+    )
 
 
 def _write_csv(rows: list[dict[str, Any]], csv_path: Path) -> None:
@@ -432,16 +477,16 @@ def _plot(rows: list[dict[str, Any]], metadata: dict[str, Any], png_path: Path) 
     device_ids = [int(row["device_id"]) for row in rows]
     active_times = [float(row["active_time_s"]) for row in rows]
     idle_times = [float(row["idle_time_s"]) for row in rows]
-    active_powers = [
-        0.0 if math.isnan(float(row["active_power_w"])) else float(row["active_power_w"])
+    active_energies = [
+        0.0 if math.isnan(float(row["active_energy_j"])) else float(row["active_energy_j"])
         for row in rows
     ]
-    idle_powers = [
-        0.0 if math.isnan(float(row["idle_power_w"])) else float(row["idle_power_w"])
+    idle_energies = [
+        0.0 if math.isnan(float(row["idle_energy_j"])) else float(row["idle_energy_j"])
         for row in rows
     ]
 
-    fig, (time_ax, power_ax) = plt.subplots(
+    fig, (time_ax, energy_ax) = plt.subplots(
         2,
         1,
         figsize=(8.4, 6.0),
@@ -456,27 +501,27 @@ def _plot(rows: list[dict[str, Any]], metadata: dict[str, Any], png_path: Path) 
     time_ax.legend(frameon=False, ncol=2)
 
     width = 0.38
-    power_ax.bar(
+    energy_ax.bar(
         [x - width / 2 for x in x_positions],
-        active_powers,
+        active_energies,
         width=width,
         color="#2E7D32",
         label="Active",
     )
-    power_ax.bar(
+    energy_ax.bar(
         [x + width / 2 for x in x_positions],
-        idle_powers,
+        idle_energies,
         width=width,
         color="#E76F51",
         label="Idle",
     )
-    power_ax.set_ylabel("Average Power (W)")
-    power_ax.set_xlabel("Device Index")
-    power_ax.legend(frameon=False, ncol=2)
-    power_ax.set_xticks(x_positions)
-    power_ax.set_xticklabels([str(device_id) for device_id in device_ids])
+    energy_ax.set_ylabel("Energy (J)")
+    energy_ax.set_xlabel("Device Index")
+    energy_ax.legend(frameon=False, ncol=2)
+    energy_ax.set_xticks(x_positions)
+    energy_ax.set_xticklabels([str(device_id) for device_id in device_ids])
 
-    for ax in (time_ax, power_ax):
+    for ax in (time_ax, energy_ax):
         ax.grid(axis="y", color="#D9D9D9", linewidth=0.8, linestyle=(0, (2, 2)))
         ax.set_axisbelow(True)
         for spine in ax.spines.values():
@@ -487,7 +532,10 @@ def _plot(rows: list[dict[str, Any]], metadata: dict[str, Any], png_path: Path) 
     title_parts = []
     if metadata.get("method"):
         title_parts.append(str(metadata["method"]))
-    title_parts.append(f"row {metadata['result_row_index']}")
+    if metadata.get("result_row_index") is not None:
+        title_parts.append(f"row {metadata['result_row_index']}")
+    else:
+        title_parts.append(Path(metadata["event_file"]).name)
     title_parts.append(str(metadata["observation_window"]))
     time_ax.set_title(" | ".join(title_parts))
 
@@ -499,11 +547,22 @@ def _plot(rows: list[dict[str, Any]], metadata: dict[str, Any], png_path: Path) 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "For one results.jsonl row, compute per-device active/idle time from "
-            "batch events and active/idle average power."
+            "Compute per-device active/idle time from batch events and active/idle "
+            "average power for one results.jsonl row or one event file."
         )
     )
-    parser.add_argument("results_jsonl", type=Path, help="Path to a results.jsonl file.")
+    parser.add_argument(
+        "input_path",
+        nargs="?",
+        type=Path,
+        help="Path to a results.jsonl file or a *.events.jsonl event file.",
+    )
+    parser.add_argument(
+        "--event-file",
+        type=Path,
+        default=None,
+        help="Analyze this event file directly instead of reading event_file from results.jsonl.",
+    )
     parser.add_argument(
         "--row-index",
         type=int,
@@ -520,6 +579,17 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--n-device",
+        type=int,
+        default=None,
+        help="Optional device count override for direct --event-file mode.",
+    )
+    parser.add_argument(
+        "--method",
+        default="",
+        help="Optional method label for direct --event-file mode.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=DEFAULT_OUTPUT_STEM,
@@ -530,21 +600,44 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    rows, metadata = _build_rows(
-        args.results_jsonl,
-        row_index=args.row_index,
-        observation_window=args.observation_window,
-    )
+    if args.n_device is not None and args.n_device <= 0:
+        raise SystemExit("--n-device must be positive.")
+
+    direct_event_file = args.event_file
+    if direct_event_file is None and args.input_path is not None:
+        input_name = args.input_path.name
+        if input_name.endswith(".events.jsonl") or ".events." in input_name:
+            direct_event_file = args.input_path
+
+    if direct_event_file is not None:
+        rows, metadata = _build_rows_for_direct_event_file(
+            direct_event_file,
+            n_device=args.n_device,
+            method=args.method,
+            observation_window=args.observation_window,
+        )
+    else:
+        if args.input_path is None:
+            raise SystemExit("Pass a results.jsonl path or use --event-file path/to/file.events.jsonl.")
+        rows, metadata = _build_rows(
+            args.input_path,
+            row_index=args.row_index,
+            observation_window=args.observation_window,
+        )
+
     csv_path = args.output.with_suffix(".csv")
     png_path = args.output.with_suffix(".png")
     _write_csv(rows, csv_path)
     _plot(rows, metadata, png_path)
     print(f"Wrote {csv_path}")
     print(f"Wrote {png_path}")
-    print(
-        f"Analyzed row {metadata['result_row_index']} from {args.results_jsonl} "
-        f"({metadata['event_file']})."
-    )
+    if metadata.get("results_jsonl") is None:
+        print(f"Analyzed event file {metadata['event_file']}.")
+    else:
+        print(
+            f"Analyzed row {metadata['result_row_index']} from {metadata['results_jsonl']} "
+            f"({metadata['event_file']})."
+        )
 
 
 if __name__ == "__main__":
