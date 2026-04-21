@@ -485,11 +485,19 @@ def _plot(rows: list[dict[str, Any]], metadata: dict[str, Any], png_path: Path) 
         0.0 if math.isnan(float(row["idle_energy_j"])) else float(row["idle_energy_j"])
         for row in rows
     ]
+    active_powers = [
+        0.0 if math.isnan(float(row["active_power_w"])) else float(row["active_power_w"])
+        for row in rows
+    ]
+    idle_powers = [
+        0.0 if math.isnan(float(row["idle_power_w"])) else float(row["idle_power_w"])
+        for row in rows
+    ]
 
-    fig, (time_ax, energy_ax) = plt.subplots(
-        2,
+    fig, (time_ax, energy_ax, power_ax) = plt.subplots(
+        3,
         1,
-        figsize=(8.4, 6.0),
+        figsize=(8.4, 8.2),
         sharex=True,
         constrained_layout=True,
     )
@@ -497,6 +505,7 @@ def _plot(rows: list[dict[str, Any]], metadata: dict[str, Any], png_path: Path) 
 
     time_ax.bar(x_positions, active_times, color="#4C78A8", label="Active")
     time_ax.bar(x_positions, idle_times, bottom=active_times, color="#B8B8B8", label="Idle")
+    time_ax.set_title("Time Breakdown")
     time_ax.set_ylabel("Time (s)")
     time_ax.legend(frameon=False, ncol=2)
 
@@ -515,13 +524,32 @@ def _plot(rows: list[dict[str, Any]], metadata: dict[str, Any], png_path: Path) 
         color="#E76F51",
         label="Idle",
     )
+    energy_ax.set_title("Energy Breakdown")
     energy_ax.set_ylabel("Energy (J)")
-    energy_ax.set_xlabel("Device Index")
     energy_ax.legend(frameon=False, ncol=2)
-    energy_ax.set_xticks(x_positions)
-    energy_ax.set_xticklabels([str(device_id) for device_id in device_ids])
 
-    for ax in (time_ax, energy_ax):
+    power_ax.bar(
+        [x - width / 2 for x in x_positions],
+        active_powers,
+        width=width,
+        color="#2E7D32",
+        label="Active",
+    )
+    power_ax.bar(
+        [x + width / 2 for x in x_positions],
+        idle_powers,
+        width=width,
+        color="#E76F51",
+        label="Idle",
+    )
+    power_ax.set_title("Power Breakdown")
+    power_ax.set_ylabel("Average Power (W)")
+    power_ax.set_xlabel("Device Index")
+    power_ax.legend(frameon=False, ncol=2)
+    power_ax.set_xticks(x_positions)
+    power_ax.set_xticklabels([str(device_id) for device_id in device_ids])
+
+    for ax in (time_ax, energy_ax, power_ax):
         ax.grid(axis="y", color="#D9D9D9", linewidth=0.8, linestyle=(0, (2, 2)))
         ax.set_axisbelow(True)
         for spine in ax.spines.values():
@@ -537,7 +565,7 @@ def _plot(rows: list[dict[str, Any]], metadata: dict[str, Any], png_path: Path) 
     else:
         title_parts.append(Path(metadata["event_file"]).name)
     title_parts.append(str(metadata["observation_window"]))
-    time_ax.set_title(" | ".join(title_parts))
+    fig.suptitle(" | ".join(title_parts))
 
     png_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(png_path, dpi=300, bbox_inches="tight")
