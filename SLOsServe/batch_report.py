@@ -64,12 +64,14 @@ def build_config_report(config_path: str | Path) -> ConfigReport:
         ttft_slo_scales = spec["ttft_slo_scales"]
         slo_tpots = spec["slo_tpots"]
         perf_model_errs = spec["perf_model_errs"]
+        decode_length_offsets = spec.get("decode_length_offsets", ["0"])
         tensor_parallel_size = int(spec["tensor_parallel_size"])
         combinations_per_device = (
             len(load_scales)
             * len(ttft_slo_scales)
             * len(slo_tpots)
             * len(perf_model_errs)
+            * len(decode_length_offsets)
         )
 
         for policy in spec["policies"]:

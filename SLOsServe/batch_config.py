@@ -19,6 +19,11 @@ LIST_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "per_model_err",
         "per_model_errs",
     ),
+    "decode_length_offsets": (
+        "decode_length_offset",
+        "benchmark_decode_length_offset",
+        "benchmark_decode_length_offsets",
+    ),
 }
 
 TRACE_APPEND_LIST_ALIASES: dict[str, tuple[str, ...]] = {

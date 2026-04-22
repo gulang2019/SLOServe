@@ -1,0 +1,37 @@
+{
+  "experiment_name": "disagg_code_n_device_policy_shard1",
+  "extends": [
+    "base.json"
+  ],
+  "policies": [
+    "round_robin-disagg-d1:qlm",
+    "round_robin-disagg-d2:qlm"
+  ],
+  "traces": [
+    "azure_code_23:azure_code_23"
+  ],
+  "server_router_kwargs": {
+    "kv_xfer_delay": 0.12
+  },
+  "configs": {
+    "azure_code_23:azure_code_23": {
+      "window": "t1200:1800",
+      "load_scale": 1.0,
+      "n_devices": [8, 7, 6, 5],
+      "slo_tpot": [0.025],
+      "slo_routing_overhead": 0.3,
+      "extra_args": [
+        "--kv_xfer_delay",
+        "0.12",
+        "--frontend_httpx_max_keepalive_connections",
+        "2000",
+        "--frontend_httpx_max_connections",
+        "2000"
+      ],
+      "perf_model_err": 1.05,
+      "scheduling_safety_margin": 0.002,
+      "ttft_slo_scale": 5.0
+    }
+  },
+  "output_dir": "experiments_disagg_code_n_device/policy_shard1"
+}

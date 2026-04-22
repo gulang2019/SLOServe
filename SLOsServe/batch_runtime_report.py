@@ -52,6 +52,7 @@ def build_trace_runtime_report(
         * len(spec["ttft_slo_scales"])
         * len(spec["slo_tpots"])
         * len(spec["perf_model_errs"])
+        * len(spec.get("decode_length_offsets", ["0"]))
     )
     requested_device_count = len(spec["n_devices"])
 

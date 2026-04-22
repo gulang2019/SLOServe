@@ -43,6 +43,7 @@ DEFAULT_LOAD_SCALES=("1.0")
 DEFAULT_TTFT_SLO_SCALES=("5.0")
 DEFAULT_SLO_TPOTS=("0.05")
 DEFAULT_PERF_MODEL_ERRS=("1.0")
+DEFAULT_DECODE_LENGTH_OFFSETS=("0")
 
 load_config() {
   local trace="$1"
@@ -64,6 +65,13 @@ load_config() {
     read -r -a ttft_slo_scales <<< "${TRACE_TTFT_SLO_SCALES[$key]}"
     read -r -a slo_tpots <<< "${TRACE_SLO_TPOTS[$key]}"
     read -r -a perf_model_errs <<< "${TRACE_PERF_MODEL_ERRS[$key]}"
+    decode_length_offsets_explicit=0
+    if [[ -n "${TRACE_DECODE_LENGTH_OFFSETS[$key]:-}" ]]; then
+      read -r -a decode_length_offsets <<< "${TRACE_DECODE_LENGTH_OFFSETS[$key]}"
+      decode_length_offsets_explicit=1
+    else
+      decode_length_offsets=("${DEFAULT_DECODE_LENGTH_OFFSETS[@]}")
+    fi
     read -r -a trace_policies <<< "${TRACE_POLICIES[$key]}"
     extra_bench_args=()
     if [[ -n "${TRACE_EXTRA_ARGS_SHELL[$key]:-}" ]]; then
@@ -112,6 +120,8 @@ load_config() {
   ttft_slo_scales=("${DEFAULT_TTFT_SLO_SCALES[@]}")
   slo_tpots=("${DEFAULT_SLO_TPOTS[@]}")
   perf_model_errs=("${DEFAULT_PERF_MODEL_ERRS[@]}")
+  decode_length_offsets=("${DEFAULT_DECODE_LENGTH_OFFSETS[@]}")
+  decode_length_offsets_explicit=0
   trace_policies=("${POLICIES[@]}")
   extra_bench_args=()
   model_name="$DEFAULT_MODEL_NAME"
@@ -158,29 +168,41 @@ make_run_key() {
   local policy="$2"
   local slo_tpots_key="${slo_tpots[*]}"
   local perf_model_errs_key="${perf_model_errs[*]}"
+  local decode_length_offsets_key="${decode_length_offsets[*]}"
   shift 2
 
   if (($# >= 2)) && [[ ! "$1" =~ ^[0-9]+$ ]]; then
     slo_tpots_key="$1"
     perf_model_errs_key="$2"
     shift 2
+    if ((decode_length_offsets_explicit)) && (($# >= 1)); then
+      decode_length_offsets_key="$1"
+      shift 1
+    fi
   fi
 
   local devices=("$@")
   local length_trace="$trace"
   local arrival_trace="$trace"
+  local sweep_key
 
   if [[ "$trace" == *:* && "${trace#*:}" != *:* ]]; then
     length_trace="${trace%%:*}"
     arrival_trace="${trace#*:}"
   fi
 
+  sweep_key="$window|load_scales=${load_scales[*]}|ttft_slo_scales=${ttft_slo_scales[*]}|slo_tpots=${slo_tpots_key}|perf_model_errs=${perf_model_errs_key}"
+  if ((decode_length_offsets_explicit)); then
+    sweep_key+="|decode_length_offsets=${decode_length_offsets_key}"
+  fi
+  sweep_key+="|model_name=${model_name}|tensor_parallel_size=${tensor_parallel_size}|profit=${profit}|admission_mode=${admission_mode}|slo_routing_overhead=${slo_routing_overhead}|scheduling_overhead=${scheduling_overhead}|scheduling_safety_margin=${scheduling_safety_margin}|routing_overhead=${routing_overhead}|routing_fallback_policy=${routing_fallback_policy}|output_dir=${output_dir}|extra_args=${extra_bench_args[*]}"
+
   printf '%s|%s|%s|%s|%s|%s\n' \
     "$EXPERIMENT_NAME" \
     "$length_trace" \
     "$arrival_trace" \
     "$policy" \
-    "$window|load_scales=${load_scales[*]}|ttft_slo_scales=${ttft_slo_scales[*]}|slo_tpots=${slo_tpots_key}|perf_model_errs=${perf_model_errs_key}|model_name=${model_name}|tensor_parallel_size=${tensor_parallel_size}|profit=${profit}|admission_mode=${admission_mode}|slo_routing_overhead=${slo_routing_overhead}|scheduling_overhead=${scheduling_overhead}|scheduling_safety_margin=${scheduling_safety_margin}|routing_overhead=${routing_overhead}|routing_fallback_policy=${routing_fallback_policy}|output_dir=${output_dir}|extra_args=${extra_bench_args[*]}" \
+    "$sweep_key" \
     "${devices[*]}"
 }
 
@@ -341,6 +363,8 @@ run_suite() {
   local trace_server_router_kwargs_base
   local current_slo_tpot
   local current_perf_model_err
+  local current_decode_length_offset
+  local decode_length_offsets_explicit=0
 
   available_clients="$(count_clients_spec "$SERVER_CLIENTS")"
   trap 'cleanup_server "$server_pid"' EXIT
@@ -354,7 +378,7 @@ run_suite() {
       if ! policy_supports_partial_rr "$policy"; then
         mapfile -t run_devices < <(filter_compatible_devices "$available_clients" "${n_devices[@]}")
         if ((${#run_devices[@]} == 0)); then
-          run_key="$(make_run_key "$trace" "$policy" "${slo_tpots[*]}" "${perf_model_errs[*]}" "${n_devices[@]}")"
+          run_key="$(make_run_key "$trace" "$policy" "${slo_tpots[*]}" "${perf_model_errs[*]}" "${decode_length_offsets[*]}" "${n_devices[@]}")"
           echo "SKIP (no compatible client counts for non-RR policy): $run_key"
           echo "  available_clients=$available_clients"
           echo "  requested_n_devices=${n_devices[*]}"
@@ -365,7 +389,8 @@ run_suite() {
 
       for current_perf_model_err in "${perf_model_errs[@]}"; do
         for current_slo_tpot in "${slo_tpots[@]}"; do
-          run_key="$(make_run_key "$trace" "$policy" "$current_slo_tpot" "$current_perf_model_err" "${run_devices[@]}")"
+          for current_decode_length_offset in "${decode_length_offsets[@]}"; do
+          run_key="$(make_run_key "$trace" "$policy" "$current_slo_tpot" "$current_perf_model_err" "$current_decode_length_offset" "${run_devices[@]}")"
 
           if already_succeeded "$run_key"; then
             echo "SKIP (already succeeded): $run_key"
@@ -398,6 +423,9 @@ run_suite() {
           echo "  ttft_slo_scales=${ttft_slo_scales[*]}"
           echo "  slo_tpots=$current_slo_tpot"
           echo "  perf_model_errs=$current_perf_model_err"
+          if ((decode_length_offsets_explicit)); then
+            echo "  decode_length_offset=$current_decode_length_offset"
+          fi
           echo "  model_name=$model_name"
           echo "  tensor_parallel_size=$tensor_parallel_size"
           echo "  profit=$profit"
@@ -439,6 +467,7 @@ run_suite() {
             --output_dir "$output_dir"
             --routing_overhead "$routing_overhead"
             --routing_fallback_policy "$routing_fallback_policy"
+            --benchmark_decode_length_offset "$current_decode_length_offset"
             "${extra_bench_args[@]}"
           )
 
@@ -460,6 +489,7 @@ run_suite() {
             cleanup_server "$server_pid"
             server_pid=""
           fi
+          done
         done
       done
     done
