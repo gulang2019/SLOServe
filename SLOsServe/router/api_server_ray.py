@@ -68,6 +68,10 @@ def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
 logger = setup_logger("SLOsServe.router.api_server", os.getenv("SLOSSERVE_LOG_LEVEL", "INFO"))
 
 POST_ADMISSION_OOM_REJECTION_REASON = "POST_ADMISSION_OOM"
+INHERITED_WORKER_ENV_KEYS = (
+    "SLOSSERVE_ENERGY_INTERVAL_S",
+    "SLOSSERVE_ENERGY_SAMPLE_HZ",
+)
 
 
 def _build_rejection_response(
@@ -180,6 +184,9 @@ def _format_load_statistics_table(
         {"label": "dev", "key": None, "align": "left", "kind": "text"},
         {"label": "wait", "key": "n_waitings", "align": "right", "kind": "int", "agg": "sum"},
         {"label": "run", "key": "n_running", "align": "right", "kind": "int", "agg": "sum"},
+        {"label": "w_att", "key": "n_waiting_attainable", "align": "right", "kind": "int", "agg": "sum"},
+        {"label": "w_kv", "key": "n_waiting_kv_xfer", "align": "right", "kind": "int", "agg": "sum"},
+        {"label": "w_unatt", "key": "n_waiting_unattainable", "align": "right", "kind": "int", "agg": "sum"},
         {"label": "free", "key": "num_free_blocks", "align": "right", "kind": "int", "agg": "sum"},
         {"label": "eff_free", "key": "effective_num_free_blocks", "align": "right", "kind": "int", "agg": "sum"},
         {"label": "oom", "key": "n_oom_rejects", "align": "right", "kind": "int", "agg": "sum"},
@@ -253,12 +260,41 @@ def _format_load_statistics_table(
             "kind": "int",
             "agg": "sum",
         },
+        {
+            "label": "thr",
+            "key": "backend_threshold_active_count",
+            "align": "right",
+            "kind": "int",
+            "agg": "sum",
+        },
+        {
+            "label": "thr_arr",
+            "key": "backend_threshold_arrived_count",
+            "align": "right",
+            "kind": "int",
+            "agg": "sum",
+        },
+        {
+            "label": "thr_pend",
+            "key": "backend_threshold_pending_count",
+            "align": "right",
+            "kind": "int",
+            "agg": "sum",
+        },
+        {
+            "label": "adm_pend",
+            "key": "backend_pending_admitted_count",
+            "align": "right",
+            "kind": "int",
+            "agg": "sum",
+        },
     ]
     if not isinstance(load_statistics, list) or not load_statistics:
         return (
-            "dev | wait | run | free | eff_free | oom | arr_oom | post_oom | power_w | avg_power_w | "
-            "ctrl_est_ms | ctrl_elap_ms | ctrl_avg_ms | ctrl_last_ms | ctrl_n | "
-            "ctrl_slk_ms | recover | reg | reg_rej\n<empty>"
+            "dev | wait | run | w_att | w_kv | w_unatt | free | eff_free | oom | arr_oom | "
+            "post_oom | power_w | avg_power_w | ctrl_est_ms | ctrl_elap_ms | ctrl_avg_ms | "
+            "ctrl_last_ms | ctrl_n | ctrl_slk_ms | recover | reg | reg_rej | thr | thr_arr | "
+            "thr_pend | adm_pend\n<empty>"
         )
 
     def _numeric_value(stats: dict[str, Any], key: str, kind: str) -> int | float:
@@ -483,9 +519,25 @@ def _build_worker_energy_csv_path(filename: str, device_id: int) -> str:
 
 
 class WorkerEnergyProfiler:
-    def __init__(self, *, device_id: int, interval_s: float = 0.1):
+    def __init__(
+        self,
+        *,
+        device_id: int,
+        interval_s: float = 0.1,
+        sample_hz: float | None = None,
+    ):
         self.device_id = device_id
-        self.interval_s = interval_s
+        try:
+            self.interval_s = max(1e-6, float(interval_s))
+        except (TypeError, ValueError):
+            self.interval_s = 0.1
+        if sample_hz is None:
+            self.sample_hz = 1.0 / self.interval_s
+        else:
+            try:
+                self.sample_hz = max(1e-6, float(sample_hz))
+            except (TypeError, ValueError):
+                self.sample_hz = 1.0 / self.interval_s
         self.physical_gpu_ids = self._detect_physical_gpu_ids()
         self.csv_path: str | None = None
         self._meter: EnergyMeter | None = None
@@ -586,7 +638,10 @@ class WorkerEnergyProfiler:
         self.csv_path = csv_path
         if self.csv_path:
             _ensure_parent_dir(self.csv_path)
-        self._meter = EnergyMeter(devices=self.physical_gpu_ids or None)
+        self._meter = EnergyMeter(
+            devices=self.physical_gpu_ids or None,
+            sample_hz=self.sample_hz,
+        )
         self._meter.start()
         self._started_at = time.time()
         self._recorder = EnergyHistoryRecorder(
@@ -855,6 +910,18 @@ def _parse_worker_env_args(raw_envs: list[str] | None) -> dict[str, str]:
             env_vars[key] = value
     return env_vars
 
+
+def _with_inherited_worker_env(env_vars: dict[str, str]) -> dict[str, str]:
+    merged = dict(env_vars)
+    for key in INHERITED_WORKER_ENV_KEYS:
+        if key in merged:
+            continue
+        value = os.environ.get(key)
+        if value is not None:
+            merged[key] = value
+    return merged
+
+
 def _task_done(task: asyncio.Task):
     try:
         task.result()  # re-raises exception if task failed
@@ -941,9 +1008,17 @@ class EngineWorker:
         self._mux_task.add_done_callback(_task_done)
         self._profile_events = []
         self._energy_store_prefix: str | None = None
+        energy_interval_s = float(os.getenv("SLOSSERVE_ENERGY_INTERVAL_S", "0.1"))
+        raw_energy_sample_hz = os.getenv("SLOSSERVE_ENERGY_SAMPLE_HZ")
+        energy_sample_hz = (
+            float(raw_energy_sample_hz)
+            if raw_energy_sample_hz not in (None, "")
+            else None
+        )
         self._energy_profiler = None if mock_engine else WorkerEnergyProfiler(
             device_id=device_id,
-            interval_s=float(os.getenv("SLOSSERVE_ENERGY_INTERVAL_S", "0.1")),
+            interval_s=energy_interval_s,
+            sample_hz=energy_sample_hz,
         )
         
     async def wait_until_ready(self):
@@ -2652,6 +2727,34 @@ class SLOsServeRouter(Router):
     ) -> None:
         self._prefetched_raw_engine_states = raw_engine_states
 
+    def _is_full_decode_device(self, did: int) -> bool:
+        if not self.is_pd_disagg:
+            return False
+        if not (0 <= int(did) < self.n_devices):
+            return False
+        return (int(did) % self.group_size) >= self.n_prefill_or_mixed_per_group
+
+    def update_json(self, request_json: dict, i: int):
+        new_request_json = request_json.copy()
+        scheduling_kwargs = new_request_json.get('scheduling_kwargs')
+        if isinstance(scheduling_kwargs, dict):
+            scheduling_kwargs = dict(scheduling_kwargs)
+        else:
+            scheduling_kwargs = {}
+        if self._is_full_decode_device(i):
+            if self.threshold_admission_request_limit is not None:
+                scheduling_kwargs.setdefault(
+                    "threshold_admission_request_limit",
+                    int(self.threshold_admission_request_limit),
+                )
+        else:
+            scheduling_kwargs.pop(
+                "threshold_admission_request_limit",
+                None,
+            )
+        new_request_json['scheduling_kwargs'] = scheduling_kwargs
+        return new_request_json
+
     def consume_decode_migration_plan(self) -> dict[str, int]:
         plan = dict(getattr(self, "_decode_migration_plan", {}))
         self._decode_migration_plan = {}
@@ -2844,11 +2947,16 @@ class SLOsServeRouter(Router):
 
     def _threshold_applies_to_device_requests(
         self,
+        did: int,
         running_requests: List[RequestInstance],
         waiting_requests: List[RequestInstance],
         mode: str,
     ) -> bool:
-        if not self._uses_threshold_admission() or mode != "decode_only":
+        if (
+            not self._uses_threshold_admission()
+            or mode != "decode_only"
+            or not self._is_full_decode_device(did)
+        ):
             return False
         requests = [
             req for req in (list(running_requests) + list(waiting_requests))
@@ -2867,6 +2975,7 @@ class SLOsServeRouter(Router):
         mode: str,
     ) -> List[RequestInstance] | None:
         if not self._threshold_applies_to_device_requests(
+            did,
             running_requests,
             waiting_requests,
             mode,
@@ -5976,7 +6085,8 @@ def start_engine(clients: list):
             ray.init(log_to_driver=True, logging_level=ray_log_level)
 
     n_devices = len(clients)
-    worker_env = _parse_worker_env_args(args.worker_env)
+    worker_env = _with_inherited_worker_env(
+        _parse_worker_env_args(args.worker_env))
     print('clients: ', clients, 'n_devices: ', n_devices,
           'tensor_parallel_size: ', args.tensor_parallel_size,
           'worker_env: ', worker_env)

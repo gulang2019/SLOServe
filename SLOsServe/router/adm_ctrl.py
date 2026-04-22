@@ -112,6 +112,14 @@ class BatchPlanner:
             "backend_accepted_regular_count": 0,
             "backend_rejected_regular_count": 0,
             "backend_earliest_deadline_laxity_ms": 0.0,
+            "backend_threshold_enabled": 0,
+            "backend_threshold_limit": 0,
+            "backend_threshold_active_count": 0,
+            "backend_threshold_arrived_count": 0,
+            "backend_threshold_pending_count": 0,
+            "backend_threshold_decode_only_count": 0,
+            "backend_threshold_non_decode_count": 0,
+            "backend_pending_admitted_count": 0,
         }
 
     def __post_init__(self):
@@ -334,6 +342,22 @@ class BatchPlanner:
         self._admitted_requests.append(new_req.request_id)
         self._last_infeasible_reason = None
 
+    def _drain_arrived_admitted_requests(self) -> set[str]:
+        arrived_admitted: set[str] = set()
+        pending_admitted: list[str] = []
+        seen_pending: set[str] = set()
+        for req_id in self._admitted_requests:
+            req = self._requests.get(req_id)
+            if req is None or req.finished(self._is_oracle):
+                continue
+            if req.arrived:
+                arrived_admitted.add(req_id)
+            elif req_id not in seen_pending:
+                pending_admitted.append(req_id)
+                seen_pending.add(req_id)
+        self._admitted_requests = pending_admitted
+        return arrived_admitted
+
     def _uses_threshold_admission(self) -> bool:
         return self._threshold_admission_request_limit is not None
 
@@ -343,7 +367,7 @@ class BatchPlanner:
             and req.num_computed_tokens >= req.num_prompt_tokens
         )
 
-    def _active_requests(
+    def _threshold_tracked_requests(
         self,
         exclude_request_id: str | None = None,
     ) -> list[Request]:
@@ -352,8 +376,7 @@ class BatchPlanner:
             for req_id, req in self._requests.items()
             if (
                 req_id != exclude_request_id
-                and req.arrived
-                and not req.finished(self._is_oracle)
+                and self._counts_against_threshold(req)
             )
         ]
 
@@ -362,7 +385,7 @@ class BatchPlanner:
             return False
         if not self._is_decode_only_request(new_req):
             return False
-        active_reqs = self._active_requests(
+        active_reqs = self._threshold_tracked_requests(
             exclude_request_id=new_req.request_id,
         )
         return all(self._is_decode_only_request(req) for req in active_reqs)
@@ -377,14 +400,46 @@ class BatchPlanner:
         self,
         exclude_request_id: str | None = None,
     ) -> int:
-        return sum(
-            1
-            for req_id, req in self._requests.items()
-            if (
-                req_id != exclude_request_id
-                and self._counts_against_threshold(req)
+        return len(
+            self._threshold_tracked_requests(
+                exclude_request_id=exclude_request_id,
             )
         )
+
+    def _threshold_state(self) -> dict[str, int]:
+        uses_threshold = self._uses_threshold_admission()
+        active_reqs = (
+            self._threshold_tracked_requests()
+            if uses_threshold
+            else []
+        )
+        arrived_reqs = [req for req in active_reqs if req.arrived]
+        decode_only_reqs = [
+            req for req in active_reqs if self._is_decode_only_request(req)
+        ]
+        pending_admitted_ids = {
+            req_id
+            for req_id in self._admitted_requests
+            if (
+                (req := self._requests.get(req_id)) is not None
+                and not req.arrived
+                and not req.finished(self._is_oracle)
+            )
+        }
+        return {
+            "backend_threshold_enabled": 1 if uses_threshold else 0,
+            "backend_threshold_limit": int(
+                self._threshold_admission_request_limit or 0
+            ),
+            "backend_threshold_active_count": len(active_reqs),
+            "backend_threshold_arrived_count": len(arrived_reqs),
+            "backend_threshold_pending_count": len(active_reqs) - len(arrived_reqs),
+            "backend_threshold_decode_only_count": len(decode_only_reqs),
+            "backend_threshold_non_decode_count": (
+                len(active_reqs) - len(decode_only_reqs)
+            ),
+            "backend_pending_admitted_count": len(pending_admitted_ids),
+        }
 
     def _threshold_feasible_with_new(
         self,
@@ -785,22 +840,16 @@ class BatchPlanner:
         if not len(reqs): 
             return True, set()
 
-        active_reqs = self._active_requests()
+        active_reqs = self._threshold_tracked_requests()
         if (
             self._uses_threshold_admission()
             and active_reqs
             and all(self._is_decode_only_request(req) for req in active_reqs)
         ):
-            limit = int(self._threshold_admission_request_limit or 0)
-            ranked_reqs = sorted(
-                reqs,
-                key=lambda req: (req.get_next_ddl(), req.request_id),
-            )
-            accepted_ids = {
-                req.request_id
-                for req in ranked_reqs[:limit]
-            }
-            return len(reqs) <= limit, accepted_ids
+            # Threshold admission happens when a request is registered. Refresh
+            # should only schedule already-admitted work so over-limit state can
+            # drain instead of stranding requests in the backend.
+            return True, {req.request_id for req in reqs}
         
         tpot = min(r.slo_tpot for r in reqs)
         self._ensure_cpp_planner(tpot)
@@ -842,7 +891,9 @@ class BatchPlanner:
         return self._last_infeasible_reason
 
     def get_backend_admission_state(self) -> dict[str, int | float]:
-        return dict(self._last_backend_admission_state)
+        state = dict(self._last_backend_admission_state)
+        state.update(self._threshold_state())
+        return state
         
     def get_next_batch_and_admitted_reqs(self) -> tuple[dict[str, int], set[str], ExecPlan]:
         start = time.time()
@@ -857,8 +908,7 @@ class BatchPlanner:
             self._next_batch_time = None 
             return {}, set(), ExecPlan()
         assert len(self._batch_plan)
-        admitted_requests = set(self._admitted_requests)
-        self._admitted_requests.clear()
+        admitted_requests = self._drain_arrived_admitted_requests()
         next_batch = self._batch_plan[0]
         if self._enforce_batch_memory_budget:
             next_batch, memory_limited = self._fit_batch_to_memory_budget(next_batch)
@@ -960,6 +1010,76 @@ class BatchPlanner:
             x for x in load_ddls
             if self._requests[x[0]].service_tier == "best_effort"
         ]
+        threshold_decode_only_batch = (
+            self._uses_threshold_admission()
+            and bool(regular_load_ddls)
+            and all(
+                self._is_decode_only_request(self._requests[req_id])
+                for req_id, _next_ddl, _next_load in load_ddls
+            )
+            and all(
+                self._is_decode_only_request(req)
+                for req in self._threshold_tracked_requests()
+            )
+        )
+        if threshold_decode_only_batch:
+            accepted_regular_ids = {
+                req_id for req_id, _next_ddl, _next_load in regular_load_ddls
+            }
+            self._last_backend_admission_state = {
+                "backend_admission_checked": 1,
+                "backend_recovery_state": 0,
+                "backend_regular_feasible": 1,
+                "backend_regular_count": len(regular_load_ddls),
+                "backend_accepted_regular_count": len(accepted_regular_ids),
+                "backend_rejected_regular_count": 0,
+                "backend_earliest_deadline_laxity_ms": (
+                    1000.0 * float(regular_load_ddls[0][1])
+                    if regular_load_ddls else 0.0
+                ),
+            }
+            scheduled_load_ddls = regular_load_ddls + best_effort_load_ddls
+            n_scheduled_tokens = {
+                req_id: 1
+                for req_id, _next_ddl, next_load in scheduled_load_ddls
+                if next_load > 0
+            }
+            if not n_scheduled_tokens:
+                return True, [], None
+            first_req_id, _first_next_ddl, first_next_load = scheduled_load_ddls[0]
+            b = Batch(
+                start_time=now,
+                unscheduled_tokens=0,
+                n_scheduled_tokens=n_scheduled_tokens,
+            )
+            total_scheduled_tokens = sum(n_scheduled_tokens.values())
+            total_past_tokens = sum(
+                self._requests[req_id].num_computed_tokens
+                for req_id in n_scheduled_tokens
+            )
+            self._emit_planner_sch_event({
+                'batch_id': self.batch_id,
+                'load_ddls': load_ddls,
+                'sch': b.n_scheduled_tokens,
+                'unsched_tokens': b.unscheduled_tokens,
+                'accepted_regular_count': len(accepted_regular_ids),
+                'rejected_regular_count': 0,
+                'batch_size_source': "threshold_decode_only",
+                'batch_time_budget': 0.0,
+                'selected_deadline_req_id': first_req_id,
+                'selected_deadline_cumulative_load': first_next_load,
+                'selected_deadline_total_past_tokens': self._requests[
+                    first_req_id
+                ].num_computed_tokens,
+                'selected_deadline_num_reqs': 1,
+                'regular_feasible': True,
+                'fast_sched_perf_mode': self._fast_sched_perf_mode,
+                'total_past_tokens': total_past_tokens,
+                'total_scheduled_tokens': total_scheduled_tokens,
+                'num_scheduled_reqs': len(n_scheduled_tokens)
+            })
+            return True, [b], None
+
         batch_time_budget = 0.0
         batch_size = 0
         batch_size_source = "none"
