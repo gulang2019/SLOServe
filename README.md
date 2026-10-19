@@ -66,10 +66,44 @@ cd -
 ```
 > Trouble shooting 1 ImportError:..._C.abi3.so: undefined symbol... : Comment out import vllm._C in SLOServe/3rdparty/vllm/vllm/platforms/cuda.py:18
 
+### uv alternative
+
+If `uv` is available, the bootstrap script creates a Python 3.10 virtual
+environment and installs the pinned modified-vLLM submodule plus the native
+SLOServe extension. It intentionally does not update `3rdparty/vllm` beyond
+the revision recorded by the SLOServe checkout.
+
+```sh
+./scripts/setup_uv.sh
+source .venv/bin/activate
+export PYTHONPATH=$PWD
+```
+
 ```sh
 # download traces
 PYTHONPATH=. python Dataset/download_dataset.py # this takes minutes
 ```
+
+### BEAM baseline (Qwen2.5-7B)
+
+BEAM is provided as `3rdparty/BEAM` and runs in its evaluator container. Its
+S1+S2 DVFS mode needs an offline profile for the exact GPU, model, and
+parallelism configuration. Profile and serve with the same memory-utilization
+setting; lower it when other processes already occupy GPU memory.
+
+```sh
+BEAM_GPU=0 BEAM_GPU_MEMORY_UTILIZATION=0.85 ./scripts/profile_beam_qwen7b.sh
+BEAM_GPU=0 BEAM_PORT=8008 BEAM_GPU_MEMORY_UTILIZATION=0.85 \
+  BEAM_MODE=s1s2 ./scripts/serve_beam_qwen7b.sh
+curl -fsS http://127.0.0.1:8008/v1/models
+```
+
+BEAM's endpoint is OpenAI-compatible. Its native traced benchmark accepts a
+CSV with `TIMESTAMP`, `ContextTokens`, and `GeneratedTokens` columns. The
+current Figure 7 driver cannot target BEAM directly: it requires SLOServe
+control-plane endpoints and its curves sweep independent replicas. An exact
+Figure 7 BEAM baseline therefore needs a multi-replica adapter and trace
+converter. Stop the service with `./scripts/stop_beam_qwen7b.sh`.
 
 ## Step 2: Launch distributed api server
 

@@ -9,6 +9,7 @@ beam_root="$repo_root/3rdparty/BEAM"
 container_name="vllm_evaluator_env"
 beam_gpu="${BEAM_GPU:-0}"
 beam_model="${BEAM_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+beam_memory_utilization="${BEAM_GPU_MEMORY_UTILIZATION:-0.90}"
 
 if ! nvidia-smi -i "$beam_gpu" >/dev/null 2>&1; then
   echo "BEAM_GPU=$beam_gpu is not an available NVIDIA GPU." >&2
@@ -25,7 +26,7 @@ docker exec \
   -e "CUDA_VISIBLE_DEVICES=$beam_gpu" \
   -e "HF_TOKEN=${HF_TOKEN:-}" \
   "$container_name" \
-  bash -lc "cd /workspace/benchmarks/energy && ./run_offline_profile.sh --model '$beam_model' --tp 1 --pp 1"
+  bash -lc "cd /workspace/benchmarks/energy && ./run_offline_profile.sh --model '$beam_model' --tp 1 --pp 1 --gpu-memory-utilization '$beam_memory_utilization'"
 
 gpu_name="$(nvidia-smi -i "$beam_gpu" --query-gpu=name --format=csv,noheader | head -n 1)"
 model_name_clean="${beam_model//\//_}"
