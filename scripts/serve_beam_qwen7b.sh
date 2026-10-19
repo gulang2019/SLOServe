@@ -63,9 +63,12 @@ if docker exec "$container_name" pgrep -f 'vllm serve' >/dev/null 2>&1; then
   exit 1
 fi
 
+# This non-empty setting enables BEAM's /start_profile and /stop_profile
+# endpoints. Per-run benchmarks override the output directory.
 docker exec -d \
   -e "CUDA_VISIBLE_DEVICES=$beam_gpu" \
   -e "HF_TOKEN=${HF_TOKEN:-}" \
+  -e "VLLM_TORCH_PROFILER_DIR=/workspace/benchmarks/energy/results" \
   "$container_name" \
   bash -lc "cd /workspace/benchmarks/energy && exec vllm serve '$beam_model' --host 0.0.0.0 --port '$beam_port' --tensor-parallel-size 1 --pipeline-parallel-size 1 --max-model-len '$beam_max_model_len' --gpu-memory-utilization '$beam_memory_utilization' ${beam_extra_args[*]} > /tmp/beam-qwen7b.log 2>&1"
 

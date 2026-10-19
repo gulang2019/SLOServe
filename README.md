@@ -116,6 +116,61 @@ The files are written under `3rdparty/BEAM/benchmarks/energy/datasets/`.
 The multi-round export is flattened because BEAM's traced CSV format has no
 session-dependency or prefix-cache-affinity field.
 
+To retain per-request timings, run BEAM's native benchmark with both
+`--save-result` and `--save-detailed`.  The resulting JSON contains the
+request-order-aligned `entry_times`, `ttfts`, `itls`, `e2el`, `successes`, and
+`errors` arrays.
+
+```sh
+docker exec -it vllm_evaluator_env bash -lc '
+  cd /workspace/benchmarks/energy
+  PYTHONPATH=/workspace/benchmarks:$PYTHONPATH python benchmark_script.py \
+    --backend vllm --host 127.0.0.1 --port 8008 \
+    --endpoint /v1/completions --model Qwen/Qwen2.5-7B-Instruct \
+    --dataset-name traced \
+    --dataset-path /workspace/benchmarks/energy/datasets/sloserve_fig7_chat_7b_t1200_1800.csv \
+    --save-result --save-detailed --result-dir results/beam-7b \
+    --result-filename chat_7b.json --disable-tqdm
+'
+```
+
+Score that detailed result using SLOServe's rule with
+`scripts/score_beam_detailed_results.py`.  Supply the *unscaled* zero-load
+TTFT affine parameters from the same SLOServe performance-model profile used
+for the comparison; the script applies `scale * (constant + per_token * input)`
+and treats a request as compliant only if TTFT meets that budget and
+`p90(ITL) <= slo_tpot`.  Its JSONL output also reconstructs client-send,
+first-token, and every generated-token timestamp relative to benchmark start.
+
+```sh
+python scripts/score_beam_detailed_results.py \
+  --result /path/to/chat_7b.json \
+  --trace 3rdparty/BEAM/benchmarks/energy/datasets/sloserve_fig7_chat_7b_t1200_1800.csv \
+  --output results/beam-7b/chat_7b.sloserve.jsonl \
+  --ttft-scale 3 --zero-load-ttft-per-token 5.55e-05 \
+  --zero-load-ttft-constant 0.014 --routing-overhead 0.05 \
+  --slo-tpot 0.025
+```
+
+`scripts/run_beam_figure7_7b.sh` automates the three 7B Figure 7 traces
+(ChatBot, Coder, and Mixed), captures BEAM's S1/S2 logs and NVML energy trace,
+derives a per-GPU power timeline, and emits the SLOServe-scored JSONL. Start
+or restart the server with the script above first so its profiling endpoints
+are enabled, then run either all traces or only the first smoke-test trace:
+
+```sh
+./scripts/run_beam_figure7_7b.sh
+./scripts/run_beam_figure7_7b.sh --first-trace
+```
+
+Each run directory contains `beam_detailed.json`, `per_request_slo.jsonl`,
+`power_timeline_gpu_0.csv`, BEAM's S1/S2 scheduler logs, and `slo_config.txt`.
+BEAM accepts only one server-wide TTFT setting, whereas SLOServe's Figure 7
+budget is prompt-length dependent. The runner uses the median request budget
+for BEAM control by default (`--ttft-quantile` selects another percentile) and
+scores the exact per-request budget offline; do not use BEAM's aggregate
+goodput field as the Figure 7 SLO result.
+
 ## Step 2: Launch distributed api server
 
 Launch a distributed api_server (router + engine).
