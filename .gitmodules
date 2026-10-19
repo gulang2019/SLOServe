@@ -34,3 +34,6 @@
 [submodule "Paper"]
 	path = Paper
 	url = git@github.com:gulang2019/SLOsServe-SOSP-26.git
+[submodule "3rdparty/BEAM"]
+	path = 3rdparty/BEAM
+	url = https://github.com/jlee335/BEAM-artifact.git

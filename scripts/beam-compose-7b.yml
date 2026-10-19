@@ -1,0 +1,5 @@
+services:
+  evaluator:
+    # BEAM's base compose file is evaluator-oriented and does not publish the
+    # vLLM port. Host networking makes the dedicated API reachable at PORT.
+    network_mode: host
