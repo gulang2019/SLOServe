@@ -105,6 +105,17 @@ control-plane endpoints and its curves sweep independent replicas. An exact
 Figure 7 BEAM baseline therefore needs a multi-replica adapter and trace
 converter. Stop the service with `./scripts/stop_beam_qwen7b.sh`.
 
+Generate BEAM traced inputs from the local Figure 7 request and arrival
+artifacts (the common `t1200:1800` window) with:
+
+```sh
+python scripts/export_beam_figure7_traces.py
+```
+
+The files are written under `3rdparty/BEAM/benchmarks/energy/datasets/`.
+The multi-round export is flattened because BEAM's traced CSV format has no
+session-dependency or prefix-cache-affinity field.
+
 ## Step 2: Launch distributed api server
 
 Launch a distributed api_server (router + engine).
