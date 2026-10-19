@@ -37,3 +37,6 @@
 [submodule "3rdparty/BEAM"]
 	path = 3rdparty/BEAM
 	url = https://github.com/jlee335/BEAM-artifact.git
+[submodule "SLO-Packer-MLSys-27"]
+	path = SLO-Packer-MLSys-27
+	url = git@github.com:gulang2019/SLO-Packer-MLSys-27.git

@@ -1,0 +1,77 @@
+diff --git a/benchmarks/benchmark_dataset.py b/benchmarks/benchmark_dataset.py
+index a4b5b34..95a0c19 100644
+--- a/benchmarks/benchmark_dataset.py
++++ b/benchmarks/benchmark_dataset.py
+@@ -425,6 +425,12 @@ class RandomTracedDataset(BenchmarkDataset):
+                          vocab_size).tolist()
+             token_sequence = inner_seq
+             prompt = tokenizer.decode(token_sequence)
++            # Decoded random ids re-tokenize into a different count (0.5x to
++            # 1.4x); trim so the server sees the trace's prompt length.
++            for _ in range(3):
++                token_sequence = tokenizer.encode(
++                    prompt, add_special_tokens=False)[:prompt_len]
++                prompt = tokenizer.decode(token_sequence)
+ 
+             requests.append(
+                 SampleRequest(
+@@ -499,6 +505,12 @@ class RandomTracedDataset(BenchmarkDataset):
+                          vocab_size).tolist()
+             token_sequence = inner_seq
+             prompt = tokenizer.decode(token_sequence)
++            # Decoded random ids re-tokenize into a different count (0.5x to
++            # 1.4x); trim so the server sees the trace's prompt length.
++            for _ in range(3):
++                token_sequence = tokenizer.encode(
++                    prompt, add_special_tokens=False)[:prompt_len]
++                prompt = tokenizer.decode(token_sequence)
+ 
+             requests.append(
+                 SampleRequest(
+diff --git a/benchmarks/energy/test_offline_profile_new.py b/benchmarks/energy/test_offline_profile_new.py
+index f06ea85..4b49903 100644
+--- a/benchmarks/energy/test_offline_profile_new.py
++++ b/benchmarks/energy/test_offline_profile_new.py
+@@ -72,9 +72,6 @@ def main(args: argparse.Namespace):
+     engine_args = EngineArgs.from_cli_args(args)
+     print("engine_args : ", engine_args)
+ 
+-    # Set GPU memory utilization.
+-    engine_args.gpu_memory_utilization = 0.90
+-
+     llm = LLM(**dataclasses.asdict(engine_args))
+     
+     ############################################################
+@@ -140,7 +137,13 @@ def main(args: argparse.Namespace):
+     except Exception as e:
+         print(f"Could not get clocks from pynvml: {e}, using default")
+         clocks = [1410, 1530, 1650]  # Default fallback clocks
+-    
++
++    # Optionally keep only N evenly spaced clocks (e.g., for a smoke run)
++    num_clocks = int(os.environ.get("BEAM_PROFILE_NUM_CLOCKS", "0"))
++    if 0 < num_clocks < len(clocks):
++        step = (len(clocks) - 1) / max(num_clocks - 1, 1)
++        clocks = [clocks[round(i * step)] for i in range(num_clocks)]
++
+     print(f"Using clocks: {clocks}")
+     
+     ############################################################
+diff --git a/vllm/v1/core/sched/energy_model.py b/vllm/v1/core/sched/energy_model.py
+index 63d52cc..e716ca0 100644
+--- a/vllm/v1/core/sched/energy_model.py
++++ b/vllm/v1/core/sched/energy_model.py
+@@ -107,6 +107,13 @@ class EnergySimulator:
+             self.default_clock_high = 1800
+             self.default_clock = 1260
+ 
++        # Snap defaults to the nearest profiled clock; the hardcoded values
++        # are not in every GPU's clock table (e.g. RTX 4090).
++        def nearest_clock(c):
++            return min(self.available_clocks, key=lambda a: abs(a - c))
++        self.default_clock_high = nearest_clock(self.default_clock_high)
++        self.default_clock = nearest_clock(self.default_clock)
++
+     def _load_profiling_data(self):
+         """Load and preprocess profiling CSV."""
+         # print the profiling_csv_path

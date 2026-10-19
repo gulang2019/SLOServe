@@ -19,6 +19,14 @@ from pathlib import Path
 from typing import Any
 
 
+def parse_trace_time(value: str) -> datetime:
+    """Parse BEAM trace timestamps; Python < 3.11 rejects "+0000" offsets."""
+    value = str(value).replace("Z", "+00:00")
+    if len(value) > 5 and value[-5] in "+-" and value[-4:].isdigit():
+        value = value[:-2] + ":" + value[-2:]
+    return datetime.fromisoformat(value)
+
+
 def percentile_90(values: list[float]) -> float | None:
     """Match numpy.percentile(values, 90) (linear interpolation)."""
     if not values:
@@ -69,8 +77,8 @@ def main() -> None:
 
     result = json.loads(args.result.read_text(encoding="utf-8"))
     trace = read_trace(args.trace)
-    trace_start = datetime.fromisoformat(
-        trace[0].get("TIMESTAMP", trace[0].get("timestamp", "")).replace("Z", "+00:00")
+    trace_start = parse_trace_time(
+        trace[0].get("TIMESTAMP", trace[0].get("timestamp", ""))
     )
     ttfts = result.get("ttfts", [])
     itls = result.get("itls", [])
@@ -90,8 +98,7 @@ def main() -> None:
     for index, source in enumerate(trace):
         trace_timestamp = source.get("TIMESTAMP", source.get("timestamp"))
         planned_arrival = (
-            datetime.fromisoformat(str(trace_timestamp).replace("Z", "+00:00"))
-            - trace_start
+            parse_trace_time(trace_timestamp) - trace_start
         ).total_seconds()
         prompt_tokens = int(source["ContextTokens"])
         target_output_tokens = int(source["GeneratedTokens"])
