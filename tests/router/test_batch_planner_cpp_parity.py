@@ -57,6 +57,13 @@ class _LinearPerfModel:
             / self.hardware_params[0]
         )
 
+    def configure_cpp_ar_planner(self, cpp_scheduler, *, tpots, fixed_bs):
+        cpp_scheduler.set_ar_planner(
+            tpots,
+            self.hardware_params,
+            fixed_bs,
+        )
+
 
 def _make_planner(
     request_specs: list[RequestSpec],

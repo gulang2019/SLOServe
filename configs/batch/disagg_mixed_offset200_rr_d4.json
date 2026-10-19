@@ -1,0 +1,10 @@
+{
+  "experiment_name": "disagg_mixed_offset200_rr_d4",
+  "extends": [
+    "disagg_mixed_offset200_base.json"
+  ],
+  "policies": [
+    "round_robin-disagg-d4:qlm"
+  ],
+  "output_dir": "experiments_disagg_mixed_offset200/rr_d4"
+}

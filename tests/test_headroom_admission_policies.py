@@ -25,10 +25,10 @@ class _DummyAdmCtrlScheduler:
     def __init__(self, *args, **kwargs):
         pass
 
-    def adm_ctrl(self, reqs, _num_free_blocks, _current_time):
+    def adm_ctrl(self, reqs, _num_free_blocks, _current_time, _online_slack=0.0):
         return True, [True] * len(reqs)
 
-    def adm_ctrl_with_reason(self, reqs, _num_free_blocks, _current_time):
+    def adm_ctrl_with_reason(self, reqs, _num_free_blocks, _current_time, _online_slack=0.0):
         return True, [True] * len(reqs), None
 
 

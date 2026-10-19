@@ -29,12 +29,14 @@ def test_run_batch_load_config_supports_compound_trace_key():
         load_config "$trace"
         printf 'window=%s\\n' "$window"
         printf 'policy_count=%s\\n' "${#trace_policies[@]}"
+        printf 'scheduling_safety_margin=%s\\n' "$scheduling_safety_margin"
         printf 'trace=%s\\n' "$trace"
         """
     )
 
     assert "window=t1200:1800" in result.stdout
     assert "policy_count=5" in result.stdout
+    assert "scheduling_safety_margin=0.002" in result.stdout
     assert "trace=sharegpt_code:azure_code_23+azure_chat_23:azure_chat_23" in result.stdout
 
 
@@ -55,6 +57,7 @@ def test_run_batch_make_run_key_preserves_simple_and_compound_traces():
         admission_mode='arrival'
         slo_routing_overhead='0.05'
         scheduling_overhead='0.003'
+        scheduling_safety_margin='0.002'
         routing_overhead='-1.0'
         routing_fallback_policy='asap'
         output_dir='experiments_test'
@@ -66,10 +69,12 @@ def test_run_batch_make_run_key_preserves_simple_and_compound_traces():
 
     lines = result.stdout.strip().splitlines()
     assert lines[0].startswith("emulation_0316|azure_chat|azure_chat|round_robin:atfc|")
+    assert "scheduling_safety_margin=0.002" in lines[0]
     assert lines[1].startswith(
         "emulation_0316|sharegpt_code:azure_code_23+azure_chat_23:azure_chat_23|"
         "sharegpt_code:azure_code_23+azure_chat_23:azure_chat_23|round_robin:atfc|"
     )
+    assert "scheduling_safety_margin=0.002" in lines[1]
 
 
 def test_run_batch_render_runtime_server_router_kwargs_applies_current_sweep_values():
@@ -82,6 +87,7 @@ def test_run_batch_render_runtime_server_router_kwargs_applies_current_sweep_val
           '{"block_size":16,"device_mem":1024,"tpot":0.05,"scheduling_overhead":0.005}' \
           'Qwen/Test-30B' \
           '0.003' \
+          '0.002' \
           '0.015' \
           '1.2'
         """
@@ -93,5 +99,6 @@ def test_run_batch_render_runtime_server_router_kwargs_applies_current_sweep_val
         "model_name": "Qwen/Test-30B",
         "perf_model_err": 1.2,
         "scheduling_overhead": 0.003,
+        "scheduling_safety_margin": 0.002,
         "tpot": 0.015,
     }

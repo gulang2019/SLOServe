@@ -1,0 +1,23 @@
+{
+  "experiment_name": "single_server_policy_grid_multi_round_chatting",
+  "extends": [
+    "../base.json"
+  ],
+  "server_clients": "0-0",
+  "policies": [
+    "slosserve_planner:atfc"
+  ],
+  "traces": [
+    "sharegpt_chat:azure_chat_23"
+  ],
+  "configs": {
+    "sharegpt_chat:azure_chat_23": {
+      "window": "t1200:1400",
+      "n_devices": [2]
+    }
+  },
+  "load_scales": [0.2, 0.4, 0.6, 0.8, 1.0],
+  "ttft_slo_scales": [2.0, 3.0, 5.0],
+  "slo_tpots": [0.015, 0.025, 0.05],
+  "extra_args": "--enable_session_replay --session_pause_s 5.0"
+}

@@ -48,3 +48,32 @@ def test_round_robin_router_keeps_round_robin_for_new_sessions():
 
     assert first.prefill_device_id == 0
     assert second.prefill_device_id == 1
+
+
+def test_round_robin_session_disagg_router_reuses_prefill_and_decode_homes():
+    router = api_server_ray.create_router(
+        "round_robin_session-disagg",
+        4,
+        {
+            "is_pd_disagg": True,
+            "group_size": 4,
+            "n_prefill_per_group": 2,
+        },
+    )
+
+    first = _make_request("req-0", session_id="session-1")
+    router.run([first], [])
+    router.note_request_state(first, api_server_ray.RequestState.DECODE_FINISHED)
+
+    second = _make_request("req-1", session_id="session-2")
+    router.run([second], [])
+
+    third = _make_request("req-2", session_id="session-1")
+    router.run([third], [])
+
+    assert first.prefill_device_id == 0
+    assert first.decode_device_id == 2
+    assert second.prefill_device_id == 1
+    assert second.decode_device_id == 3
+    assert third.prefill_device_id == first.prefill_device_id
+    assert third.decode_device_id == first.decode_device_id

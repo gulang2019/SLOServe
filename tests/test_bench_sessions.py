@@ -1,4 +1,5 @@
 import json
+from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
@@ -185,6 +186,57 @@ def test_apply_service_tier_reporting_rewrites_top_level_slo_metrics():
     assert updated["violations"] == {"none": 0.8, "tpot": 0.2}
 
 
+def test_summarize_asap_request_metrics_counts_distinct_router_fallbacks():
+    events = [
+        {
+            "event_type": "arrival-router",
+            "timestamp": 0.0,
+            "device_id": -1,
+            "request_id": "regular-1",
+            "service_tier": "default",
+            "initial_service_tier": "default",
+            "extra_args": {},
+        },
+        {
+            "event_type": "router_asap",
+            "timestamp": 0.5,
+            "device_id": -1,
+            "request_id": "regular-1",
+            "extra_args": {},
+        },
+        {
+            "event_type": "router_asap",
+            "timestamp": 0.8,
+            "device_id": -1,
+            "request_id": "regular-1",
+            "extra_args": {},
+        },
+        {
+            "event_type": "arrival-router",
+            "timestamp": 0.1,
+            "device_id": -1,
+            "request_id": "regular-2",
+            "service_tier": "default",
+            "initial_service_tier": "default",
+            "extra_args": {},
+        },
+        {
+            "event_type": "arrival-router",
+            "timestamp": 0.2,
+            "device_id": -1,
+            "request_id": "best-effort-0",
+            "service_tier": "best_effort",
+            "initial_service_tier": "best_effort",
+            "extra_args": {},
+        },
+    ]
+
+    summary = bench_api_server._summarize_asap_request_metrics(events)
+
+    assert summary["asap_request_count"] == 1
+    assert summary["asap_request_ratio"] == pytest.approx(0.5)
+
+
 def test_split_ready_request_indices_respects_session_gate():
     requests = [
         Request(input_length=4, output_length=2, session_id="s1"),
@@ -220,6 +272,21 @@ def test_split_ready_request_indices_is_noop_when_replay_disabled():
 
     assert ready == [0, 1]
     assert blocked == []
+
+
+def test_collect_unissued_request_indices_captures_pending_heads_and_queued_turns():
+    skipped = bench_api_server._collect_unissued_request_indices(
+        pending_indices=[1, 3],
+        trace_request_indices=[0, 1, 2, 3],
+        arrival_idx=2,
+        session_turn_queues={
+            "s1": deque([4, 5]),
+            "s2": deque([]),
+            "s3": deque([6]),
+        },
+    )
+
+    assert skipped == [1, 2, 3, 4, 5, 6]
 
 
 def test_ensure_prompts_present_clears_mixed_prompt_sources():
@@ -283,25 +350,68 @@ def test_normalize_rejection_reason_maps_scheduler_codes():
     assert bench_api_server._normalize_rejection_reason("MEM") == "memory"
     assert bench_api_server._normalize_rejection_reason("OOM") == "oom"
     assert bench_api_server._normalize_rejection_reason("router") == "router"
+    assert (
+        bench_api_server._normalize_rejection_reason("ROUTER_PREFILL")
+        == "router-prefill"
+    )
+    assert (
+        bench_api_server._normalize_rejection_reason("router-decode")
+        == "router-decode"
+    )
     assert bench_api_server._normalize_rejection_reason("UNKNOWN") == "unknown"
     assert bench_api_server._normalize_rejection_reason(None) is None
 
 
 def test_summarize_rejection_breakdown_reports_counts_rates_and_shares():
     summary = bench_api_server._summarize_rejection_breakdown(
-        bench_api_server.Counter({"compute": 3, "memory": 1, "router": 2}),
+        bench_api_server.Counter(
+            {
+                "compute": 3,
+                "memory": 1,
+                "router-prefill": 2,
+                "router-decode": 1,
+            }
+        ),
         total_requests=12,
     )
 
-    assert summary["counts"] == {"compute": 3, "memory": 1, "router": 2}
+    assert summary["counts"] == {
+        "compute": 3,
+        "memory": 1,
+        "router-decode": 1,
+        "router-prefill": 2,
+    }
     assert summary["rates"]["compute"] == pytest.approx(3 / 12)
     assert summary["rates"]["memory"] == pytest.approx(1 / 12)
-    assert summary["shares"]["compute"] == pytest.approx(3 / 6)
-    assert summary["shares"]["memory"] == pytest.approx(1 / 6)
+    assert summary["rates"]["router-prefill"] == pytest.approx(2 / 12)
+    assert summary["rates"]["router-decode"] == pytest.approx(1 / 12)
+    assert summary["shares"]["compute"] == pytest.approx(3 / 7)
+    assert summary["shares"]["memory"] == pytest.approx(1 / 7)
+    assert summary["shares"]["router-prefill"] == pytest.approx(2 / 7)
+    assert summary["shares"]["router-decode"] == pytest.approx(1 / 7)
     assert summary["compute_rejection_count"] == 3
     assert summary["memory_rejection_count"] == 1
-    assert summary["compute_rejection_share"] == pytest.approx(3 / 6)
-    assert summary["memory_rejection_share"] == pytest.approx(1 / 6)
+    assert summary["compute_rejection_share"] == pytest.approx(3 / 7)
+    assert summary["memory_rejection_share"] == pytest.approx(1 / 7)
+
+
+def test_format_finished_bar_description_reports_router_prefill_and_decode():
+    description = bench_api_server._format_finished_bar_description(
+        8,
+        n_rejected=4,
+        n_timed_out=1,
+        rejection_reason_counts=bench_api_server.Counter(
+            {
+                "router-prefill": 1,
+                "router-decode": 2,
+                "compute": 1,
+            }
+        ),
+    )
+
+    assert description == (
+        "Finished: 8, Rejected: 4, Router P/D: 1/2, Other Rej: 1, Timed Out: 1"
+    )
 
 
 def test_summarize_per_server_memory_metrics_uses_batch_snapshots():
@@ -393,36 +503,43 @@ def test_summarize_memory_occupancy_replay_uses_token_snapshots():
 
 def test_save_benchmark_figures_from_result_row_includes_memory_plot(tmp_path):
     output_prefix = tmp_path / "bench"
+    memory_file = tmp_path / "bench.memory_occupancy_over_time.json"
+    memory_file.write_text(
+        json.dumps(
+            {
+                "devices": [
+                    {
+                        "device_id": 0,
+                        "max_tokens": 128,
+                        "samples": [
+                            {
+                                "time": 0.0,
+                                "used_tokens": 16.0,
+                                "effective_used_tokens": 8.0,
+                            },
+                            {
+                                "time": 1.0,
+                                "used_tokens": 32.0,
+                                "effective_used_tokens": 24.0,
+                            },
+                        ],
+                    }
+                ],
+                "has_effective": True,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     figure_paths = bench_api_server.save_benchmark_figures_from_result_row(
         {
             "scheduling_policy": "atfc",
             "routing_policy": "slosserve_planner",
+            "memory_occupancy_over_time_file": str(memory_file),
             "benchmark_figure_replay": {
                 "window_time_pct_vs_active_requests": {"points": []},
                 "power_vs_active_servers": {"stats": []},
                 "power_vs_batch_tokens": {"stats": []},
-                "memory_occupancy_over_time": {
-                    "devices": [
-                        {
-                            "device_id": 0,
-                            "max_tokens": 128,
-                            "samples": [
-                                {
-                                    "time": 0.0,
-                                    "used_tokens": 16.0,
-                                    "effective_used_tokens": 8.0,
-                                },
-                                {
-                                    "time": 1.0,
-                                    "used_tokens": 32.0,
-                                    "effective_used_tokens": 24.0,
-                                },
-                            ],
-                        }
-                    ],
-                    "has_effective": True,
-                },
             },
         },
         output_prefix,
@@ -484,6 +601,25 @@ def test_select_admission_output_length_supports_percentiles():
         output_lengths,
         "p95",
     ) == 60
+
+
+def test_apply_benchmark_decode_length_offset_returns_adjusted_copies():
+    requests = [
+        Request(input_length=16, output_length=8, prompt="prompt-a"),
+        Request(input_length=24, output_length=16, prompt="prompt-b"),
+    ]
+
+    adjusted = bench_api_server._apply_benchmark_decode_length_offset(
+        requests,
+        decode_length_offset=5,
+    )
+
+    assert [request.output_length for request in adjusted] == [13, 21]
+    assert [request.output_length for request in requests] == [8, 16]
+    assert adjusted[0] is not requests[0]
+    assert adjusted[1] is not requests[1]
+    assert adjusted[0].prompt == "prompt-a"
+    assert adjusted[1].prompt == "prompt-b"
 
 
 def test_build_problems_uses_configured_admission_output_length(
@@ -558,6 +694,143 @@ def test_build_problems_uses_configured_admission_output_length(
         problem.routing_kwargs["admission_max_decode_length"] == expected_cap
     )
     assert "/atfc_p80_slosserve_p80_" in problem.store_prefix
+
+
+def test_build_problems_applies_benchmark_decode_length_offset(
+    monkeypatch,
+    tmp_path,
+):
+    requests = [
+        Request(input_length=16, output_length=8),
+        Request(input_length=24, output_length=16),
+        Request(input_length=32, output_length=32),
+        Request(input_length=40, output_length=64),
+    ]
+
+    monkeypatch.setattr(
+        bench_api_server,
+        "_load_trace_inputs",
+        lambda *args, **kwargs: (requests, [0.0, 1.0, 2.0, 3.0], [("trace", "trace")]),
+    )
+
+    class _FakePerfModel:
+        is_piecewise_current_tokens = False
+
+        def describe_hardware_params(self):
+            return {}
+
+        def get_max_decode_batch_size(self, slo_tpot, average_input_length=0.0):
+            return 16
+
+        def get_batch_time(self, batch):
+            return 0.01
+
+        def get_zero_load_prefill_affine_params(self):
+            return 0.001, 0.01
+
+    monkeypatch.setattr(
+        bench_api_server.PerfModel,
+        "get_perf_model",
+        staticmethod(lambda *args, **kwargs: _FakePerfModel()),
+    )
+
+    problems = bench_api_server.build_problems(
+        model_name="test-model",
+        trace="trace",
+        ttft_slo_scale=1.0,
+        slo_tpot=0.05,
+        profit="constant",
+        scheduling_policy="atfc",
+        routing_policy="slosserve",
+        n_device=4,
+        tensor_parallel_size=1,
+        window="0:4",
+        load_scale=1.0,
+        experiment_dir=str(tmp_path),
+        benchmark_decode_length_offset=5,
+        admission_output_length_mode="p80",
+    )
+
+    assert len(problems) == 1
+    problem = problems[0]
+    adjusted_output_lengths = np.asarray([13, 21, 37, 69], dtype=np.float64)
+    expected_cap = bench_api_server._select_admission_output_length(
+        adjusted_output_lengths,
+        "p80",
+    )
+
+    assert problem.benchmark_decode_length_offset == 5
+    assert problem.scheduling_kwargs["max_decoding_length"] == 69
+    assert (
+        problem.scheduling_kwargs["admission_max_decoding_length"] == expected_cap
+    )
+    assert problem.routing_kwargs["max_decode_length"] == 69
+    assert (
+        problem.routing_kwargs["admission_max_decode_length"] == expected_cap
+    )
+    assert "_dloff5" in problem.store_prefix
+    assert [request.output_length for request in requests] == [8, 16, 32, 64]
+
+
+def test_build_problems_propagates_strict_pd_separation_for_disagg_planner(
+    monkeypatch,
+    tmp_path,
+):
+    requests = [
+        Request(input_length=16, output_length=8),
+        Request(input_length=24, output_length=16),
+    ]
+
+    monkeypatch.setattr(
+        bench_api_server,
+        "_load_trace_inputs",
+        lambda *args, **kwargs: (requests, [0.0, 1.0], [("trace", "trace")]),
+    )
+
+    class _FakePerfModel:
+        is_piecewise_current_tokens = False
+
+        def describe_hardware_params(self):
+            return {}
+
+        def get_max_decode_batch_size(self, slo_tpot, average_input_length=0.0):
+            return 16
+
+        def get_batch_time(self, batch):
+            return 0.01
+
+        def get_zero_load_prefill_affine_params(self):
+            return 0.001, 0.01
+
+    monkeypatch.setattr(
+        bench_api_server.PerfModel,
+        "get_perf_model",
+        staticmethod(lambda *args, **kwargs: _FakePerfModel()),
+    )
+
+    problems = bench_api_server.build_problems(
+        model_name="test-model",
+        trace="trace",
+        ttft_slo_scale=1.0,
+        slo_tpot=0.05,
+        profit="constant",
+        scheduling_policy="atfc",
+        routing_policy="slosserve_4_1_disagg_2_planner",
+        n_device=4,
+        tensor_parallel_size=1,
+        window="0:2",
+        load_scale=1.0,
+        experiment_dir=str(tmp_path),
+        strict_pd_separation=True,
+    )
+
+    assert len(problems) == 1
+    problem = problems[0]
+    assert problem.strict_pd_separation is True
+    assert problem.routing_kwargs["is_pd_disagg"] is True
+    assert problem.routing_kwargs["use_planner"] is True
+    assert problem.routing_kwargs["strict_pd_separation"] is True
+    assert "_strictpd1" in problem.store_prefix
 
 
 def test_resolve_policy_admission_output_length_mode_from_suffix():
@@ -648,6 +921,66 @@ def test_build_problems_parses_mem_suffixes_from_policy_names(
     assert problem.admission_output_length_mode == "p90"
     assert problem.admission_output_length == expected_cap
     assert "/atfc_p90_slosserve_p90_" in problem.store_prefix
+
+
+def test_build_problems_accepts_round_robin_session_disagg_policy(
+    monkeypatch,
+    tmp_path,
+):
+    requests = [
+        Request(input_length=16, output_length=8, session_id="session-1"),
+        Request(input_length=24, output_length=16, session_id="session-2"),
+    ]
+
+    monkeypatch.setattr(
+        bench_api_server,
+        "_load_trace_inputs",
+        lambda *args, **kwargs: (requests, [0.0, 1.0], [("trace", "trace")]),
+    )
+
+    class _FakePerfModel:
+        is_piecewise_current_tokens = False
+
+        def describe_hardware_params(self):
+            return {}
+
+        def get_max_decode_batch_size(self, slo_tpot, average_input_length=0.0):
+            return 16
+
+        def get_batch_time(self, batch):
+            return 0.01
+
+        def get_zero_load_prefill_affine_params(self):
+            return 0.001, 0.01
+
+    monkeypatch.setattr(
+        bench_api_server.PerfModel,
+        "get_perf_model",
+        staticmethod(lambda *args, **kwargs: _FakePerfModel()),
+    )
+
+    problems = bench_api_server.build_problems(
+        model_name="test-model",
+        trace="trace",
+        ttft_slo_scale=1.0,
+        slo_tpot=0.05,
+        profit="constant",
+        scheduling_policy="atfc",
+        routing_policy="round_robin_session-disagg",
+        n_device=4,
+        tensor_parallel_size=1,
+        window="0:2",
+        load_scale=1.0,
+        experiment_dir=str(tmp_path),
+    )
+
+    assert len(problems) == 1
+    problem = problems[0]
+    assert problem.routing_policy == "round_robin_session-disagg"
+    assert problem.routing_kwargs["sticky_sessions"] is True
+    assert problem.routing_kwargs["is_pd_disagg"] is True
+    assert problem.routing_kwargs["group_size"] == 4
+    assert 0 < problem.routing_kwargs["n_prefill_per_group"] < 4
 
 
 def test_build_problems_propagates_frontend_httpx_settings(

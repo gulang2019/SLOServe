@@ -76,6 +76,91 @@ def test_engine_worker_energy_start_is_deferred_until_explicit_start():
     worker._energy_profiler.restart.assert_called_once_with("/shared/run-a")
 
 
+def test_worker_env_inherits_energy_interval(monkeypatch):
+    monkeypatch.setenv("SLOSSERVE_ENERGY_INTERVAL_S", "0.01")
+    monkeypatch.setenv("SLOSSERVE_ENERGY_SAMPLE_HZ", "100")
+
+    worker_env = api_server_ray._with_inherited_worker_env({})
+
+    assert worker_env["SLOSSERVE_ENERGY_INTERVAL_S"] == "0.01"
+    assert worker_env["SLOSSERVE_ENERGY_SAMPLE_HZ"] == "100"
+
+
+def test_worker_env_keeps_explicit_energy_interval(monkeypatch):
+    monkeypatch.setenv("SLOSSERVE_ENERGY_INTERVAL_S", "0.01")
+
+    worker_env = api_server_ray._with_inherited_worker_env({
+        "SLOSSERVE_ENERGY_INTERVAL_S": "0.02",
+    })
+
+    assert worker_env["SLOSSERVE_ENERGY_INTERVAL_S"] == "0.02"
+
+
+def test_worker_energy_profiler_derives_sample_hz_from_interval(monkeypatch):
+    monkeypatch.setattr(api_server_ray.ray, "get_gpu_ids", lambda: [])
+
+    profiler = api_server_ray.WorkerEnergyProfiler(
+        device_id=0,
+        interval_s=0.01,
+    )
+
+    assert profiler.interval_s == 0.01
+    assert profiler.sample_hz == 100.0
+
+
+def test_worker_energy_telemetry_summary_reports_counter_mode():
+    profiler = api_server_ray.WorkerEnergyProfiler.__new__(
+        api_server_ray.WorkerEnergyProfiler)
+    profiler.device_id = 2
+    profiler.interval_s = 0.25
+    profiler.physical_gpu_ids = [4]
+    profiler.csv_path = "/tmp/run.device2.energy.csv"
+    profiler._meter = SimpleNamespace(
+        _nvml=object(),
+        _rocm=None,
+        _counter_supported=True,
+        _running=True,
+        _handles=[object()],
+        sample_hz=10.0,
+    )
+
+    summary = profiler._energy_telemetry_summary()
+
+    assert summary["backend"] == "NVML"
+    assert summary["method"] == "total_energy_counter"
+    assert summary["method_sample_hz"] == 4.0
+    assert summary["recorder_sample_hz"] == 4.0
+    assert summary["meter_sample_hz"] == 10.0
+    assert summary["counter_supported"] is True
+    assert summary["handle_count"] == 1
+
+
+def test_worker_energy_telemetry_summary_reports_power_sampling_fallback():
+    profiler = api_server_ray.WorkerEnergyProfiler.__new__(
+        api_server_ray.WorkerEnergyProfiler)
+    profiler.device_id = 3
+    profiler.interval_s = 0.1
+    profiler.physical_gpu_ids = [5]
+    profiler.csv_path = None
+    profiler._meter = SimpleNamespace(
+        _nvml=object(),
+        _rocm=None,
+        _counter_supported=False,
+        _running=True,
+        _handles=[object()],
+        sample_hz=12.5,
+    )
+
+    summary = profiler._energy_telemetry_summary()
+
+    assert summary["backend"] == "NVML"
+    assert summary["method"] == "power_sampling_fallback"
+    assert summary["method_sample_hz"] == 12.5
+    assert summary["recorder_sample_hz"] == 10.0
+    assert summary["counter_supported"] is False
+    assert summary["handle_count"] == 1
+
+
 def test_dump_profile_events_aggregates_worker_energy(tmp_path, monkeypatch):
     output_file = tmp_path / "profile_events.jsonl"
     admission_file = tmp_path / "admission_history.jsonl"

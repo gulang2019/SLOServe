@@ -1619,7 +1619,7 @@ std::tuple<bool, std::vector<bool>, std::string> AdmCtrlScheduler::_admission_co
         }
         return {true, "NONE"};
     };
-
+    
     auto feasibility_check_decode_only = [&](const std::vector<Request>& reqs) -> std::pair<bool, std::string> {
         std::vector<std::tuple<int, std::string, Request> > events;
         std::vector<Request> decode_reqs;

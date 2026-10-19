@@ -21,9 +21,9 @@ os.makedirs(FIGDIR, exist_ok=True)
 REQUIRED_SERVER_COMPONENTS = ("total", "prefill", "decode")
 REQUIRED_SERVER_COMPONENT_CHOICES = (*REQUIRED_SERVER_COMPONENTS, "split")
 REQUIRED_SERVER_COMPONENT_LABELS = {
-    "total": "Required servers",
-    "prefill": "Prefill required servers",
-    "decode": "Decode required servers",
+    "total": "Required GPUs",
+    "prefill": "Prefill required GPUs",
+    "decode": "Decode required GPUs",
 }
 REQUIRED_SERVER_COMPONENT_STYLES = {
     "total": {"color": "black", "linewidth": 2.2, "linestyle": "-"},
@@ -36,11 +36,11 @@ PAPER_STYLE = {
     "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
     "pdf.fonttype": 42,
     "ps.fonttype": 42,
-    "axes.labelsize": 24,
+    "axes.labelsize": 28,
     "axes.titlesize": 24,
-    "xtick.labelsize": 20,
-    "ytick.labelsize": 20,
-    "legend.fontsize": 19,
+    "xtick.labelsize": 22,
+    "ytick.labelsize": 22,
+    "legend.fontsize": 22,
     "axes.linewidth": 1.4,
     "lines.linewidth": 2.8,
     "grid.linewidth": 0.9,
@@ -126,7 +126,7 @@ def _plotted_components(required_server_component: str) -> tuple[str, ...]:
 
 def _required_server_axis_label(required_server_component: str) -> str:
     if required_server_component == "split":
-        return "Required Servers"
+        return "Required GPUs"
     label = REQUIRED_SERVER_COMPONENT_LABELS[required_server_component]
     return label[:1].upper() + label[1:]
 
@@ -333,7 +333,7 @@ def plot_required_server_distribution(ax, values: np.ndarray, component: str = "
     ax.axvline(p95, color="darkorange", linestyle="--", linewidth=2.8, label=f"P95 {p95:.2f}")
     ax.axvline(p99, color="crimson", linestyle=":", linewidth=3.0, label=f"P99 {p99:.2f}")
     component_label = REQUIRED_SERVER_COMPONENT_LABELS[component]
-    ax.set_xlabel(f"{component_label.title()} (1s Window)")
+    ax.set_xlabel(f"{component_label} (1s Window)")
     ax.set_ylabel("Fraction of Windows")
     ax.yaxis.set_major_formatter(ticker.PercentFormatter(xmax=1.0, decimals=0))
     ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
@@ -508,10 +508,10 @@ def plot_headroom_figure(trace: dict,
             component=summary_component,
         )
 
-        ax_ts.text(0.5, -0.20, "(a) Required Servers Over Time", transform=ax_ts.transAxes,
+        ax_ts.text(0.5, -0.20, "(a) Required GPUs Over Time", transform=ax_ts.transAxes,
                    ha="center", va="top", fontsize=22)
         dist_component_label = REQUIRED_SERVER_COMPONENT_LABELS[summary_component]
-        ax_dist.text(0.5, -0.40, f"(b) Distribution of {dist_component_label.title()} in Highlighted 1s Windows", transform=ax_dist.transAxes,
+        ax_dist.text(0.5, -0.40, f"(b) Distribution of {dist_component_label} in Highlighted 1s Windows", transform=ax_dist.transAxes,
                      ha="center", va="top", fontsize=22)
 
     output_dir = os.path.dirname(output_path)

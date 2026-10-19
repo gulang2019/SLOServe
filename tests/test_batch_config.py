@@ -93,6 +93,7 @@ def test_normalize_batch_config_merges_defaults_and_aliases():
     assert spec["slo_tpots"] == ["0.025", "0.05"]
     assert spec["perf_model_errs"] == ["0.8", "1.2"]
     assert spec["model_name"] == "Qwen/Test"
+    assert spec["scheduling_safety_margin"] == "0.002"
     assert spec["policies"] == ["round_robin:atfc"]
 
 
@@ -110,6 +111,7 @@ def test_render_bash_assignments_emits_trace_arrays():
                     "load_scales": [2.0, 3.0],
                     "n_devices": [2, 4],
                     "slo_tpot": [0.05, 0.1],
+                    "decode_length_offsets": [0, 100],
                 }
             },
         }
@@ -126,10 +128,13 @@ def test_render_bash_assignments_emits_trace_arrays():
     assert "declare -gA TRACE_EXTRA_ARGS_SHELL=(" in rendered
     assert "declare -gA TRACE_LOAD_SCALES=(" in rendered
     assert "declare -gA TRACE_SLO_TPOTS=(" in rendered
+    assert "declare -gA TRACE_DECODE_LENGTH_OFFSETS=(" in rendered
+    assert "declare -gA TRACE_SCHEDULING_SAFETY_MARGIN=(" in rendered
     assert "declare -gA TRACE_WINDOW=(" in rendered
     assert "azure_chat:azure_chat" in rendered
     assert "2.0 3.0" in rendered
     assert "0.05 0.1" in rendered
+    assert "0 100" in rendered
 
 
 def test_normalize_batch_config_supports_extra_args_string_alias():
@@ -234,6 +239,7 @@ def test_normalize_batch_config_extracts_server_launch_overrides():
         "model_name": "Qwen/Test-30B",
         "perf_model_err": 1.0,
         "scheduling_overhead": 0.003,
+        "scheduling_safety_margin": 0.002,
         "tpot": 0.05,
     }
 
@@ -267,7 +273,36 @@ def test_normalize_batch_config_omits_router_tpot_and_perf_when_sweeping():
         "device_mem": 1024,
         "model_name": "Qwen/Qwen2.5-7B-Instruct",
         "scheduling_overhead": 0.003,
+        "scheduling_safety_margin": 0.002,
     }
+
+
+def test_normalize_batch_config_allows_overriding_scheduling_safety_margin():
+    normalized = normalize_batch_config(
+        {
+            "defaults": {
+                "scheduling_safety_margin": 0.002,
+            },
+            "server_router_kwargs": {
+                "device_mem": 1024,
+                "block_size": 16,
+            },
+            "policies": ["round_robin:atfc"],
+            "configs": {
+                "azure_chat:azure_chat": {
+                    "window": "t10:20",
+                    "n_devices": [2],
+                    "scheduling_safety_margin": 0.004,
+                }
+            },
+        }
+    )
+
+    spec = normalized["trace_specs"]["azure_chat:azure_chat"]
+    assert spec["scheduling_safety_margin"] == "0.004"
+    assert json.loads(
+        normalized["trace_server_router_kwargs"]["azure_chat:azure_chat"]
+    )["scheduling_safety_margin"] == pytest.approx(0.004)
 
 
 def test_normalize_batch_config_promotes_reserved_server_args_into_trace_defaults():

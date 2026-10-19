@@ -131,8 +131,60 @@ def test_perf_model_copy_with_adjustments_keeps_source_model_unchanged():
 
     adjusted = model.copy_with_adjustments(scale=1.2, constant_offset=0.7)
 
-    assert adjusted.hardware_params == pytest.approx([1.2, 2.4, 3.6, 4.8, 6.7])
+    assert adjusted.hardware_params == pytest.approx([1.2, 2.4, 3.6, 4.8, 6.0])
+    assert adjusted._online_average_delay == pytest.approx(0.0)
+    assert adjusted._online_spike_slack == pytest.approx(0.7)
     assert model.hardware_params == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0])
+
+
+def test_perf_model_copy_with_adjustments_preserves_online_spike_slack_state():
+    model = perf_model.PerfModel(
+        "Qwen/Qwen2.5-7B-Instruct",
+        [1.0, 2.0, 3.0, 4.0, 5.0],
+    )
+    model._online_average_delay = 0.4
+    model._online_spike_slack = 0.4
+
+    adjusted = model.copy_with_adjustments(scale=1.0)
+
+    assert adjusted.hardware_params == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert adjusted._online_average_delay == pytest.approx(0.4)
+    assert adjusted._online_spike_slack == pytest.approx(0.4)
+    assert model.hardware_params == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert model._online_average_delay == pytest.approx(0.4)
+    assert model._online_spike_slack == pytest.approx(0.4)
+
+
+def test_perf_model_copy_with_adjustments_uses_constant_offset_as_initial_online_slack():
+    model = perf_model.PerfModel(
+        "Qwen/Qwen2.5-7B-Instruct",
+        [1.0, 2.0, 3.0, 4.0, 5.0],
+    )
+
+    adjusted = model.copy_with_adjustments(
+        scale=1.0,
+        constant_offset=0.4,
+    )
+
+    assert adjusted.hardware_params == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert adjusted._online_average_delay == pytest.approx(0.0)
+    assert adjusted._online_spike_slack == pytest.approx(0.4)
+    assert adjusted.get_batch_time([(0, 1)]) == pytest.approx(12.4)
+    assert model._online_average_delay == pytest.approx(0.0)
+    assert model._online_spike_slack == pytest.approx(0.0)
+
+
+def test_perf_model_update_tracks_residual_delay_separately_from_slack():
+    model = perf_model.PerfModel(
+        "Qwen/Qwen2.5-7B-Instruct",
+        [1.0, 2.0, 3.0, 4.0, 5.0],
+    ).copy_with_adjustments(scale=1.0, constant_offset=0.005)
+    model._decay_factor = 0.5
+
+    model.update(-0.003)
+
+    assert model._online_average_delay == pytest.approx(-0.003)
+    assert model._online_spike_slack == pytest.approx(0.0035)
 
 
 def test_compute_upper_bound_metrics_returns_empirical_constants():
@@ -177,8 +229,10 @@ def test_piecewise_perf_model_runtime_selects_segments_and_copies_adjustments():
     adjusted = model.copy_with_adjustments(scale=1.1, constant_offset=0.3)
     assert adjusted.is_piecewise_current_tokens is True
     assert adjusted.describe_hardware_params()["segment_params"]["le_512"] == pytest.approx(
-        [0.11, 0.22, 0.011, 0.0, 0.85]
+        [0.11, 0.22, 0.011, 0.0, 0.55]
     )
+    assert adjusted._online_average_delay == pytest.approx(0.0)
+    assert adjusted._online_spike_slack == pytest.approx(0.3)
     assert model.describe_hardware_params()["segment_params"]["le_512"] == pytest.approx(
         PIECEWISE_TRUE_HW_PARAMS["le_512"]
     )
@@ -214,6 +268,7 @@ def test_build_problems_propagates_perf_model_err_and_log_flag(monkeypatch, tmp_
         load_scale=1.0,
         experiment_dir=str(tmp_path),
         perf_model_err=1.2,
+        scheduling_safety_margin=0.002,
         log_perf_model_errors=False,
         enable_piecewise_perf_model_regression=True,
         perf_model_piecewise_breakpoints=[128, 256],
@@ -221,6 +276,8 @@ def test_build_problems_propagates_perf_model_err_and_log_flag(monkeypatch, tmp_
 
     assert problems
     assert problems[0].routing_kwargs["perf_model_err"] == pytest.approx(1.2)
+    assert problems[0].scheduling_safety_margin == pytest.approx(0.002)
+    assert problems[0].scheduling_kwargs["scheduling_safety_margin"] == pytest.approx(0.002)
     assert problems[0].log_perf_model_errors is False
     assert problems[0].enable_piecewise_perf_model_regression is True
     assert problems[0].perf_model_piecewise_breakpoints == [128, 256]
@@ -610,6 +667,67 @@ def _make_multicategory_batch_events():
     return batches, events
 
 
+def test_group_zoom_rows_by_category_filters_decode_outliers_by_default():
+    rows = [
+        {
+            "batch_category": "decode",
+            "measured_time": 0.12,
+            "total_current_tokens": 8,
+        },
+        {
+            "batch_category": "decode",
+            "measured_time": 0.45,
+            "total_current_tokens": 9,
+        },
+        {
+            "batch_category": "prefill",
+            "measured_time": 0.60,
+            "total_current_tokens": 64,
+        },
+    ]
+
+    grouped = perf_model._group_zoom_rows_by_category(
+        rows,
+        comparison_times=[0.11, 0.44, 0.59],
+    )
+
+    assert len(grouped["decode"]["rows"]) == 1
+    assert grouped["decode"]["filtered_count"] == 1
+    assert grouped["decode"]["rows"][0]["total_current_tokens"] == 8
+    assert len(grouped["prefill"]["rows"]) == 1
+    assert grouped["prefill"]["filtered_count"] == 0
+
+
+def test_downsample_current_token_plot_items_caps_dense_token_buckets():
+    rows = [
+        {
+            "batch_category": "decode",
+            "measured_time": measured_time,
+            "total_current_tokens": 1,
+        }
+        for measured_time in [0.11, 0.12, 0.13, 0.14, 0.15]
+    ] + [
+        {
+            "batch_category": "decode",
+            "measured_time": 0.20,
+            "total_current_tokens": 2,
+        }
+    ]
+
+    sampled = perf_model._downsample_current_token_plot_items(
+        rows,
+        comparison_times=[0.21, 0.22, 0.23, 0.24, 0.25, 0.30],
+        max_points_per_token=2,
+    )
+
+    assert sampled["downsampled_count"] == 3
+    assert [row["total_current_tokens"] for row in sampled["rows"]] == [1, 1, 2]
+    assert [row["measured_time"] for row in sampled["rows"]] == pytest.approx(
+        [0.11, 0.15, 0.20]
+    )
+    assert sampled["comparison_times"] == pytest.approx([0.21, 0.25, 0.30])
+
+
 def _make_piecewise_batch_events():
     segment_batches = {
         "le_512": [
@@ -740,6 +858,57 @@ def test_fit_batch_perf_trace_by_category_writes_category_reports_and_plots(tmp_
     assert report["category_fit"]["categories"]["mixed"]["used_sample_count"] == len(
         batches["mixed"]
     )
+
+
+def test_fit_batch_perf_trace_by_category_writes_plot_metadata(tmp_path):
+    batches, events = _make_multicategory_batch_events()
+    trace_path = tmp_path / "batches.jsonl"
+    meta_path = tmp_path / "category_fit_meta.json"
+    report_path = tmp_path / "report.json"
+    trace_path.write_text(json.dumps(events), encoding="utf-8")
+
+    report = perf_model.fit_batch_perf_trace(
+        trace_path,
+        fit_by_category=True,
+        decode_fit_max_time_ms=400.0,
+        viz=True,
+        report_path=report_path,
+        meta_path=meta_path,
+    )
+
+    assert report["category_fit_meta_path"] == str(meta_path)
+    assert report["category_fit"]["meta_path"] == str(meta_path)
+    written_report = json.loads(report_path.read_text())
+    assert written_report["category_fit_meta_path"] == str(meta_path)
+
+    meta = json.loads(meta_path.read_text())
+    assert meta["schema_version"] == 1
+    assert meta["trace_path"] == str(trace_path.resolve())
+    assert meta["decode_fit_max_time_ms"] == pytest.approx(400.0)
+    assert set(meta["categories"]) == {"decode", "prefill", "mixed"}
+    assert meta["categories"]["decode"]["used_sample_count"] == len(
+        batches["decode"]
+    )
+    assert len(meta["categories"]["decode"]["rows"]) == len(batches["decode"])
+    first_decode = meta["categories"]["decode"]["rows"][0]
+    assert first_decode["batch_category"] == "decode"
+    assert first_decode["fit_included"] is True
+    assert first_decode["excluded_from_fit_reason"] is None
+    assert first_decode["measured_time_s"] == pytest.approx(
+        _expected_time(batches["decode"][0])
+    )
+    assert first_decode["category_fitted_time_s"] == pytest.approx(
+        _expected_time(batches["decode"][0])
+    )
+    assert first_decode["existing_estimated_time_s"] == pytest.approx(
+        _expected_time(batches["decode"][0]) * 1.1
+    )
+    assert first_decode["batch"] == [
+        {"past_tokens": 0, "scheduled_tokens": 1}
+    ]
+    assert Path(meta["plot_paths"]["scatter_by_category"]).exists()
+    assert Path(meta["plot_paths"]["time_vs_current_tokens"]).exists()
+    assert Path(meta["plot_paths"]["time_vs_current_tokens_zoom"]).exists()
 
 
 def test_fit_batch_perf_trace_by_category_excludes_decode_outliers_from_fit(tmp_path):

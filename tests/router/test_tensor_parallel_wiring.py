@@ -14,6 +14,7 @@ from SLOsServe.router import api_server_ray
         (None, None),
         ("", None),
         ("0-3", "r0,r1,r2,r3"),
+        ("r0-3", "r0,r1,r2,r3"),
         ("0:4", "r0,r1,r2,r3"),
         ("0,2,4", "r0,r2,r4"),
         ("r0,r1", "r0,r1"),
@@ -34,6 +35,7 @@ def test_normalize_router_clients_arg_preserves_replica_semantics(
 def test_parse_clients_arg_splits_logical_replica_labels():
     assert api_server_ray._parse_clients_arg(None) == []
     assert api_server_ray._parse_clients_arg("r0, r1 ,, r2") == ["r0", "r1", "r2"]
+    assert api_server_ray._parse_clients_arg("r0-3") == ["r0", "r1", "r2", "r3"]
     assert api_server_ray._parse_clients_arg("0-3") == ["r0", "r1", "r2", "r3"]
     assert api_server_ray._parse_clients_arg("0:4") == ["r0", "r1", "r2", "r3"]
     assert api_server_ray._parse_clients_arg("8001:2") == [

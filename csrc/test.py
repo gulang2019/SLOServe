@@ -38,13 +38,16 @@ def test_scheduler():
     # Create a AdmCtrlScheduler instance
     tpots = [0.1]
     hardware_params = [4.1e-5, 0, 0, 0, 1.3e-2]
-    scheduler = C.AdmCtrlScheduler("dp", False)
+    scheduler = C.AdmCtrlScheduler("dp", 16, False, False)
     # scheduler.set_sd_planner(tpots, hardware_params, False, 0.8, 10, False)
     scheduler.set_ar_planner(tpots, hardware_params, False)
     # Call schedule
     M = 100
     current_time = 0.0
-    is_feasible, accepted_ids, batch_schedules = scheduler.schedule(reqs, M, current_time, True)
+    is_feasible, is_accepteds = scheduler.adm_ctrl(reqs, M, current_time)
+    accepted_ids = [req.id for req, accepted in zip(reqs, is_accepteds) if accepted]
+    accepted_reqs = [req for req, accepted in zip(reqs, is_accepteds) if accepted]
+    is_feasible, batch_schedules = scheduler.schedule(accepted_reqs, current_time, 1, True) if is_feasible else (False, [])
 
     print('feasible:', is_feasible)
 
@@ -132,17 +135,17 @@ def test_problems(filepath = 'experiments/Qwen-7B_constant_sharegpt_code:azure_c
     with open(filepath, 'r') as f:
         data = json.load(f)
     data = [e for e in data if e['event_type'] == 'schedule_problem']
-    from motivation.common import PerfModel
+    from SLOsServe.perf_model import PerfModel
     perf_model = PerfModel.get_perf_model(model_name, 'azure_chat_23')
     bs = perf_model.get_bs(slo_tpot, 1)
     print('bs', bs)
-    scheduler_dp = C.AdmCtrlScheduler("dp", False, False)
+    scheduler_dp = C.AdmCtrlScheduler("dp", 16, False, False)
     scheduler_dp.set_ar_planner([slo_tpot], perf_model.hardware_params, False)
     
-    scheduler_edf = C.AdmCtrlScheduler("edf", False, False)
+    scheduler_edf = C.AdmCtrlScheduler("edf", 16, False, False)
     scheduler_edf.set_ar_planner([slo_tpot], perf_model.hardware_params, False)
     
-    scheduler_ar_fixed_bs = C.AdmCtrlScheduler("edf", False, False)
+    scheduler_ar_fixed_bs = C.AdmCtrlScheduler("edf", 16, False, False)
     scheduler_ar_fixed_bs.set_ar_planner([slo_tpot], perf_model.hardware_params, True, 1769)
     
     num_accepted_reqs = []
@@ -164,20 +167,29 @@ def test_problems(filepath = 'experiments/Qwen-7B_constant_sharegpt_code:azure_c
         n_old_reqs.append(len(reqs) - len(new_reqs))
         num_free_blocks = problem['num_free_blocks']
         start = time.time()
-        is_feasible, accepted_ids, batch_schedules = scheduler_dp.schedule(
-            reqs, num_free_blocks, 0.0, False)
+        is_feasible, is_accepteds = scheduler_dp.adm_ctrl(
+            reqs, num_free_blocks, 0.0)
+        accepted_ids = [req.id for req, accepted in zip(reqs, is_accepteds) if accepted]
+        is_feasible, batch_schedules = scheduler_dp.schedule(
+            [req for req, accepted in zip(reqs, is_accepteds) if accepted], 0.0, 1, False) if is_feasible else (False, [])
         accepted_ids = set(accepted_ids) & set(new_reqs)
         
         dp_time = time.time() - start
         start = time.time()
-        is_feasible_edf, accepted_ids_edf, batch_schedules_edf = scheduler_edf.schedule(
-            reqs, num_free_blocks, 0.0, False)
+        is_feasible_edf, is_accepteds_edf = scheduler_edf.adm_ctrl(
+            reqs, num_free_blocks, 0.0)
+        accepted_ids_edf = [req.id for req, accepted in zip(reqs, is_accepteds_edf) if accepted]
+        is_feasible_edf, batch_schedules_edf = scheduler_edf.schedule(
+            [req for req, accepted in zip(reqs, is_accepteds_edf) if accepted], 0.0, 1, False) if is_feasible_edf else (False, [])
         edf_time = time.time() - start
         accepted_ids_edf = set(accepted_ids_edf) & set(new_reqs)
         
         start = time.time()
-        is_feasible_ar_fixed_bs, accepted_ids_ar_fixed_bs, batch_schedules_ar_fixed_bs = scheduler_ar_fixed_bs.schedule(
-            reqs, num_free_blocks, 0.0, False)
+        is_feasible_ar_fixed_bs, is_accepteds_ar_fixed_bs = scheduler_ar_fixed_bs.adm_ctrl(
+            reqs, num_free_blocks, 0.0)
+        accepted_ids_ar_fixed_bs = [req.id for req, accepted in zip(reqs, is_accepteds_ar_fixed_bs) if accepted]
+        is_feasible_ar_fixed_bs, batch_schedules_ar_fixed_bs = scheduler_ar_fixed_bs.schedule(
+            [req for req, accepted in zip(reqs, is_accepteds_ar_fixed_bs) if accepted], 0.0, 1, False) if is_feasible_ar_fixed_bs else (False, [])
         ar_fixed_bs_time = time.time() - start
         accepted_ids_ar_fixed_bs = set(accepted_ids_ar_fixed_bs) & set(new_reqs)
 
@@ -306,7 +318,7 @@ def get_plus_scheduler(scheduler_fn):
 def synthesize_problems(datasets, model_name):
     from Dataset.dataset import Requests, Request
     import random
-    from motivation.common import PerfModel
+    from SLOsServe.perf_model import PerfModel
     import numpy as np
     import tqdm
     REQS = []
@@ -356,7 +368,7 @@ def synthesize_problems(datasets, model_name):
     return problems
 
 def run(problems, model_name, tpot, dataset):
-    from motivation.common import PerfModel
+    from SLOsServe.perf_model import PerfModel
     from Dataset.dataset import Requests
     import numpy as np
     import tqdm
@@ -364,21 +376,25 @@ def run(problems, model_name, tpot, dataset):
     perf_model = PerfModel.get_perf_model(model_name, dataset)
     max_bs = perf_model.get_max_decode_batch_size(tpot, np.mean([req.input_length for req in requests]))
     
-    scheduler_dp = C.AdmCtrlScheduler("dp", False)
+    scheduler_dp = C.AdmCtrlScheduler("dp", 16, False, False)
     scheduler_dp.set_ar_planner([tpot], perf_model.hardware_params, False)
     
-    scheduler_edf = C.AdmCtrlScheduler("edf", False)
+    scheduler_edf = C.AdmCtrlScheduler("edf", 16, False, False)
     scheduler_edf.set_ar_planner([tpot], perf_model.hardware_params, False)
     
-    scheduler_ar_fixed_bs = C.AdmCtrlScheduler("edf", False)
+    scheduler_ar_fixed_bs = C.AdmCtrlScheduler("edf", 16, False, False)
     scheduler_ar_fixed_bs.set_ar_planner([tpot], perf_model.hardware_params, True, max_bs)
     all_results = {}
     for scheduler, name in zip([scheduler_dp, scheduler_edf, scheduler_ar_fixed_bs], 
                                ['OPT', 'edf', 'qlm+']):
         results = []
         for problem in tqdm.tqdm(problems): 
-            is_feasible, accepted_ids, batch_schedules = scheduler.schedule(
-                problem['reqs'], problem['num_free_blocks'], problem.get('current_time', 0.0), False)
+            is_feasible, is_accepteds = scheduler.adm_ctrl(
+                problem['reqs'], problem['num_free_blocks'], problem.get('current_time', 0.0))
+            accepted_ids = [req.id for req, accepted in zip(problem['reqs'], is_accepteds) if accepted]
+            is_feasible, batch_schedules = scheduler.schedule(
+                [req for req, accepted in zip(problem['reqs'], is_accepteds) if accepted],
+                problem.get('current_time', 0.0), 1, False) if is_feasible else (False, [])
             results.append((len(accepted_ids), 0, len(problem['reqs']) - len(accepted_ids)))
         
         accepted, accepted_violations, rejected = zip(*results)

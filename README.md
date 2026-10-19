@@ -1,5 +1,35 @@
 # TODOs
 
+30B model experiment:
+
+7B:
+Coding: 25% at 5%, ?? at 1% SLO violation, need to rerun Sarathi+, baseline with more than 8 servers; 
+
+Mixed: 35% at 5%, 37% at 1%, need to rerun Sarathi+; 
+
+Chatting: 5% at 5%; 50% at 1%; need to rerun Sarathi+; 1-4 devices is okay;
+
+Multi-Node 16 server experiment:
+AzureChat: good result;
+
+Multi-round Chatting: AzureChat + Multi-round Chatting 
+
+Disaggregation: 
+AzureChat24: No visible energy benefit at 8 machines; The SLO violation is smaller. The ideal # device is larger than 8 devices;
+
+
+Reasoning:
+Ran for load scale 0.3 on disagg servers; it is able to serve with only 2 devices; 
+
+30B:
+
+AzureChat23: baselines saturate at 4 devices; need to check ours at 2 devices to see the gain; 
+
+AzureCode23: Not a huge win for the setup;
+Mixed: not ran yet;
+
+Mixed seems promising;
+
 3.21 
 Finish the expeirment section: coding + writing + evaluation;
 Multi-node experiment;
@@ -204,6 +234,31 @@ python motivation/bench_api_server.py --overwrite \
 End-to-end scripts
 ```sh
 source run_batch.sh
+```
+
+### Recover Main Multi-Replica Figure
+
+To quickly regenerate the paper's main multi-replica figure set
+(`fig:distributed` in `Paper/04-evaluation.tex`) and its shared legend:
+
+```sh
+python3 scripts/recover_main_multi_replica_figure.py
+```
+
+This rewrites the assets in `Paper/figs/e2e_new/`, including:
+
+- `multi_replica_shared_legend.pdf`
+- `chat_7B_two_panel_slo_cap_10_logx.pdf`
+- `code_7B_two_panel_slo_cap_10_logx_normal.pdf`
+- `mixed_7B_two_panel_slo_cap_10_logx.pdf`
+- `32B_chat_two_panel_slo_cap_10_logx.pdf`
+- `e2e_mulitiround_chatting_two_panel_slo_cap_10_logx.pdf`
+- `chatting_large_scale_two_panel_slo_cap_10_logx.pdf`
+
+To write the recovered assets somewhere else for inspection:
+
+```sh
+python3 scripts/recover_main_multi_replica_figure.py --output-dir /tmp/e2e_new
 ```
 
 # Instructions

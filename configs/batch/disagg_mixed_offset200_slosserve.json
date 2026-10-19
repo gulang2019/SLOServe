@@ -1,0 +1,10 @@
+{
+  "experiment_name": "disagg_mixed_offset200_slosserve",
+  "extends": [
+    "disagg_mixed_offset200_base.json"
+  ],
+  "policies": [
+    "slosserve_disagg_planner:atfc"
+  ],
+  "output_dir": "experiments_disagg_mixed_offset200/slosserve"
+}

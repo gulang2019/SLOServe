@@ -1,0 +1,8 @@
+{
+  "extends": [
+    "base_single_policy.json"
+  ],
+  "policies": [
+    "round_robin:vllm"
+  ]
+}
