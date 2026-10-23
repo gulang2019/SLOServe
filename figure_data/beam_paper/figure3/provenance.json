@@ -1,0 +1,122 @@
+{
+  "figure": 3,
+  "workload": "mixed",
+  "server_count": 8,
+  "window_s": [
+    0,
+    600
+  ],
+  "bin_width_s": 1,
+  "beam_is_estimated_cluster_power": true,
+  "beam_source_shards": [
+    0,
+    3,
+    7
+  ],
+  "estimator": "8 * arithmetic_mean(selected scaled one-GPU shard powers), per time bin",
+  "power_scaling_per_gpu": "70 + (P_pcie - 52) * 330/248, no clipping",
+  "renderer": "plots/timeline_comparison_replay.py:render_timeline_comparison_metadata",
+  "renderer_sha256": "7dea5499dafbb72c7442859ac7728f022a8480ef42a66dc50cd5c9245befcd56",
+  "script_sha256": "c6f5e6bd337dcd6a45a46c71c47441d9061552ee64a95d434fc39291ef7f43ed",
+  "original_metadata": "Paper/data/timeline/energy_consumption-mixed.meta.json",
+  "original_metadata_sha256": "007f9abab0a91e89c9823fd5d1bd3a504b9d94cffbb1193895b82fd4f078c136",
+  "original_curves_preserved": true,
+  "presentation": {
+    "beam_legend": "BEAM",
+    "beam_linestyle": "solid",
+    "added_plot_caption": false
+  },
+  "beam_runs": [
+    {
+      "device_index": 0,
+      "source_directory": "beam-figure7-7b-20261020-215014/mixed_7b/split_8_0",
+      "requests": 780,
+      "benchmark_duration_s": 605.6119624599814,
+      "beam_ttft_target_s": 0.242710253,
+      "beam_tbt_target_s": 0.02,
+      "estimated_replay_start_remote_local": "2026-10-20T19:52:36.184076",
+      "alignment_method": "final_batch_minus_last_client_completion",
+      "alignment_is_approximate": true,
+      "restored_global_trace_offset_s": 0.0,
+      "monitor_relative_global_start_s": -15.399324,
+      "monitor_relative_global_end_s": 606.67792,
+      "full_monitor_raw_energy_kj": 126.6167769999504,
+      "plotted_bins": 600,
+      "covered_bins": 600,
+      "plotted_raw_energy_kj": 124.61180351543426,
+      "plotted_scaled_energy_kj": 166.29796435521496,
+      "date_anchor_minus_selected_anchor_s": -0.296038,
+      "source_sha256": {
+        "beam-figure7-7b-20261020-215014/mixed_7b/split_8_0/beam_detailed.json": "ef1ba33b7e6661b61da717fe4d745df6541bd793b8ff906f7c239f5cdab9f501",
+        "beam-figure7-7b-20261020-215014/mixed_7b/split_8_0/power_timeline_gpu_0.csv": "3ceba794e176932b9103e058d228749b610f762525b60a7fe60161b7ed646550",
+        "beam-figure7-7b-20261020-215014/mixed_7b/split_8_0/per_request_slo.jsonl": "8a720f1c48cc637d047b074e15979c39eb00c4592df8a5a190022c52eb9b8dcb",
+        "beam-figure7-7b-20261020-215014/mixed_7b/split_8_0/slo_config.txt": "26ad8c34c241add8fc69b7950bb59568423ca9aa6dbb04c0cce387bc2ded9017",
+        "beam-figure7-7b-20261020-215014/mixed_7b/split_8_0/batch_log_GPU_0.csv": "4640a99bd2af375930188972e069891e582afd6b9f643604c03de44f66bb28fd"
+      }
+    },
+    {
+      "device_index": 3,
+      "source_directory": "beam-jobs-mlsys/mixed/split_8_3",
+      "requests": 779,
+      "benchmark_duration_s": 606.0346300266683,
+      "beam_ttft_target_s": 0.241799713,
+      "beam_tbt_target_s": 0.025,
+      "estimated_replay_start_remote_local": "2026-10-22T00:03:04.465370",
+      "alignment_method": "result_date_midsecond_minus_duration",
+      "alignment_is_approximate": true,
+      "restored_global_trace_offset_s": 0.553,
+      "monitor_relative_global_start_s": -14.733293,
+      "monitor_relative_global_end_s": 607.946458,
+      "full_monitor_raw_energy_kj": 127.44776200008393,
+      "plotted_bins": 600,
+      "covered_bins": 600,
+      "plotted_raw_energy_kj": 125.10542612457276,
+      "plotted_scaled_energy_kj": 166.9548008915686,
+      "date_anchor_minus_selected_anchor_s": 0.0,
+      "source_sha256": {
+        "beam-jobs-mlsys/mixed/split_8_3/beam_detailed.json": "d9713ae217888418a1bee81da60a76c2800ce185f00da7ef382fb856009c5e48",
+        "beam-jobs-mlsys/mixed/split_8_3/power_timeline_gpu_0.csv": "6025f657d9a19660a268f3541c78c08eb293a0d4cda0c25894a2b431dae70ec9",
+        "beam-jobs-mlsys/mixed/split_8_3/per_request_slo.jsonl": "b6dd0f5e22455dc1eeff257c848e5e7cec9ccb3630690df41ddb0a6917582b89",
+        "beam-jobs-mlsys/mixed/split_8_3/slo_config.txt": "c47aa993354f44b5416fdb9ff8a39232293d8978d9dd323ab25a0d584b03d598"
+      }
+    },
+    {
+      "device_index": 7,
+      "source_directory": "beam-jobs-mlsys/mixed/split_8_7",
+      "requests": 779,
+      "benchmark_duration_s": 608.5263766907156,
+      "beam_ttft_target_s": 0.238703877,
+      "beam_tbt_target_s": 0.025,
+      "estimated_replay_start_remote_local": "2026-10-22T00:17:40.973623",
+      "alignment_method": "result_date_midsecond_minus_duration",
+      "alignment_is_approximate": true,
+      "restored_global_trace_offset_s": 1.351,
+      "monitor_relative_global_start_s": -13.083117000000001,
+      "monitor_relative_global_end_s": 630.632689,
+      "full_monitor_raw_energy_kj": 128.62118300008774,
+      "plotted_bins": 600,
+      "covered_bins": 600,
+      "plotted_raw_energy_kj": 124.54909378099441,
+      "plotted_scaled_energy_kj": 166.21451995051675,
+      "date_anchor_minus_selected_anchor_s": 0.0,
+      "source_sha256": {
+        "beam-jobs-mlsys/mixed/split_8_7/beam_detailed.json": "a36eb5ba3d61bce2833616e2e81d3b0a451c7939a2fc29ad2dd8dd37f9028748",
+        "beam-jobs-mlsys/mixed/split_8_7/power_timeline_gpu_0.csv": "0acff70a980960771d28796801d37d24144abad9d5bb70aa24ca3b6a649c25bf",
+        "beam-jobs-mlsys/mixed/split_8_7/per_request_slo.jsonl": "b0ab2f6e6981ea4942a7f9c5699cc5f5d12177f8fb3b5015736b718071decb13",
+        "beam-jobs-mlsys/mixed/split_8_7/slo_config.txt": "1c20c7fe66fa330f4e3e202b7ff2cb40d1e01addd8e94d448e45e7c0b6b26a36"
+      }
+    }
+  ],
+  "plotted_energy_kj": {
+    "vllm": 1547.5303110000268,
+    "slo_packer": 989.649997999996,
+    "beam_estimated": 1331.9127605261342
+  },
+  "limitations": [
+    "Not measured simultaneous eight-GPU power; sample mean may not represent unmeasured shards or aggregate peaks.",
+    "Independent replay targets: shard 0 uses 20 ms TBT; shards 3 and 7 use 25 ms TBT.",
+    "PCIe-to-SXM scaling is a heuristic, not measured SXM power.",
+    "Time alignment is approximate; original metadata starts at its first power event.",
+    "No missing-data imputation, clipping, idle addback, or modification of original curves."
+  ]
+}

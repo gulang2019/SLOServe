@@ -1,0 +1,303 @@
+{
+  "source_preview": "analysis_outputs/beam_figure7_energy_preview_old_coding_multiround_tpot25ms/provenance.json",
+  "source_preview_sha256": "a1bd6a6917cf2dd2732ae8efe06bd6a7becf10552bd9d840f615eec47cd8867b",
+  "original_sources": {
+    "code_7b": {
+      "duplicate_rows": 26,
+      "family_selections": {
+        "vllm / round_robin": "vllm / round_robin",
+        "sarathi / round_robin": "sarathi / round_robin"
+      },
+      "context": {
+        "load_scale": [
+          "1"
+        ],
+        "ttft_slo_scale": [
+          "3"
+        ],
+        "slo_tpot": [
+          "0.025"
+        ],
+        "perf_model_err": [
+          "1"
+        ]
+      },
+      "source": "Paper/data/e2e/code_7B.csv",
+      "sha256": "b94f561981b439fc45f593a5fc1959bdccf704a5c2edd58388b79e72fb6ae85a"
+    },
+    "mixed_7b": {
+      "duplicate_rows": 2,
+      "family_selections": {
+        "vllm / round_robin": "qlm / round_robin",
+        "sarathi / round_robin": "sarathi+ / round_robin"
+      },
+      "context": {
+        "load_scale": [
+          "1"
+        ],
+        "ttft_slo_scale": [
+          "3"
+        ],
+        "slo_tpot": [
+          "0.02"
+        ],
+        "perf_model_err": [
+          "1"
+        ]
+      },
+      "source": "Paper/data/e2e/mixed_7B.csv",
+      "sha256": "e11c7258f913c4aed0e023c1b3b67edf78b4614a52a85493c374595009ee6ca1"
+    }
+  },
+  "x_axis": "Original paper 0-10% piecewise-focus scale; CSV retains all points.",
+  "raw_energy_formula": "N * mean(raw_gpu_energy_j) / 1000",
+  "retained_point_values_unchanged": true,
+  "original_curves_unchanged": true,
+  "beam_energy_variant": "unscaled PCIe only; no affine hardware normalization",
+  "point_selection": "Coder only: minimize (raw energy, upper-bound SLO violation); Mixed unchanged.",
+  "omitted_coder_points": [
+    {
+      "workload": "code_7b",
+      "n_device": 7,
+      "violation_pct_lower": 6.953642384105961,
+      "violation_pct_upper": 6.953642384105961,
+      "energy_kj": 539.0601735238027,
+      "raw_energy_kj": 402.5839579997063,
+      "sources": [
+        "beam-figure7-7b-20261020-215014/code_7b/split_7_0"
+      ],
+      "device_indices": [
+        0
+      ],
+      "requests": 302,
+      "counts": {
+        "lower": 21,
+        "upper": 21,
+        "ttft": 21,
+        "errors": 0,
+        "ambiguous": 0
+      },
+      "eval_tpot_s": 0.025,
+      "allowance_s": 0.2,
+      "original_csv_tpot_s": 0.025,
+      "evaluation_matches_original_tpot": true,
+      "control_targets": [
+        {
+          "device_index": 0,
+          "ttft_s": 0.348735422,
+          "tbt_s": 0.025,
+          "tpot_s": null
+        }
+      ],
+      "monitor_durations_s": [
+        595.86921
+      ],
+      "benchmark_durations_s": [
+        584.262561198324
+      ],
+      "per_shard": [
+        {
+          "source": "beam-figure7-7b-20261020-215014/code_7b/split_7_0",
+          "device_index": 0,
+          "requests": 302,
+          "counts": {
+            "lower": 21,
+            "upper": 21,
+            "ttft": 21,
+            "errors": 0,
+            "ambiguous": 0
+          },
+          "raw_gpu_energy_j": 57511.99399995804,
+          "scaled_gpu_energy_j": 77008.5962176861,
+          "monitor_duration_s": 595.86921,
+          "benchmark_duration_s": 584.262561198324,
+          "max_power_sample_gap_s": 0.200616000000025,
+          "requests_with_missing_token_timestamps": 0,
+          "control_targets": {
+            "device_index": 0,
+            "ttft_s": 0.348735422,
+            "tbt_s": 0.025,
+            "tpot_s": null
+          },
+          "saved_allowance_s": 0.05,
+          "saved_eval_tpot_s": 0.025,
+          "eval_tpot_s": 0.025,
+          "allowance_s": 0.2,
+          "ttft_calibration": {
+            "ttft_scale": 3.0,
+            "zero_load_ttft_per_token_s": 6.139078782619333e-05,
+            "zero_load_ttft_constant_s": 0.010899481145765222
+          },
+          "expected_cache_adjusted": false,
+          "config": {
+            "trace": "sloserve_fig7_round_robin/code_7b/7/0.csv",
+            "duration_s": "full",
+            "ttft_scale": "3",
+            "zero_load_ttft_per_token_s": "6.1390787826193327e-05",
+            "zero_load_ttft_constant_s": "0.010899481145765222",
+            "routing_overhead_s": "0.05",
+            "slo_tpot_s": "0.025",
+            "beam_ttft_quantile": "50",
+            "beam_global_ttft_s": "0.348735422",
+            "beam_tbt_scale": "1",
+            "beam_tbt_s": "0.025000"
+          },
+          "source_sha256": {
+            "beam-figure7-7b-20261020-215014/code_7b/split_7_0/beam_detailed.json": "6bd6b7bc432ba21cd2e1f3040c1364ea051d4dae8528ba875e7dfbaf119ea264",
+            "beam-figure7-7b-20261020-215014/code_7b/split_7_0/per_request_slo.jsonl": "a490c0a065c87ecbedc75ec93cc66e0036b631d95a2071287582dc387a1fac4b",
+            "beam-figure7-7b-20261020-215014/code_7b/split_7_0/per_request_slo.summary.json": "6d8cc322062fa79f28bb09c1c6ee937e9d048f2693575dc83cf83ce9e3b9884f",
+            "beam-figure7-7b-20261020-215014/code_7b/split_7_0/slo_config.txt": "edb1dc3dd80aad40bf37113872ff80d32779319edbbd7cacb71cc116b1aad583",
+            "beam-figure7-7b-20261020-215014/code_7b/split_7_0/power_timeline_gpu_0.csv": "6ef890cc7be517d62104d78904fec04ad81e2c58296870d2d93c17792f02ea25"
+          }
+        }
+      ],
+      "source_sha256": {
+        "beam-figure7-7b-20261020-215014/code_7b/split_7_0/beam_detailed.json": "6bd6b7bc432ba21cd2e1f3040c1364ea051d4dae8528ba875e7dfbaf119ea264",
+        "beam-figure7-7b-20261020-215014/code_7b/split_7_0/per_request_slo.jsonl": "a490c0a065c87ecbedc75ec93cc66e0036b631d95a2071287582dc387a1fac4b",
+        "beam-figure7-7b-20261020-215014/code_7b/split_7_0/per_request_slo.summary.json": "6d8cc322062fa79f28bb09c1c6ee937e9d048f2693575dc83cf83ce9e3b9884f",
+        "beam-figure7-7b-20261020-215014/code_7b/split_7_0/slo_config.txt": "edb1dc3dd80aad40bf37113872ff80d32779319edbbd7cacb71cc116b1aad583",
+        "beam-figure7-7b-20261020-215014/code_7b/split_7_0/power_timeline_gpu_0.csv": "6ef890cc7be517d62104d78904fec04ad81e2c58296870d2d93c17792f02ea25"
+      },
+      "energy_is_extrapolated": true,
+      "energy_estimator": "N * mean(scaled single-GPU full-monitor energy); unequal windows retained",
+      "scoring": "Prior BEAM sensitivity convention; cumulative-deadline chunk bounds, raw client timings",
+      "limitations": [
+        "Not measured simultaneous deployment energy; selected shards may not represent the whole workload.",
+        "Full monitor intervals include overhead and differ across runs; no 600-second normalization or idle addback.",
+        "PCIe-to-SXM scaling is heuristic and does not predict SXM latency or scheduling.",
+        "Original-system scores are unchanged; BEAM evaluation TPOT is 25 ms versus original CSV TPOT 25 ms. Recorded scheduler targets are unchanged.",
+        "BEAM-only TTFT allowances are sensitivity settings, not proven matched historical calibration.",
+        "Multi-round uses current session traces and expected-cache budgets, not verified historical Figure 7 replay."
+      ],
+      "dominated_by_n_devices": [
+        6
+      ]
+    },
+    {
+      "workload": "code_7b",
+      "n_device": 8,
+      "violation_pct_lower": 6.4393939393939394,
+      "violation_pct_upper": 6.4393939393939394,
+      "energy_kj": 588.7988573803202,
+      "raw_energy_kj": 439.6060559997559,
+      "sources": [
+        "beam-figure7-7b-20261020-215014/code_7b/split_8_0"
+      ],
+      "device_indices": [
+        0
+      ],
+      "requests": 264,
+      "counts": {
+        "lower": 17,
+        "upper": 17,
+        "ttft": 14,
+        "errors": 0,
+        "ambiguous": 0
+      },
+      "eval_tpot_s": 0.025,
+      "allowance_s": 0.2,
+      "original_csv_tpot_s": 0.025,
+      "evaluation_matches_original_tpot": true,
+      "control_targets": [
+        {
+          "device_index": 0,
+          "ttft_s": 0.353155559,
+          "tbt_s": 0.025,
+          "tpot_s": null
+        }
+      ],
+      "monitor_durations_s": [
+        595.073844
+      ],
+      "benchmark_durations_s": [
+        583.6271233558655
+      ],
+      "per_shard": [
+        {
+          "source": "beam-figure7-7b-20261020-215014/code_7b/split_8_0",
+          "device_index": 0,
+          "requests": 264,
+          "counts": {
+            "lower": 17,
+            "upper": 17,
+            "ttft": 14,
+            "errors": 0,
+            "ambiguous": 0
+          },
+          "raw_gpu_energy_j": 54950.75699996948,
+          "scaled_gpu_energy_j": 73599.85717254003,
+          "monitor_duration_s": 595.073844,
+          "benchmark_duration_s": 583.6271233558655,
+          "max_power_sample_gap_s": 0.20068200000000047,
+          "requests_with_missing_token_timestamps": 0,
+          "control_targets": {
+            "device_index": 0,
+            "ttft_s": 0.353155559,
+            "tbt_s": 0.025,
+            "tpot_s": null
+          },
+          "saved_allowance_s": 0.05,
+          "saved_eval_tpot_s": 0.025,
+          "eval_tpot_s": 0.025,
+          "allowance_s": 0.2,
+          "ttft_calibration": {
+            "ttft_scale": 3.0,
+            "zero_load_ttft_per_token_s": 6.139078782619333e-05,
+            "zero_load_ttft_constant_s": 0.010899481145765222
+          },
+          "expected_cache_adjusted": false,
+          "config": {
+            "trace": "sloserve_fig7_round_robin/code_7b/8/0.csv",
+            "duration_s": "full",
+            "ttft_scale": "3",
+            "zero_load_ttft_per_token_s": "6.1390787826193327e-05",
+            "zero_load_ttft_constant_s": "0.010899481145765222",
+            "routing_overhead_s": "0.05",
+            "slo_tpot_s": "0.025",
+            "beam_ttft_quantile": "50",
+            "beam_global_ttft_s": "0.353155559",
+            "beam_tbt_scale": "1",
+            "beam_tbt_s": "0.025000"
+          },
+          "source_sha256": {
+            "beam-figure7-7b-20261020-215014/code_7b/split_8_0/beam_detailed.json": "9e3cf1d8de4e737598f8fbfae307fe9946dbe24b3d6a5e3ea83d483b610c369b",
+            "beam-figure7-7b-20261020-215014/code_7b/split_8_0/per_request_slo.jsonl": "7ad20a5af7ed45da34f45376619fea98d248171a388e026b41763090be387223",
+            "beam-figure7-7b-20261020-215014/code_7b/split_8_0/per_request_slo.summary.json": "23bfe8d927fb6064a797b50b3e978d58d952434423e120d5cb176ac878ad1d6e",
+            "beam-figure7-7b-20261020-215014/code_7b/split_8_0/slo_config.txt": "7606123cdfd71f88591ec20a3122ebbebe2fd5f50cd8fba1ed8b5611391b8394",
+            "beam-figure7-7b-20261020-215014/code_7b/split_8_0/power_timeline_gpu_0.csv": "91ab99cbda61d0270891bc612ee833fac88d1e73fa822457dcca6fa89bb28276"
+          }
+        }
+      ],
+      "source_sha256": {
+        "beam-figure7-7b-20261020-215014/code_7b/split_8_0/beam_detailed.json": "9e3cf1d8de4e737598f8fbfae307fe9946dbe24b3d6a5e3ea83d483b610c369b",
+        "beam-figure7-7b-20261020-215014/code_7b/split_8_0/per_request_slo.jsonl": "7ad20a5af7ed45da34f45376619fea98d248171a388e026b41763090be387223",
+        "beam-figure7-7b-20261020-215014/code_7b/split_8_0/per_request_slo.summary.json": "23bfe8d927fb6064a797b50b3e978d58d952434423e120d5cb176ac878ad1d6e",
+        "beam-figure7-7b-20261020-215014/code_7b/split_8_0/slo_config.txt": "7606123cdfd71f88591ec20a3122ebbebe2fd5f50cd8fba1ed8b5611391b8394",
+        "beam-figure7-7b-20261020-215014/code_7b/split_8_0/power_timeline_gpu_0.csv": "91ab99cbda61d0270891bc612ee833fac88d1e73fa822457dcca6fa89bb28276"
+      },
+      "energy_is_extrapolated": true,
+      "energy_estimator": "N * mean(scaled single-GPU full-monitor energy); unequal windows retained",
+      "scoring": "Prior BEAM sensitivity convention; cumulative-deadline chunk bounds, raw client timings",
+      "limitations": [
+        "Not measured simultaneous deployment energy; selected shards may not represent the whole workload.",
+        "Full monitor intervals include overhead and differ across runs; no 600-second normalization or idle addback.",
+        "PCIe-to-SXM scaling is heuristic and does not predict SXM latency or scheduling.",
+        "Original-system scores are unchanged; BEAM evaluation TPOT is 25 ms versus original CSV TPOT 25 ms. Recorded scheduler targets are unchanged.",
+        "BEAM-only TTFT allowances are sensitivity settings, not proven matched historical calibration.",
+        "Multi-round uses current session traces and expected-cache budgets, not verified historical Figure 7 replay."
+      ],
+      "dominated_by_n_devices": [
+        6
+      ]
+    }
+  ],
+  "raw_measurements_retained_in_csv": true,
+  "paper_assets_modified": false,
+  "limitations": [
+    "Unscaled BEAM is PCIe, original baselines are SXM: not hardware-matched.",
+    "BEAM curves extrapolate independent shards, not measured cluster totals.",
+    "Coder BEAM alone is Pareto-filtered; excluded points are not claimed to be erroneous measurements.",
+    "Full monitoring windows retained; no idle addback or duration normalization.",
+    "BEAM Mixed evaluation remains 25 ms versus original baseline 20 ms."
+  ]
+}

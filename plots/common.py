@@ -6,8 +6,11 @@ LABEL_MAP = {
     'atfc / round_robin_session': 'SLO Packer (Session-Aware)',
     'vllm / round_robin_session': 'vLLM (Session-Aware)',
     'sarathi / round_robin_session': 'Sarathi+ (Session-Aware)',
+    'atfc / slosserve_4_planner': 'SLO Packer',
     'atfc / slosserve_planner_ablation-no_local': 'SLO Packer (no local)',
+    'atfc / slosserve_planner_ablation_no_local': 'SLO Packer (no local)',
     'atfc / slosserve_planner_ablation-no_global': 'SLO Packer (no global)',
+    'atfc / slosserve_planner_ablation_no_global': 'SLO Packer (no global)',
     'atfc / slosserve_planner': 'SLO Packer',
     'atfc / slosserve_planner_oracle_mem': 'SLO Packer (Oracle)',
     'qlm / round_robin': 'vLLM+',
@@ -16,7 +19,13 @@ LABEL_MAP = {
     'sarathi / round_robin': 'Sarathi',
     'qlm / llumnix_load': 'Llumnix',
     'atfc / slosserve_disagg_planner': 'SLO Packer (Disagg)',
-    'qlm / round_robin-disagg': 'vLLM+ (Disagg)'
+    'atfc / slosserve_planner_disagg': 'SLO Packer (Disagg)',
+    'qlm / round_robin-disagg': 'vLLM+ (Disagg)',
+    'qlm / round_robin-disagg-d1': 'vLLM (1 decode)',
+    'qlm / round_robin-disagg-d2': 'vLLM (2 decode)',
+    'qlm / round_robin-disagg-d3': 'vLLM (3 decode)',
+    'qlm / round_robin-disagg-d4': 'vLLM (4 decode)',
+    'qlm / round_robin_session': 'vLLM (Session-Aware)'
 }
 
 STYLE_KEY_ALIASES = {
@@ -24,10 +33,18 @@ STYLE_KEY_ALIASES = {
     'Ours': 'atfc / slosserve_planner',
     'SLO Packer': 'atfc / slosserve_planner',
     'SLO-Packer': 'atfc / slosserve_planner',
+    'atfc / slosserve_4_planner': 'atfc / slosserve_planner',
+    'atfc / slosserve_planner_disagg': 'atfc / slosserve_disagg_planner',
+    'atfc / slosserve_planner_ablation_no_local': 'atfc / slosserve_planner_ablation-no_local',
+    'atfc / slosserve_planner_ablation_no_global': 'atfc / slosserve_planner_ablation-no_global',
     'SLO Packer (RR)': 'atfc / round_robin',
     'SLO-Packer (RR)': 'atfc / round_robin',
     'SLO Packer (Oracle)': 'atfc / slosserve_planner_oracle_mem',
     'SLO-Packer (Oracle)': 'atfc / slosserve_planner_oracle_mem',
+    'SLO Packer (no local)': 'atfc / slosserve_planner_ablation-no_local',
+    'SLO-Packer (no local)': 'atfc / slosserve_planner_ablation-no_local',
+    'SLO Packer (no global)': 'atfc / slosserve_planner_ablation-no_global',
+    'SLO-Packer (no global)': 'atfc / slosserve_planner_ablation-no_global',
     'QLM': 'qlm / round_robin',
     'vLLM+': 'vllm / round_robin',
     'vLLM (Session-Aware)': 'vllm / round_robin_session',
@@ -101,7 +118,7 @@ def get_method_style(method: str) -> dict[str, object]:
         'color': get_method_color(method),
         'marker': get_method_marker(method),
         'linewidth': 2.0,
-        'markersize': 6,
+        'markersize': 7.5,
     }
 
 
