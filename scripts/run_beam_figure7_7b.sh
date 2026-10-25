@@ -7,7 +7,7 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/beam_common.sh"
 
 beam_host="${BEAM_HOST:-127.0.0.1}"
 beam_port="${BEAM_PORT:-8008}"
-output_root="results/beam-figure7-7b-$(date +%Y%m%d-%H%M%S)"
+output_root="results/beam-figure7-7b-$(date +%Y%m%d-%H%M%S)-gpu${beam_gpu}"
 first_only=0
 only_trace=""
 split=""

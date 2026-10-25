@@ -7,6 +7,10 @@ container_name="${BEAM_CONTAINER:-vllm_evaluator_env}"
 beam_image="jlee335/beam-volume-260307:latest"
 beam_gpu="${BEAM_GPU:-0}"
 beam_model="${BEAM_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+beam_port="${BEAM_PORT:-8008}"
+# One BEAM server per GPU, each on its own port, can share the container.
+beam_server_pattern="vllm serve .* --port $beam_port "
+beam_server_log="/tmp/beam-qwen7b-$beam_port.log"
 
 require_docker() {
   if ! docker info >/dev/null 2>&1; then
@@ -19,6 +23,16 @@ require_docker() {
 require_gpu() {
   if ! nvidia-smi -i "$beam_gpu" >/dev/null 2>&1; then
     echo "BEAM_GPU=$beam_gpu is not an available NVIDIA GPU." >&2
+    exit 1
+  fi
+}
+
+# Timing and energy are measured per GPU, so nothing else may run on it.
+require_idle_gpu() {
+  local pids
+  pids="$(nvidia-smi -i "$beam_gpu" --query-compute-apps=pid --format=csv,noheader)"
+  if [[ -n "$pids" ]]; then
+    echo "GPU $beam_gpu is in use (PIDs: $(echo $pids)); BEAM needs it exclusively." >&2
     exit 1
   fi
 }

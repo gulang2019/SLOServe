@@ -79,6 +79,7 @@ class BatchPlanner:
     _max_decode_length: int
     _decode_length_predictor: DecodeLengthPredictorPlugin | None = None
     _max_batch_size: int | None = None
+    _admission_max_batch_size: int | None = None
     _profile_events: list = field(default_factory=list)
     _is_oracle: bool = False
     _enforce_batch_memory_budget: bool = False
@@ -489,6 +490,8 @@ class BatchPlanner:
             self._adm_ctrler,
             tpots=[tpot],
             fixed_bs=False,
+            max_bs=(self._admission_max_batch_size
+                    if self._admission_max_batch_size is not None else 16384),
         )
         if self._adm_ctrler_tpot is None:
             logger.info(

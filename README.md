@@ -98,6 +98,25 @@ BEAM_GPU=0 BEAM_PORT=8008 BEAM_GPU_MEMORY_UTILIZATION=0.85 \
 curl -fsS http://127.0.0.1:8008/v1/models
 ```
 
+`BEAM_GPU` may be any GPU index (PCI order, as `nvidia-smi` lists them): the
+baseline patch makes BEAM's profiler and scheduler lock clocks and read
+energy on that GPU. Scripts refuse a GPU that has other processes on it.
+A profile is valid for every GPU of the same name (e.g. all
+`NVIDIA A100-SXM4-80GB`); `BEAM_PROFILE_NUM_CLOCKS=3` makes a quick smoke
+profile first. Several BEAM servers can share the container, one per GPU and
+port; stop one with `BEAM_PORT=<port> BEAM_GPU=<gpu> ./scripts/stop_beam_qwen7b.sh`.
+A checkout that already has an older version of the baseline patch must be
+reverted (`git -C 3rdparty/BEAM checkout -- .`) before `scripts/setup_beam.sh`.
+
+With few GPUs, replay round-robin replicas one at a time: each replica of an
+N-way split sees exactly its share of the trace, with global timestamps.
+
+```sh
+python scripts/split_beam_figure7_rr_load.py
+BEAM_GPU=3 BEAM_PORT=8009 ./scripts/run_beam_figure7_7b.sh \
+  --trace chat_7b --split 8/0 --output-root results/a100sxm/chat_7b_8_0
+```
+
 BEAM's endpoint is OpenAI-compatible. Its native traced benchmark accepts a
 CSV with `TIMESTAMP`, `ContextTokens`, and `GeneratedTokens` columns. The
 current Figure 7 driver cannot target BEAM directly: it requires SLOServe
@@ -192,6 +211,87 @@ python -m SLOsServe.router.api_server_ray --stat_window 2 \
     --clients 0,1 --admission_mode anytime --mock_connector \
     --mock_engine 2>&1 | tee out.txt
 ```
+
+### Integrated BEAM policies (real or mock engines)
+
+The modified `3rdparty/vllm` scheduler supports `beam` and `beam_atfc` with
+TP=1, PP=1, using `SLOsServe/beam.py` and a BEAM offline CSV profile:
+
+- `beam`: a port of upstream BEAM's S1/S2 scheduler (`--use-s1 --use-s2`).
+  `tests/test_beam.py` checks its profile lookups and S1/S2 decisions against
+  the code in `3rdparty/BEAM`. As upstream: S1 and S2 run only on the step
+  after a request arrives; S1 sets the batch token budget (chunk size) and
+  locks the prefill clock; the S2 clock is locked after 5 consecutive
+  decode-only steps; clock locks are asynchronous; chunk sizes may only move
+  to an adjacent size while a prefill is in flight; the 128/256 fallbacks and
+  upstream's tie-breaking are kept. Requests queue FCFS without rejection.
+- `beam_atfc` (not upstream BEAM): ATFC admits requests and owns token
+  allocation; each batch then runs at the lowest-energy clock whose BEAM
+  estimate fits ATFC's predicted batch time and the SLO.
+
+Deliberate differences from upstream `beam`: SLOServe TTFT SLOs are per
+request, so S1 checks a candidate's TTFT against the smallest remaining TTFT
+budget of the step's prefill requests (upstream: `ttft + max queuing <= one
+server-wide SLO`; identical when all requests share an SLO). The TBT target is
+`slo_tpot`. A chunk size equal to the running-request count is skipped where
+upstream raises `ZeroDivisionError`. The first batch is capped at the
+profile's largest batch (512) instead of vLLM's 8192. Preempted requests
+resume after, not before, the waiting queue. `beam_use_s1`, `beam_use_s2` and
+`beam_use_s1_dvfs_only` select upstream's ablations.
+
+#### Simulating the profiled GPU (mock engines)
+
+Set both variables before launching the router/engines and the benchmark:
+
+```sh
+export SLOSSERVE_BEAM_PROFILE=/absolute/path/to/beam_profile.csv
+export SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ=1410   # e.g. the profile's max clock
+```
+
+With these, the profile is the simulated machine for every policy, so
+comparisons are on the same hardware:
+
+- Execution: each batch takes the profiled forward time at the clock in
+  effect (interpolated in batch size and context; a clock change lands
+  `beam_switch_delay_s`, default 10 ms, after it is requested, possibly
+  mid-batch), plus `beam_prefill_overhead_s` (12 ms) or
+  `beam_decode_overhead_s` (3 ms) per step. BEAM starts at the boost clock;
+  every other policy runs locked at `SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ`.
+- Planning: ATFC and the router plan with a perf model fitted to that
+  execution model at the fixed clock.
+- SLOs: the benchmark's zero-load TTFT (hence every TTFT SLO) comes from the
+  same fitted model.
+- Energy: batch events carry `sim_energy_j` (profiled board energy of the
+  forward pass) and `sim_clock_mhz`; the analysis reports
+  `energy_est_source=profile` and charges `mock_idle_power_w` (default 70 W,
+  not profiled; set it for the GPU) for all other time.
+
+The benchmark refuses `beam`/`beam_atfc` without
+`SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ`. The bundled A100 Qwen-14B profile is not a
+Qwen-7B RTX 5090 profile; label results as simulating the profiled system.
+
+```sh
+python motivation/bench_api_server.py \
+  --model_name Qwen/Qwen2.5-7B-Instruct \
+  --policies round_robin:beam slosserve_planner:atfc \
+  --n_devices 1 --clients 0 --port 8000 \
+  --trace azure_chat_23:azure_chat_23 --window t1200:1260 \
+  --load_scales 1.0 --ttft_slo_scales 3 --slo_tpots 0.05 \
+  --profit constant --admission_mode arrival \
+  --output_dir experiments_beam
+```
+
+Each S1/S2/decode-clock decision is logged as a `beam_decision` event
+(chunk size, clock, feasibility, whether a lock was issued).
+
+#### Real GPUs
+
+Launch the regular GPU-backed server; its process needs permission to set
+NVML locked clocks, which, as upstream, are set on a background thread.
+Each engine must own its GPU exclusively. CUDA-visible device 0 is the
+default; `beam_device_id` selects another visible device and is required for
+multi-DP engines. Resetting the policy or shutting down releases the lock.
+Use a profile matching the model, GPU, precision and TP/PP setup.
 
 ### Multi-node experiment (no shared filesystem)
 

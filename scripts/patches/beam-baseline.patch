@@ -29,7 +29,7 @@ index a4b5b34..95a0c19 100644
              requests.append(
                  SampleRequest(
 diff --git a/benchmarks/energy/test_offline_profile_new.py b/benchmarks/energy/test_offline_profile_new.py
-index f06ea85..4b49903 100644
+index f06ea85..9dc2fe6 100644
 --- a/benchmarks/energy/test_offline_profile_new.py
 +++ b/benchmarks/energy/test_offline_profile_new.py
 @@ -72,9 +72,6 @@ def main(args: argparse.Namespace):
@@ -42,7 +42,46 @@ index f06ea85..4b49903 100644
      llm = LLM(**dataclasses.asdict(engine_args))
      
      ############################################################
-@@ -140,7 +137,13 @@ def main(args: argparse.Namespace):
+@@ -90,20 +87,25 @@ def main(args: argparse.Namespace):
+     model_executor = llm.llm_engine.engine_core
+     
+     # Get GPU information and indices for tensor parallelism
+-    gpu_indices = [0]  # Default to GPU 0 for single GPU
++    # NVML sees every GPU; profile the ones CUDA_VISIBLE_DEVICES selects, not
++    # NVML 0 (run with CUDA_DEVICE_ORDER=PCI_BUS_ID so the orders agree).
++    visible = [int(x) for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
++               if x.strip()]
++    physical = visible if visible else list(range(max(tp_size, 1)))
++    gpu_indices = physical[:1]  # Default to the first visible GPU
+     if tp_size > 1:
+         try:
+             import torch.distributed as dist
+             if dist.is_initialized():
+                 local_rank = dist.get_rank()
+                 world_size = dist.get_world_size()
+-                gpu_indices = list(range(tp_size))
++                gpu_indices = physical[:tp_size]
+                 print(f"Distributed environment: Local rank={local_rank}, World size={world_size}")
+             else:
+-                gpu_indices = list(range(tp_size))
++                gpu_indices = physical[:tp_size]
+                 print(f"Using local GPUs for TP: {gpu_indices}")
+         except Exception as e:
+-            gpu_indices = list(range(tp_size))
++            gpu_indices = physical[:tp_size]
+             print(f"Fallback to local GPUs for TP: {gpu_indices} (Error: {e})")
+     
+     # Get GPU name
+@@ -116,7 +118,7 @@ def main(args: argparse.Namespace):
+     
+     # Get available GPU graphics clocks (using max memory clock)
+     import pynvml
+-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
++    handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_indices[0])
+     try:
+         # Get the maximum memory clock to query graphics clocks
+         mem_clocks = pynvml.nvmlDeviceGetSupportedMemoryClocks(handle)
+@@ -140,7 +142,13 @@ def main(args: argparse.Namespace):
      except Exception as e:
          print(f"Could not get clocks from pynvml: {e}, using default")
          clocks = [1410, 1530, 1650]  # Default fallback clocks
@@ -75,3 +114,42 @@ index 63d52cc..e716ca0 100644
      def _load_profiling_data(self):
          """Load and preprocess profiling CSV."""
          # print the profiling_csv_path
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 1de87a5..53bcf4d 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -85,6 +85,16 @@ def lock_gpu_clock(rank, new_clock):
+                     args=(device_handle, new_clock, new_clock)).start()
+ 
+ 
++def first_visible_nvml_index() -> int:
++    """NVML index of this server's first GPU; apply_dvfs locks the same one.
++
++    Run with CUDA_DEVICE_ORDER=PCI_BUS_ID so CUDA and NVML orders agree.
++    """
++    visible = [x.strip() for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
++               if x.strip()]
++    return int(visible[0]) if visible else 0
++
++
+ def apply_dvfs(new_clock: int, num_ranks: int):
+     """
+     Apply DVFS to the GPU clocks.
+@@ -301,7 +311,7 @@ class Scheduler(SchedulerInterface):
+             model_name = vllm_config.model_config.model
+             model_name_clean = model_name.replace("/", "_")
+             gpu_name = nvmlDeviceGetName(
+-                nvmlDeviceGetHandleByIndex(0))
++                nvmlDeviceGetHandleByIndex(first_visible_nvml_index()))
+ 
+             # (hj) Load offline profile data from csv file. In benchmarks/energy/offline_profile_results/
+             file_name_working = f"dvfs_profile_{gpu_name}_{model_name_clean}_tp{tp_size}_pp{pp_size}_one.csv"
+@@ -326,7 +336,7 @@ class Scheduler(SchedulerInterface):
+             model_name = vllm_config.model_config.model
+             model_name_clean = model_name.replace("/", "_")
+             gpu_name = nvmlDeviceGetName(
+-                nvmlDeviceGetHandleByIndex(0))
++                nvmlDeviceGetHandleByIndex(first_visible_nvml_index()))
+ 
+             dynamo_csv_name = f"dynamo_dvfs_profile_{gpu_name}_{model_name_clean}.csv"
+             dynamo_csv_path = f"{os.getcwd()}/{dyn_dir}/{dynamo_csv_name}"

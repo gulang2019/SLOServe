@@ -105,6 +105,12 @@ class Batch(Event):
     effective_free_kv_memory_bytes: Optional[int] = None
     used_kv_memory_bytes: Optional[int] = None
     effective_used_kv_memory_bytes: Optional[int] = None
+    # Mock engines simulating a BEAM-profiled GPU (SLOsServe.beam.SimulatedGpu).
+    sim_clock_mhz: Optional[int] = None
+    sim_end_clock_mhz: Optional[int] = None
+    sim_gpu_time_s: Optional[float] = None
+    sim_energy_j: Optional[float] = None
+    sim_idle_power_w: Optional[float] = None
     
     
     @property
@@ -1335,6 +1341,69 @@ def calc_n_active_servers(
             ax.legend()
     return average, breakdown
 
+def _compute_profiled_power_series(
+    batch_events: list[Event],
+    *,
+    n_device: int,
+    window_size: float,
+    start_time: float | None,
+    end_time: float | None,
+) -> dict[str, Any]:
+    """Power of mock engines that simulate a BEAM-profiled GPU.
+
+    Each batch reports the profiled board energy of its forward pass at the
+    clock(s) it ran at; every other moment (per-step overhead, idle gaps) is
+    charged the configured idle power. The batch's energy above idle is
+    spread over the batch event's interval.
+    """
+    if start_time is None:
+        start_time = min(float(event.timestamp - event.elapsed) for event in batch_events)
+    if end_time is None:
+        end_time = max(float(event.timestamp) for event in batch_events)
+    bins = _make_time_bins(start_time, end_time, window_size)
+    n_windows = len(bins) - 1
+    max_device_id = max(int(event.device_id) for event in batch_events)
+    device_ids = list(range(max(n_device, max_device_id + 1) if n_device > 0
+                            else max_device_id + 1))
+    idle_power = float(batch_events[0].sim_idle_power_w)
+    per_device_power = {
+        device_id: np.full(n_windows, idle_power, dtype=np.float64)
+        for device_id in device_ids
+    }
+    for event in batch_events:
+        batch_start = float(event.timestamp - event.elapsed)
+        batch_end = float(event.timestamp)
+        extra_energy = float(event.sim_energy_j) - idle_power * float(event.sim_gpu_time_s)
+        if batch_end <= batch_start:
+            continue
+        clipped_start = max(start_time, batch_start)
+        clipped_end = min(end_time, batch_end)
+        if clipped_end <= clipped_start:
+            continue
+        extra_power = extra_energy / (batch_end - batch_start)
+        left = max(0, int(np.floor((clipped_start - start_time) / window_size)))
+        right = min(n_windows, int(np.ceil((clipped_end - start_time) / window_size)))
+        for idx in range(left, right):
+            overlap = max(0.0, min(clipped_end, bins[idx + 1]) - max(clipped_start, bins[idx]))
+            per_device_power[int(event.device_id)][idx] += extra_power * overlap / window_size
+
+    total_power = np.sum(
+        np.vstack([per_device_power[device_id] for device_id in device_ids]),
+        axis=0,
+    )
+    return {
+        "time": bins[:-1] - start_time,
+        "total_power": total_power,
+        "per_device_power": per_device_power,
+        "total_energy_joules": float(np.sum(total_power) * window_size),
+        "per_device_energy_joules": {
+            device_id: float(np.sum(power) * window_size)
+            for device_id, power in per_device_power.items()
+        },
+        "source": "profile",
+    }
+
+
 def _compute_state_based_power_series(
     events: list[Event],
     *,
@@ -1345,6 +1414,16 @@ def _compute_state_based_power_series(
     idle_power: float = 70.0,
 ) -> dict[str, Any]:
     batch_events = [event for event in events if event.event_type == "batch"]
+    if batch_events and all(
+        getattr(event, "sim_energy_j", None) is not None for event in batch_events
+    ):
+        return _compute_profiled_power_series(
+            batch_events,
+            n_device=n_device,
+            window_size=window_size,
+            start_time=start_time,
+            end_time=end_time,
+        )
     if not batch_events:
         empty = np.array([], dtype=np.float64)
         return {
@@ -1564,8 +1643,9 @@ def calc_num_effective_tokens(
 
     batch_events = sorted(batch_events, key=lambda x: x.timestamp - x.elapsed)
     if not batch_events:
-        ax.set_title("No batch events")
-        return
+        if ax is not None:
+            ax.set_title("No batch events")
+        return 0.0
 
     t0 = min(event.timestamp - event.elapsed for event in batch_events)
     tN = max(event.timestamp for event in batch_events)

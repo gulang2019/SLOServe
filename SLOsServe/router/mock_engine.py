@@ -357,6 +357,8 @@ class MockEngineCore:
         self.total_kv_memory_bytes = int(self.num_blocks * self.bytes_per_block)
         
         vllm_config.model_config.model_name = model_name
+        # This process must never initialize a physical GPU clock actuator.
+        vllm_config.scheduler_config.beam_backend = "mock"
         
         vllm_config.scheduler_config.scheduler_cls = 'vllm.v1.core.sched.scheduler_adm_ctrl.SchedulerAdmCtrl'
         from vllm.v1.core.sched.scheduler_adm_ctrl import SchedulerAdmCtrl
@@ -459,11 +461,17 @@ class MockEngineCore:
             elif hasattr(self.scheduler.scheduler_config, k):
                 setattr(self.scheduler.scheduler_config, k, v)
         logger.info(f'Scheduler config updated: {self.scheduler.scheduler_config}')
+        self.scheduler.scheduler_config.beam_backend = "mock"
         self.scheduler.reset(self._profile_events)
         self.perf_model = _copy_scheduler_execution_perf_model(
             self.scheduler,
             self.model_name,
         )
+        sim_gpu = self.scheduler.sim_gpu
+        if sim_gpu is not None:
+            logger.info("Mock engine %s simulates %s from %s at %s MHz",
+                        self.device_id, sim_gpu.profile.gpu_name or "a GPU",
+                        sim_gpu.profile.path, sim_gpu.clock)
         _log_mock_engine_perf_models(
             self.scheduler,
             self.perf_model,
@@ -624,7 +632,15 @@ class MockEngineCore:
                     pooler_output = [],
                 )
                 launch_start = time.time()
-                batch_time = self.perf_model.get_batch_time(batch)
+                sim_execution = None
+                if self.scheduler.sim_gpu is not None and batch:
+                    # schedule() already advanced num_computed_tokens.
+                    sim_execution = self.scheduler.sim_gpu.run_batch(
+                        [(computed - n, n) for computed, n in batch],
+                        launch_start)
+                    batch_time = sim_execution.duration_s
+                else:
+                    batch_time = self.perf_model.get_batch_time(batch)
                 control_perf_model = getattr(self.scheduler, "perf_model", None)
                 control_estimated_time = None
                 online_control_slack = None 
@@ -713,6 +729,14 @@ class MockEngineCore:
                         "between_batch_time": elapsed,
                         "output_processing_elapsed": output_processing_elapsed,
                         "estimated_time": batch_time,
+                        **({
+                            "sim_clock_mhz": sim_execution.clock_mhz,
+                            "sim_end_clock_mhz": sim_execution.end_clock_mhz,
+                            "sim_gpu_time_s": sim_execution.gpu_time_s,
+                            "sim_energy_j": sim_execution.energy_j,
+                            "sim_idle_power_w": float(
+                                self.scheduler.scheduler_config.mock_idle_power_w),
+                        } if sim_execution is not None else {}),
                         "control_estimated_time": control_estimated_time,
                         "rejected_reqs": [r['request_id'] for r in rejs],
                         "publish_overhead": publish_overhead,

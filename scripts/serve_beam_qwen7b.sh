@@ -52,33 +52,37 @@ esac
 
 start_container
 
-if docker exec "$container_name" pgrep -f 'vllm serve' >/dev/null 2>&1; then
-  echo "A BEAM vLLM server is already running in $container_name; refusing to replace it." >&2
-  echo "Stop it first with scripts/stop_beam_qwen7b.sh." >&2
+if docker exec "$container_name" pgrep -f "$beam_server_pattern" >/dev/null 2>&1; then
+  echo "A BEAM vLLM server already uses port $beam_port in $container_name; refusing to replace it." >&2
+  echo "Stop it first with BEAM_PORT=$beam_port scripts/stop_beam_qwen7b.sh." >&2
   exit 1
 fi
+require_idle_gpu
 
 # VLLM_TORCH_PROFILER_DIR enables /start_profile, /stop_profile and the SLO
 # update endpoints; --custom-profiler makes /start_profile run BEAM's energy
 # logger instead of the torch profiler. Per-run benchmarks override the
 # output directory.
+# BEAM locks the clocks of the NVML devices named in CUDA_VISIBLE_DEVICES;
+# PCI order keeps CUDA and NVML indices equal.
 docker exec -d \
+  -e "CUDA_DEVICE_ORDER=PCI_BUS_ID" \
   -e "CUDA_VISIBLE_DEVICES=$beam_gpu" \
   -e "HF_TOKEN=${HF_TOKEN:-}" \
   -e "VLLM_TORCH_PROFILER_DIR=/workspace/benchmarks/energy/results" \
   "$container_name" \
-  bash -lc "cd /workspace/benchmarks/energy && exec vllm serve '$beam_model' --host 0.0.0.0 --port '$beam_port' --tensor-parallel-size 1 --pipeline-parallel-size 1 --max-model-len '$beam_max_model_len' --gpu-memory-utilization '$beam_memory_utilization' --custom-profiler ${beam_extra_args[*]} > /tmp/beam-qwen7b.log 2>&1"
+  bash -lc "cd /workspace/benchmarks/energy && exec vllm serve '$beam_model' --host 0.0.0.0 --port '$beam_port' --tensor-parallel-size 1 --pipeline-parallel-size 1 --max-model-len '$beam_max_model_len' --gpu-memory-utilization '$beam_memory_utilization' --custom-profiler ${beam_extra_args[*]} > '$beam_server_log' 2>&1"
 
 echo "BEAM ($beam_mode) is starting on GPU $beam_gpu; waiting for http://127.0.0.1:$beam_port/v1 ..."
 waited=0
 until curl -fsS "http://127.0.0.1:$beam_port/v1/models" >/dev/null 2>&1; do
-  if ! docker exec "$container_name" pgrep -f 'vllm serve' >/dev/null 2>&1; then
+  if ! docker exec "$container_name" pgrep -f "$beam_server_pattern" >/dev/null 2>&1; then
     echo "The BEAM server exited during startup. Last log lines:" >&2
-    docker exec "$container_name" tail -n 30 /tmp/beam-qwen7b.log >&2 || true
+    docker exec "$container_name" tail -n 30 "$beam_server_log" >&2 || true
     exit 1
   fi
   if (( waited >= ready_timeout )); then
-    echo "The BEAM server did not answer within ${ready_timeout} s; see /tmp/beam-qwen7b.log in $container_name." >&2
+    echo "The BEAM server did not answer within ${ready_timeout} s; see $beam_server_log in $container_name." >&2
     exit 1
   fi
   sleep 5
@@ -86,4 +90,4 @@ until curl -fsS "http://127.0.0.1:$beam_port/v1/models" >/dev/null 2>&1; do
 done
 
 echo "BEAM ($beam_mode) is ready at http://127.0.0.1:$beam_port/v1"
-echo "Follow logs with: docker exec -it $container_name tail -f /tmp/beam-qwen7b.log"
+echo "Follow logs with: docker exec -it $container_name tail -f $beam_server_log"

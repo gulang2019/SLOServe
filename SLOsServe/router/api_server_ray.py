@@ -69,6 +69,7 @@ logger = setup_logger("SLOsServe.router.api_server", os.getenv("SLOSSERVE_LOG_LE
 
 POST_ADMISSION_OOM_REJECTION_REASON = "POST_ADMISSION_OOM"
 INHERITED_WORKER_ENV_KEYS = (
+    "SLOSSERVE_BEAM_PROFILE",
     "SLOSSERVE_ENERGY_INTERVAL_S",
     "SLOSSERVE_ENERGY_SAMPLE_HZ",
 )
@@ -2587,10 +2588,26 @@ class SLOsServeRouter(Router):
         self._latest_server_rejection_rates_ts: float = 0.0
         self._last_router_safety_margin_update_ts: float = 0.0
         self._last_router_safety_margin_decision: dict[str, Any] | None = None
-        perf_model = PerfModel.get_perf_model(
-            self.model_name,
-            self.perf_model_task,
-        )
+        profile_clock = router_kwargs.get("mock_profile_clock_mhz")
+        if profile_clock is not None:
+            from SLOsServe.beam import BeamProfile
+            profile_path = router_kwargs.get("beam_profile_path")
+            if not profile_path:
+                raise ValueError(
+                    "mock_profile_clock_mhz requires beam_profile_path"
+                )
+            profile = BeamProfile(profile_path)
+            perf_model = PerfModel(
+                self.model_name,
+                profile.fit_perf_model_params(int(profile_clock)),
+            )
+            profile_max_bs = profile.batch_sizes[-1]
+        else:
+            perf_model = PerfModel.get_perf_model(
+                self.model_name,
+                self.perf_model_task,
+            )
+            profile_max_bs = 16384
         perf_model = perf_model.copy_with_adjustments(
             scale=self.perf_model_err,
             constant_offset=router_kwargs['scheduling_overhead'],
@@ -2665,6 +2682,7 @@ class SLOsServeRouter(Router):
             self.pre_adm_ctrler,
             tpots=[self.tpot],
             fixed_bs=False,
+            max_bs=profile_max_bs,
         )
         logger.info(
             (
@@ -2695,6 +2713,7 @@ class SLOsServeRouter(Router):
             self.adm_planner,
             tpots=[self.tpot],
             fixed_bs=False,
+            max_bs=profile_max_bs,
         )
         self.kv_xfer_delay = router_kwargs.get('kv_xfer_delay', 0.05)
         self.pre_adm_schedule_dump_threshold_s = router_kwargs.get("pre_adm_schedule_dump_threshold_s", 0.05)

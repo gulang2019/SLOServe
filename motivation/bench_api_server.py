@@ -5058,8 +5058,17 @@ async def main(
     rps = len(trace_request_indices) / (arrival_times[-1] - arrival_times[0])
     
     from SLOsServe.perf_model import PerfModel
-    perf_model = PerfModel.get_perf_model(problem.model_name, problem.perf_model_task)
-    
+    mock_profile_clock = os.getenv('SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ')
+    if mock_profile_clock:
+        # TTFT SLOs scale the zero-load TTFT of the simulated GPU, so every
+        # policy on that machine shares one SLO definition.
+        from SLOsServe.beam import BeamProfile
+        perf_model = PerfModel(problem.model_name, BeamProfile(
+            os.environ['SLOSSERVE_BEAM_PROFILE']).fit_perf_model_params(
+                int(mock_profile_clock)))
+    else:
+        perf_model = PerfModel.get_perf_model(problem.model_name, problem.perf_model_task)
+
     prepare_request_prompts(
         requests,
         problem.model_name,
@@ -6820,9 +6829,20 @@ def build_problems(
             "max_num_batched_tokens": 16384
         })
         
+    elif scheduling_policy == 'beam':
+        scheduling_kwargss.append({
+            'scheduling_policy': 'beam',
+            'max_num_batched_tokens': 512,
+            # vLLM's OpenAI-server default on an 80GB A100, as BEAM serves.
+            'max_num_seqs': 1024,
+            'long_prefill_token_threshold': 0,
+            'enable_chunked_prefill': True,
+            'enable_admission': False,
+            'allow_rejection': False,
+        })
     elif 'atfc' in scheduling_policy:
         scheduling_kwargss.append({
-            'scheduling_policy': 'atfc',
+            'scheduling_policy': 'beam_atfc' if scheduling_policy == 'beam_atfc' else 'atfc',
             'enable_admission': True,
             "allow_rejection": True,
             "scheduling_overhead": scheduling_overhead,
@@ -6850,6 +6870,25 @@ def build_problems(
         })
 
     for sch_kwargs in scheduling_kwargss:
+        mock_profile_clock = os.getenv('SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ')
+        if mock_profile_clock:
+            beam_profile = os.getenv('SLOSSERVE_BEAM_PROFILE')
+            if not beam_profile:
+                raise ValueError('SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ requires '
+                                 'SLOSSERVE_BEAM_PROFILE')
+            sch_kwargs['beam_profile_path'] = os.path.abspath(beam_profile)
+            sch_kwargs['mock_profile_clock_mhz'] = int(mock_profile_clock)
+            sch_kwargs['max_num_batched_tokens'] = 512
+        if scheduling_policy in ('beam', 'beam_atfc'):
+            if not mock_profile_clock:
+                # Otherwise BEAM would run on the profiled GPU while its SLOs
+                # (and every other policy) use a different machine.
+                raise ValueError(
+                    f'{scheduling_policy} simulates the BEAM profile GPU; set '
+                    'SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ (e.g. the profile\'s max '
+                    'clock) so SLOs and baselines use that GPU too')
+            sch_kwargs['max_num_batched_tokens'] = 512
+            sch_kwargs['enable_chunked_prefill'] = True
         sch_kwargs['max_decoding_length'] = max_output_length
         sch_kwargs['admission_max_decoding_length'] = admission_output_length
         sch_kwargs['scheduling_safety_margin'] = scheduling_safety_margin
@@ -7095,6 +7134,16 @@ def build_problems(
             'ablation': ablation_no_global
             # 'routing_overhead': slo_routing_overhead
         } | extra_kwargs
+        mock_profile_clock = os.getenv('SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ')
+        if mock_profile_clock:
+            beam_profile = os.getenv('SLOSSERVE_BEAM_PROFILE')
+            if not beam_profile:
+                raise ValueError('SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ requires '
+                                 'SLOSSERVE_BEAM_PROFILE')
+            slosserve_routing_kwargs['beam_profile_path'] = os.path.abspath(
+                beam_profile)
+            slosserve_routing_kwargs['mock_profile_clock_mhz'] = int(
+                mock_profile_clock)
         if threshold_admission_request_limit is not None:
             slosserve_routing_kwargs.setdefault(
                 "threshold_admission_request_limit",
