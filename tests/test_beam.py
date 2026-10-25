@@ -222,9 +222,19 @@ def test_nvml_actuator_locks_on_a_thread_and_releases(monkeypatch):
         time.sleep(0.001)
     nvml.nvmlDeviceSetGpuLockedClocks.assert_called_once_with(
         nvml.nvmlDeviceGetHandleByIndex.return_value, 1200, 1200)
+    # Once at construction (permission check), once to release the lock.
     actuator.close()
-    nvml.nvmlDeviceResetGpuLockedClocks.assert_called_once()
+    assert nvml.nvmlDeviceResetGpuLockedClocks.call_count == 2
     nvml.nvmlShutdown.assert_called_once()
+
+
+def test_nvml_actuator_fails_fast_without_clock_permission(monkeypatch):
+    from SLOsServe.beam import NvmlClock
+    nvml = Mock()
+    nvml.nvmlDeviceResetGpuLockedClocks.side_effect = PermissionError("root")
+    monkeypatch.setattr("vllm.utils.import_pynvml", lambda: nvml)
+    with pytest.raises(PermissionError):
+        NvmlClock(0)
 
 
 # ---- Upstream state machine ----------------------------------------------
@@ -507,3 +517,24 @@ def test_profiled_energy_replaces_state_based_estimate():
     extra = (100.0 - 60.0 * 0.4) + (250.0 - 60.0 * 1.0)
     assert summary["total_energy_joules"] == pytest.approx(idle + extra)
     assert summary["per_device_energy_joules"][1] == pytest.approx(120.0 + 190.0)
+
+
+def test_rr_shard_offset_selects_later_shards():
+    from motivation.bench_api_server import _slice_rr_workload
+    requests = list(range(12))
+    kept, arrivals, indices = _slice_rr_workload(
+        requests, [i * 0.5 for i in requests], 4, 1, shard_offset=3)
+    assert indices == [3, 7, 11] and kept == indices
+    assert arrivals == [1.5, 3.5, 5.5]  # original timestamps
+    with pytest.raises(ValueError, match="exceeds"):
+        _slice_rr_workload(requests, [0.0] * 12, 4, 2, shard_offset=3)
+
+
+def test_benchmark_beam_on_real_gpus_keeps_default_slos(profile_path, tmp_path,
+                                                         monkeypatch):
+    monkeypatch.setenv("SLOSSERVE_BEAM_PROFILE", profile_path)
+    monkeypatch.delenv("SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ", raising=False)
+    monkeypatch.setenv("SLOSSERVE_BEAM_BACKEND", "real")
+    kwargs = _problems(monkeypatch, tmp_path, "beam")[0].scheduling_kwargs
+    assert kwargs["beam_profile_path"] == profile_path
+    assert "mock_profile_clock_mhz" not in kwargs

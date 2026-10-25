@@ -5018,12 +5018,15 @@ async def main(
         problem.routing_kwargs,
         clients,
     )
+    # Replay later shards of the split on few GPUs, one run at a time.
+    shard_offset = int(os.getenv('SLOSSERVE_RR_SHARD_OFFSET', '0')) if rr_sliced else 0
     if rr_sliced:
         requests, arrival_times, _ = _slice_rr_workload(
             requests,
             arrival_times,
             requested_n_devices,
             effective_n_devices,
+            shard_offset,
         )
         routing_kwargs = _routing_kwargs_to_dict(problem.routing_kwargs)
         if "group_size" in routing_kwargs:
@@ -5035,11 +5038,13 @@ async def main(
         problem.n_devices = effective_n_devices
         problem.store_prefix = (
             f"{problem.store_prefix}_rrslice_eff{effective_n_devices}"
+            + (f"_off{shard_offset}" if shard_offset else "")
         )
         print(
             "RR slicing enabled:",
             f"requested_n_devices={requested_n_devices}",
             f"effective_n_devices={effective_n_devices}",
+            f"shard_offset={shard_offset}",
             f"kept_requests={len(requests)}",
             f"original_requests={original_request_count}",
         )
@@ -5802,6 +5807,7 @@ async def main(
     results['requested_n_device'] = requested_n_devices
     results['effective_n_device'] = problem.n_devices
     results['rr_sliced'] = rr_sliced
+    results['rr_shard_offset'] = shard_offset
     results['rr_slice_kept_request_count'] = len(requests)
     results['rr_slice_total_request_count'] = original_request_count
     results['trace_arrival_limit_s'] = problem.trace_arrival_limit_s
@@ -6059,16 +6065,22 @@ def _slice_rr_workload(
     arrival_times: list[float],
     requested_n_devices: int,
     effective_n_devices: int,
+    shard_offset: int = 0,
 ) -> tuple[list[Any], list[float], list[int]]:
+    """Keep round-robin shards shard_offset .. shard_offset+effective-1."""
     assert len(requests) == len(arrival_times), (
         f"{len(requests)=} != {len(arrival_times)=}")
     if effective_n_devices >= requested_n_devices:
         kept_indices = list(range(len(requests)))
         return list(requests), list(arrival_times), kept_indices
+    if not 0 <= shard_offset <= requested_n_devices - effective_n_devices:
+        raise ValueError(
+            f"shard offset {shard_offset} with {effective_n_devices} devices "
+            f"exceeds the {requested_n_devices}-way split")
 
     kept_indices = [
         idx for idx in range(len(requests))
-        if idx % requested_n_devices < effective_n_devices
+        if 0 <= idx % requested_n_devices - shard_offset < effective_n_devices
     ]
     return (
         [requests[idx] for idx in kept_indices],
@@ -6880,13 +6892,19 @@ def build_problems(
             sch_kwargs['mock_profile_clock_mhz'] = int(mock_profile_clock)
             sch_kwargs['max_num_batched_tokens'] = 512
         if scheduling_policy in ('beam', 'beam_atfc'):
-            if not mock_profile_clock:
-                # Otherwise BEAM would run on the profiled GPU while its SLOs
-                # (and every other policy) use a different machine.
+            real_gpu = os.getenv('SLOSSERVE_BEAM_BACKEND') == 'real'
+            if not mock_profile_clock and not real_gpu:
+                # Otherwise mock BEAM would run on the profiled GPU while its
+                # SLOs (and every other policy) use a different machine.
                 raise ValueError(
-                    f'{scheduling_policy} simulates the BEAM profile GPU; set '
-                    'SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ (e.g. the profile\'s max '
-                    'clock) so SLOs and baselines use that GPU too')
+                    f'{scheduling_policy} on mock engines simulates the BEAM '
+                    'profile GPU; set SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ (e.g. the '
+                    'profile\'s max clock) so SLOs and baselines use that GPU '
+                    'too, or SLOSSERVE_BEAM_BACKEND=real on real GPUs')
+            beam_profile = os.getenv('SLOSSERVE_BEAM_PROFILE')
+            if not beam_profile:
+                raise ValueError(f'{scheduling_policy} needs SLOSSERVE_BEAM_PROFILE')
+            sch_kwargs['beam_profile_path'] = os.path.abspath(beam_profile)
             sch_kwargs['max_num_batched_tokens'] = 512
             sch_kwargs['enable_chunked_prefill'] = True
         sch_kwargs['max_decoding_length'] = max_output_length

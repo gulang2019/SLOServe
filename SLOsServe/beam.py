@@ -287,6 +287,9 @@ class NvmlClock:
         self.nvml = import_pynvml()
         self.nvml.nvmlInit()
         self.handle = self.nvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+        # Locks are applied on threads whose errors nobody sees; fail here,
+        # synchronously, if this process may not control the clocks at all.
+        self.nvml.nvmlDeviceResetGpuLockedClocks(self.handle)
         self.locked = False
 
     def set_clock(self, clock: int, now: float) -> None:
