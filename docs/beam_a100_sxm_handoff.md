@@ -134,23 +134,32 @@ Fixed for every run: `round_robin:beam`, `--window t1200:1800`,
 | ChatBot | `azure_chat_23:azure_chat_23` | 0.025 | 0.05 |
 | Coder | `azure_code_23:azure_code_23` | 0.025 | 0.05 |
 | Mixed | `azure_code_23:azure_code_23+azure_chat_23:azure_chat_23` | 0.02 | 0.02 |
+| Large-Scale Chatting | `azure_chat:azure_chat` | 0.02 | 0.05 |
 
 Trace specs and allowances follow the native-BEAM Figure 7 export
-(`scripts/export_beam_figure7_traces.py`, `scripts/run_beam_figure7_7b.sh`).
-Confirm they match the baselines in `Paper/data/e2e/{chat,code,mixed}_7B.csv`
+(`scripts/export_beam_figure7_traces.py`, `scripts/run_beam_figure7_7b.sh`)
+and, for Large-Scale Chatting, `configs/batch/sim_fig7/large_scale_chat.json`
+(13627 requests, ~23 req/s; its zero-load TTFT uses the model's `default`
+perf-model entry). Confirm they match the baselines in
+`Paper/data/e2e/{chat,code,mixed}_7B.csv` and `chatting_large_scale.csv`
 (Coder in particular: some newer configs use `sharegpt_code` lengths).
 
 The figure shows points with at most 10% SLO violation. Earlier BEAM runs
-were visible at ChatBot N = 4-8, Coder N = 6-16 and Mixed N = 10-16; the
-lists below cover those plus the point just below each threshold, so the
-curve's left end is found even if A100 SXM shifts it.
+were visible at ChatBot N = 4-8, Coder N = 6-16, Mixed N = 10-16 and
+Large-Scale Chatting N = 16 only (N = 8-14 were above 10%; the baselines
+there are visible from N = 10). The lists below cover those plus the point
+just below each threshold, so the curve's left end is found even if A100
+SXM shifts it.
 
 | Tier | What | Runs | Time |
 |---|---|---|---|
-| 1 | shard 0 of: ChatBot N = 3-8; Coder N = 5, 6, 8, 10, 12, 14, 16; Mixed N = 8, 10, 12, 14, 16 | 18 | ~3.6 h |
-| 2 | shard N-1 of every Tier-1 point with <= 10% violation | <= 18 | <= 3.6 h |
+| 1 | shard 0 of: ChatBot N = 3-8; Coder N = 5, 6, 8, 10, 12, 14, 16; Mixed N = 8, 10, 12, 14, 16; Large-Scale N = 8, 10, 12, 14, 16 | 23 | ~4.6 h |
+| 2 | shard N-1 of every Tier-1 point with <= 10% violation | <= 23 | <= 4.6 h |
 | 3 | native BEAM on ChatBot 8/0, Coder 10/0, Mixed 12/0 (fidelity, section 5) | 3 | ~40 min |
 | 4 | Coder N = 7 (shard 0), only if the curve looks odd between 6 and 8 | 1 | ~12 min |
+
+If time is short, run Tier 1 in this order: Mixed, Large-Scale, Coder,
+ChatBot (heaviest load first, where BEAM's points are least certain).
 
 Tier 1 commands (one per trace; the benchmark runs the listed N in order):
 
@@ -168,7 +177,19 @@ run() {  # trace tpot allowance offset outdir n...
 run azure_chat_23:azure_chat_23 0.025 0.05 0 runs/a100sxm_beam/shard0 8 7 6 5 4 3
 run azure_code_23:azure_code_23 0.025 0.05 0 runs/a100sxm_beam/shard0 16 14 12 10 8 6 5
 run azure_code_23:azure_code_23+azure_chat_23:azure_chat_23 0.02 0.02 0 runs/a100sxm_beam/shard0 16 14 12 10 8
+run azure_chat:azure_chat 0.02 0.05 0 runs/a100sxm_beam/shard0 16 14 12 10 8
 ```
+
+Not in this list (bottom row of Figure 7):
+
+- Multi-Round Chatting (`sharegpt_chat:azure_chat`, `round_robin_session`,
+  session replay). The benchmark's shard slicing splits by request index,
+  but session routing assigns whole sessions, so a sliced shard is not one
+  GPU's workload. It needs session-aware slicing (or the native session
+  shards in `datasets/sloserve_fig7_session_round_robin`) before it can be
+  run on one GPU.
+- ChatBot (32B). It needs its own BEAM profile (Qwen2.5-32B, hours), and
+  earlier BEAM runs had no point under 10%. Skip unless asked.
 
 Tier 2: the last shard of N is offset N-1, so run each N on its own,
 e.g. `run azure_chat_23:azure_chat_23 0.025 0.05 7 runs/a100sxm_beam/shard_last 8`.
