@@ -1,18 +1,29 @@
-# BEAM on 8x A100 SXM: Figure 7 bottom row
+# BEAM and SLO-Packer on 8x A100 SXM: Figure 7 bottom row
 
-Goal: BEAM curves for the bottom row of Figure 7 on `NVIDIA A100-SXM4-80GB`,
-on the same SLOServe backend as the baselines:
+Goal: measure these points of the bottom row of Figure 7 on
+`NVIDIA A100-SXM4-80GB` real GPUs:
 
-| Panel | Model / server | Trace | Routing | TTFT x | TPOT | N (servers) |
-|---|---|---|---|---|---|---|
-| Large-Scale Chatting | Qwen2.5-7B, 1 GPU | `azure_chat:azure_chat` | `round_robin` | 3 | 0.02 | 8, 10, 12, 14, 16 |
-| Multi-Round Chatting | Qwen2.5-7B, 1 GPU | `sharegpt_chat:azure_chat`, session replay, 5 s pause | `round_robin_session` | 5 | 0.05 | 8, 12, 16 |
-| ChatBot (32B) | Qwen3-32B, 2 GPUs (TP=2) | `azure_chat_23:azure_chat_23` | `round_robin` | 5 | 0.05 | 2-8 |
+| Panel | System | Model / server | Trace | Routing | TTFT x | TPOT | N (servers) |
+|---|---|---|---|---|---|---|---|
+| Multi-Round Chatting | BEAM | Qwen2.5-7B, 1 GPU | `sharegpt_chat:azure_chat`, session replay, 5 s pause | `round_robin_session` | 5 | 0.05 | 8, 12, 16 |
+| Multi-Round Chatting | SLO-Packer | Qwen2.5-7B, 1 GPU | same | `slosserve_4_planner`, `slosserve_planner` | 5 | 0.05 | 8 (see below) |
+| Large-Scale Chatting | SLO-Packer | Qwen2.5-7B, 1 GPU | `azure_chat:azure_chat` | `slosserve_planner` | 3 | 0.02 | **none fit on 8 GPUs** |
+| ChatBot (32B) | BEAM | Qwen3-32B, 2 GPUs (TP=2) | `azure_chat_23:azure_chat_23` | `round_robin` | 5 | 0.05 | 2-8 |
 
 All runs use `--window t1200:1800`, load 1.0, `--routing_fallback_policy asap`,
 `--slo_routing_overhead 0.05`, the same settings as the baselines in
 `figure_data/beam_paper/original_e2e/{chatting_large_scale,e2e_mulitiround_chatting,32B_chat}.csv`
 and `configs/batch/sim_fig7/*.json`.
+
+**SLO-Packer needs all N GPUs at once.** BEAM's round-robin routing keeps
+GPUs independent, so an N-GPU point can be replayed a few GPUs at a time.
+SLO-Packer's router packs load across all of its GPUs, so that does not
+work for it. On 8 GPUs this leaves:
+
+- Multi-Round: N=8 only. N=12 and N=16 need 12 and 16 GPUs.
+- Large-Scale: nothing visible. The figure shows SLO-Packer at N = 10-16
+  only; at N <= 8 the simulated runs violate 100% (overloaded). Running
+  N <= 8 here would only confirm that.
 
 Branch: `beam-a100-sxm` (main repo and `3rdparty/vllm`).
 
@@ -26,17 +37,17 @@ for a huge backlog: mostly 1410 MHz instead of 900-990 MHz. This affects
 **every** BEAM run so far, including the Tier-1 top-row runs from
 `docs/beam_a100_sxm_handoff.md`. It is fixed now: only the prefill stage
 is a BEAM arrival, as in upstream, where each request arrives once. The
-top-row runs should be redone (Phase 3).
+top-row BEAM numbers from Tier 1 should not be used as they are.
 
-## How a point is measured on 8 GPUs
+## How a BEAM point is measured on 8 GPUs
 
 The round-robin shard slicing from the first handoff still applies:
 `--n_devices N` with fewer engines in `--clients` replays shards
 `SLOSSERVE_RR_SHARD_OFFSET .. offset+k-1` of the N-way split, with original
 timestamps, and reports energy x N/k.
 
-- Large-Scale and 32B (request round robin): shards are statistically alike,
-  so one run that fills all engines (k of N shards) is the point.
+- 32B (request round robin): shards are statistically alike, so one run
+  that fills all engines (k of N shards) is the point.
 - Multi-Round: whole sessions are dealt out in turn (session *s* goes to
   GPU *s* mod N), and session lengths vary a lot. Shards of the 8-way split
   hold 361-647 requests, so one shard x N is not a good estimate. **Every
@@ -100,19 +111,20 @@ the HF cache that both the SLOServe venv and the BEAM container use.
    EOF
    ```
 
-   Expected for both 7B traces: `[6.1e-05, 1.6e-09, 3.5e-08, 0.0, 0.01]`.
+   Expected for both 7B traces: `[6.1e-05, 1.6e-09, 3.5e-08, 0.0, 0.01]`
+   (Large-Scale is printed for reference only).
    **32B is a blocker.** The main workstation's `assets/perf_model.json`
    has no Qwen3-32B entry, so it falls back to `default`
    (`[4.86e-05, 1.69e-05, 8e-08, 0.0, 0.014]`). That gives about a 60 ms
    zero-load TTFT for 1000 tokens, while the paper states about 500 ms /
    3 = 170 ms for 32B. Get the Qwen3-32B entry that the 32B baselines were
-   scored with, and add it to `assets/perf_model.json` before Phase 2. Do
+   scored with, and add it to `assets/perf_model.json` before Phase 3. Do
    not fit a new one: that would change the SLOs and leave the baselines
    incomparable.
 
-## Phase 1, in parallel (about 4.5 h)
+## Phase 1, in parallel (about 3.5 h)
 
-GPUs 6-7 profile Qwen3-32B for BEAM. GPUs 0-5 run both 7B panels.
+GPUs 6-7 profile Qwen3-32B for BEAM. GPUs 0-5 run BEAM Multi-Round.
 Profiling meters only its own GPUs, so the two jobs do not affect each
 other's energy.
 
@@ -180,15 +192,7 @@ slightly negative). Millions means the old code is running. Also check:
 there are no NVML errors in `server7b.log`, and `nvidia-smi -q -d CLOCK`
 moves on GPUs 0-5 only.
 
-**Large-Scale Chatting**: 6 of N shards per point, 5 runs, about 1 h:
-
-```sh
-MODEL=Qwen/Qwen2.5-7B-Instruct POLICY=round_robin:beam TRACE=azure_chat:azure_chat \
-TTFT=3 TPOT=0.02 EXTRA= \
-  bench runs/fig7b/large/off0 0 0-5 16 14 12 10 8
-```
-
-**Multi-Round Chatting**: all shards of every N, 8 runs. Each run lasts
+**BEAM Multi-Round Chatting**: all shards of every N, 8 runs. Each run lasts
 longer than the 600 s window because every session drains; budget about
 25 min per run, about 3.3 h total:
 
@@ -204,9 +208,35 @@ bench runs/fig7b/multiround/off6_k2  6  0-1 8         # shards 6-7 of 8
 
 Use one `--output_dir` per (offset, clients) pair, because results are
 cached per setting. If time is short, run N=16 and N=12 before N=8: the
-baselines are visible at 12-16, and at 8 only for SLO-Packer.
+round-robin baselines are visible only at 12-16.
 
-## Phase 2: ChatBot (32B), all 8 GPUs (about 1.5 h)
+## Phase 2: SLO-Packer Multi-Round, N=8, all 8 GPUs (about 1 h)
+
+Wait for the 32B profile (Phase 1a) to finish so GPUs 6-7 are free. Stop
+the 6-engine server and start the same 7B server on all eight GPUs.
+SLO-Packer needs no BEAM settings: `SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ` must
+be unset, and `SLOSSERVE_BEAM_PROFILE` / `SLOSSERVE_BEAM_BACKEND` are ignored.
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 .venv/bin/python -m SLOsServe.router.api_server_ray \
+  --stat_window 2 --host 0.0.0.0 --port 8000 --window_size 0.005 --router slosserve \
+  --router_kwargs '{"device_mem":1248576, "block_size":16, "model_name":"Qwen/Qwen2.5-7B-Instruct", "tpot":0.05, "scheduling_overhead":0.003, "scheduling_safety_margin":0.002, "max_decode_length":500, "is_pd_disagg":0, "n_prefill_per_group":1, "max_decode_bs":16, "enable_rerouting":0}' \
+  --clients 0-7 --admission_mode anytime --mock_connector 2>&1 | tee server7b_8.log
+```
+
+```sh
+export MODEL=Qwen/Qwen2.5-7B-Instruct TRACE=sharegpt_chat:azure_chat TTFT=5 TPOT=0.05 \
+  EXTRA="--enable_session_replay --session_pause_s 5"
+POLICY=slosserve_4_planner:atfc bench runs/fig7b/packer_multiround 0 0-7 8
+POLICY=slosserve_planner:atfc   bench runs/fig7b/packer_multiround 0 0-7 8
+```
+
+The figure's SLO-Packer curve uses `slosserve_4_planner` if it is present,
+otherwise `slosserve_planner`. Both are cheap at N=8 (about 25 min each).
+`--clients` must cover all N: never pass a smaller `--clients` with a
+SLO-Packer policy.
+
+## Phase 3: BEAM ChatBot (32B), all 8 GPUs (about 1.5 h)
 
 Before starting, check 3 (the Qwen3-32B perf-model entry) must be resolved.
 Stop the 7B server, then start the 32B server with four TP=2 engines:
@@ -237,14 +267,6 @@ engine).
 The earlier 32B BEAM runs on another GPU had no point under 10% violation.
 If N=2-4 are all far above 10%, stop there; the panel will not show them.
 
-## Phase 3 (recommended): redo the top row with the fix, 8 GPUs
-
-Same commands as in section 4 of `docs/beam_a100_sxm_handoff.md`, but with
-`--clients 0-7` on an 8-engine 7B server (`CUDA_VISIBLE_DEVICES=0-7`,
-`--clients 0-7`). N <= 8 are then full runs, and N > 8 replay 8 shards. This
-is the same 23 runs and about the same 4.6 h as Tier 1, with up to 8x the
-shards per point.
-
 ## Merge and bring back
 
 ```sh
@@ -252,9 +274,9 @@ shards per point.
   --output runs/fig7b/points.csv
 ```
 
-The merge errors out if two runs cover the same shard. Multi-Round rows
-must show `complete=True`. Large-Scale and 32B rows show `complete=False`
-by design (sampled shards).
+The merge errors out if two runs cover the same shard. BEAM Multi-Round
+rows must show `complete=True`. BEAM 32B rows at N > 4 show `complete=False`
+by design (sampled shards). SLO-Packer rows pass through unchanged.
 
 Bring back:
 - `runs/fig7b/**`
@@ -286,9 +308,11 @@ Bring back:
 
 ## Known limitations
 
+- SLO-Packer points above N=8 (Multi-Round 12/16, all of Large-Scale) are
+  not measurable on 8 GPUs; see the top of this document.
 - Multi-Round has no native-BEAM fidelity check: upstream's client cannot
   replay dependent session turns.
 - Shard energies come from separate replays, not one simultaneous N-GPU
-  measurement. For Large-Scale and 32B they are additionally sampled.
+  measurement. For 32B they are additionally sampled.
 - In the mock engine, `energy_consumption` is 0. Use `energy_est`, which
   the merge script does not read. Real-GPU runs fill `energy_consumption`.
