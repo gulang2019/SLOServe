@@ -8,6 +8,7 @@ Goal: measure these points of the bottom row of Figure 7 on
 | Multi-Round Chatting | BEAM | Qwen2.5-7B, 1 GPU | `sharegpt_chat:azure_chat`, session replay, 5 s pause | `round_robin_session` | 5 | 0.05 | 8, 12, 16 |
 | Multi-Round Chatting | SLO-Packer | Qwen2.5-7B, 1 GPU | same | `slosserve_4_planner`, `slosserve_planner` | 5 | 0.05 | 8 (see below) |
 | Large-Scale Chatting | SLO-Packer | Qwen2.5-7B, 1 GPU | `azure_chat:azure_chat` | `slosserve_planner` | 3 | 0.02 | 8 |
+| Large-Scale Chatting | BEAM | Qwen2.5-7B, 1 GPU | `azure_chat:azure_chat` | `round_robin` | 3 | 0.02 | 8 (10-16 optional) |
 | ChatBot (32B) | BEAM | Qwen3-32B, 2 GPUs (TP=2) | `azure_chat_23:azure_chat_23` | `round_robin` | 5 | 0.05 | 2-8 |
 
 All runs use `--window t1200:1800`, load 1.0, `--routing_fallback_policy asap`,
@@ -122,13 +123,14 @@ the HF cache that both the SLOServe venv and the BEAM container use.
    not fit a new one: that would change the SLOs and leave the baselines
    incomparable.
 
-## Phase 1: SLO-Packer, all 8 GPUs (about 1 h)
+## Phase 1: Large-Scale (SLO-Packer and BEAM), all 8 GPUs (about 1.5 h)
 
-Start the 7B server with eight engines. SLO-Packer needs no BEAM settings:
-`SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ` must be unset, and
-`SLOSSERVE_BEAM_PROFILE` / `SLOSSERVE_BEAM_BACKEND` are ignored.
+Start the 7B server with eight engines. Export the 7B BEAM profile so the
+same server can run BEAM; SLO-Packer ignores it.
+`SLOSSERVE_MOCK_PROFILE_CLOCK_MHZ` must be unset.
 
 ```sh
+export SLOSSERVE_BEAM_PROFILE="$BEAM7B"
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 .venv/bin/python -m SLOsServe.router.api_server_ray \
   --stat_window 2 --host 0.0.0.0 --port 8000 --window_size 0.005 --router slosserve \
   --router_kwargs '{"device_mem":1248576, "block_size":16, "model_name":"Qwen/Qwen2.5-7B-Instruct", "tpot":0.05, "scheduling_overhead":0.003, "scheduling_safety_margin":0.002, "max_decode_length":500, "is_pd_disagg":0, "n_prefill_per_group":1, "max_decode_bs":16, "enable_rerouting":0}' \
@@ -163,7 +165,23 @@ The window holds 13,627 requests (about 23 req/s). If this N=8 run is
 overloaded, as in simulation, it can run well past the window. Note the
 violation rate and stop it if it is clearly saturated.
 
-**Optional: Multi-Round Chatting, N=8.** Run this here, while the
+**BEAM Large-Scale Chatting, N=8.** With 8 engines this is one full
+8-GPU run, not a slice. Do the BEAM smoke check from Phase 2b first, with
+this trace and `WINDOW=t1200:1320`, to confirm the pending-prefill count
+stays bounded.
+
+```sh
+MODEL=Qwen/Qwen2.5-7B-Instruct POLICY=round_robin:beam TRACE=azure_chat:azure_chat \
+TTFT=3 TPOT=0.02 EXTRA= \
+  bench runs/fig7b/beam_large 0 0-7 8
+```
+
+About 12 min. Earlier (pre-fix, single-GPU) BEAM runs were above 10%
+violation at N = 8-14 and visible only at N=16. Unlike SLO-Packer, BEAM
+N = 10-16 can be measured here, as 8 sampled shards each. To add them,
+use `... 0 0-7 16 14 12 10 8` instead (about 1 h for all five).
+
+**Optional: SLO-Packer Multi-Round Chatting, N=8.** Run this here, while the
 8-engine server is up:
 
 ```sh
