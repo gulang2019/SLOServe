@@ -280,27 +280,34 @@ class SimulatedGpu:
 
 
 class NvmlClock:
-    """upstream lock_gpu_clock: NVML calls on a thread, never awaited."""
+    """upstream lock_gpu_clock: NVML calls on a thread, never awaited.
 
-    def __init__(self, physical_device_id: int):
+    Like upstream apply_dvfs, a TP group locks every one of its GPUs.
+    """
+
+    def __init__(self, physical_device_ids: list[int]):
         from vllm.utils import import_pynvml
         self.nvml = import_pynvml()
         self.nvml.nvmlInit()
-        self.handle = self.nvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+        self.handles = [self.nvml.nvmlDeviceGetHandleByIndex(i)
+                        for i in physical_device_ids]
         # Locks are applied on threads whose errors nobody sees; fail here,
         # synchronously, if this process may not control the clocks at all.
-        self.nvml.nvmlDeviceResetGpuLockedClocks(self.handle)
+        for handle in self.handles:
+            self.nvml.nvmlDeviceResetGpuLockedClocks(handle)
         self.locked = False
 
     def set_clock(self, clock: int, now: float) -> None:
-        threading.Thread(target=self.nvml.nvmlDeviceSetGpuLockedClocks,
-                         args=(self.handle, clock, clock), daemon=True).start()
+        for handle in self.handles:
+            threading.Thread(target=self.nvml.nvmlDeviceSetGpuLockedClocks,
+                             args=(handle, clock, clock), daemon=True).start()
         self.locked = True
 
     def close(self) -> None:
         try:
             if self.locked:
-                self.nvml.nvmlDeviceResetGpuLockedClocks(self.handle)
+                for handle in self.handles:
+                    self.nvml.nvmlDeviceResetGpuLockedClocks(handle)
                 self.locked = False
         finally:
             self.nvml.nvmlShutdown()

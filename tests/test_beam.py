@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import csv
 import importlib.util
+import json
 import math
+import os
 import random
 import time
 from pathlib import Path
@@ -215,7 +217,7 @@ def test_nvml_actuator_locks_on_a_thread_and_releases(monkeypatch):
     from SLOsServe.beam import NvmlClock
     nvml = Mock()
     monkeypatch.setattr("vllm.utils.import_pynvml", lambda: nvml)
-    actuator = NvmlClock(3)
+    actuator = NvmlClock([3])
     actuator.set_clock(1200, 0.0)
     deadline = time.time() + 2
     while not nvml.nvmlDeviceSetGpuLockedClocks.called and time.time() < deadline:
@@ -228,13 +230,30 @@ def test_nvml_actuator_locks_on_a_thread_and_releases(monkeypatch):
     nvml.nvmlShutdown.assert_called_once()
 
 
+def test_nvml_actuator_locks_every_gpu_of_a_tp_group(monkeypatch):
+    from SLOsServe.beam import NvmlClock
+    nvml = Mock()
+    nvml.nvmlDeviceGetHandleByIndex.side_effect = lambda i: f"gpu{i}"
+    monkeypatch.setattr("vllm.utils.import_pynvml", lambda: nvml)
+    actuator = NvmlClock([6, 7])
+    actuator.set_clock(900, 0.0)
+    deadline = time.time() + 2
+    while (nvml.nvmlDeviceSetGpuLockedClocks.call_count < 2
+           and time.time() < deadline):
+        time.sleep(0.001)
+    locked = {c.args for c in nvml.nvmlDeviceSetGpuLockedClocks.call_args_list}
+    assert locked == {("gpu6", 900, 900), ("gpu7", 900, 900)}
+    actuator.close()
+    assert nvml.nvmlDeviceResetGpuLockedClocks.call_count == 4
+
+
 def test_nvml_actuator_fails_fast_without_clock_permission(monkeypatch):
     from SLOsServe.beam import NvmlClock
     nvml = Mock()
     nvml.nvmlDeviceResetGpuLockedClocks.side_effect = PermissionError("root")
     monkeypatch.setattr("vllm.utils.import_pynvml", lambda: nvml)
     with pytest.raises(PermissionError):
-        NvmlClock(0)
+        NvmlClock([0])
 
 
 # ---- Upstream state machine ----------------------------------------------
@@ -303,7 +322,7 @@ def scheduler(profile_path):
         beam_profile_path=profile_path, beam_backend="mock",
         mock_profile_clock_mhz=None, beam_device_id=None,
         beam_use_s1=True, beam_use_s2=True, beam_use_s1_dvfs_only=False,
-        beam_prefill_overhead_s=0.012, beam_decode_overhead_s=0.003,
+        beam_discount_cached_prefill=True, beam_prefill_overhead_s=0.012, beam_decode_overhead_s=0.003,
         beam_switch_delay_s=0.01, slo_tpot=0.05)
     s.parallel_config = SimpleNamespace(tensor_parallel_size=1,
                                         pipeline_parallel_size=1,
@@ -361,7 +380,7 @@ def test_real_uses_explicit_device_mapping(scheduler, monkeypatch):
     scheduler.scheduler_config.beam_backend = "real"
     scheduler.scheduler_config.beam_device_id = 1
     scheduler._configure_beam()
-    factory.assert_called_once_with(5)
+    factory.assert_called_once_with([5])
     assert scheduler.sim_gpu is None
     scheduler.scheduler_config.scheduling_policy = "atfc"
     scheduler._configure_beam()
@@ -369,10 +388,47 @@ def test_real_uses_explicit_device_mapping(scheduler, monkeypatch):
     assert scheduler._beam is None
 
 
+def test_real_tp_group_locks_all_its_gpus(scheduler, profile_path, tmp_path,
+                                         monkeypatch):
+    import shutil
+    import vllm.v1.core.sched.scheduler_adm_ctrl as module
+    factory = Mock()
+    monkeypatch.setattr("SLOsServe.beam.NvmlClock", factory)
+    monkeypatch.setattr(module, "current_platform", SimpleNamespace(
+        device_id_to_physical_device_id=lambda device: device + 6))
+    scheduler.scheduler_config.beam_backend = "real"
+    scheduler.parallel_config.tensor_parallel_size = 2
+    # The fixture profile is a TP=1 measurement: one server's time differs.
+    with pytest.raises(ValueError, match="TP=1"):
+        scheduler._configure_beam()
+    tp2 = tmp_path / os.path.basename(profile_path).replace("_tp1_", "_tp2_")
+    shutil.copy(profile_path, tp2)
+    scheduler.scheduler_config.beam_profile_path = str(tp2)
+    scheduler._configure_beam()
+    factory.assert_called_once_with([6, 7])
+
+
 def test_rejects_unsupported_parallelism(scheduler):
     scheduler.parallel_config.pipeline_parallel_size = 2
-    with pytest.raises(ValueError, match="TP=1, PP=1"):
+    with pytest.raises(ValueError, match="PP=1"):
         scheduler._configure_beam()
+
+
+def test_only_beam_arrivals_drain_pending_prefill(scheduler):
+    scheduler._beam.add_request(100)
+    scheduler._beam_arrivals.add("r")
+    scheduler.requests = {
+        "r": SimpleNamespace(num_computed_tokens=900, num_prompt_tokens=1000,
+                             arrival_time=99.9),
+        # A decode stage re-added after its prefill finished elsewhere.
+        "d": SimpleNamespace(num_computed_tokens=990, num_prompt_tokens=1000,
+                             arrival_time=99.9)}
+    scheduler.running, scheduler.waiting_attainable = [], []
+    scheduler.waiting_unattainable = []
+    scheduler._get_prefill_ddl = lambda request: 101.0
+    scheduler.get_tpot_slo = lambda: 0.05
+    scheduler._beam_s1_s2({"r": 100, "d": 10})
+    assert scheduler._beam.num_waiting_prefill_tokens == 0
 
 
 @pytest.mark.parametrize("policy", ["beam", "beam_atfc", "atfc"])
@@ -419,14 +475,33 @@ def test_mock_engine_runs_on_profiled_gpu(policy, profile_path, monkeypatch):
         assert engine.scheduler.add_request(req)
         engine.n_arrived_reqs = 1
         task = asyncio.create_task(engine.loop())
+        n_requests = 1
         try:
             async def completed():
-                while engine.n_finished_reqs < 1:
+                while engine.n_finished_reqs < n_requests:
                     if task.done():
                         await task
                         raise AssertionError("mock loop stopped early")
                     await asyncio.sleep(0.005)
             await asyncio.wait_for(completed(), timeout=10)
+            if policy == "beam":
+                # A prompt sharing the cached prefix adds only its new tokens,
+                # so BEAM's pending prefill drains back to zero.
+                follow_up = Request(
+                    request_id="beam-smoke-2",
+                    prompt_token_ids=list(range(1024)) + [5000] * 64,
+                    multi_modal_kwargs=None, multi_modal_hashes=None,
+                    multi_modal_placeholders=None, pooling_params=None,
+                    eos_token_id=None, arrival_time=time.time(),
+                    block_hasher=engine.request_block_hasher,
+                    sampling_params=SamplingParams(max_tokens=8, ignore_eos=True,
+                        extra_args={"slo_ttft": 10, "slo_tpot": 0.1,
+                                    "router_arrival_time": time.time()}))
+                assert engine.scheduler.add_request(follow_up)
+                assert engine.scheduler._beam.num_waiting_prefill_tokens < 1024
+                n_requests = engine.n_arrived_reqs = 2
+                await asyncio.wait_for(completed(), timeout=10)
+                assert engine.scheduler._beam.num_waiting_prefill_tokens == 0
         finally:
             task.cancel()
             try:
@@ -436,11 +511,11 @@ def test_mock_engine_runs_on_profiled_gpu(policy, profile_path, monkeypatch):
         batches = [e for e in engine._profile_events if e["event_type"] == "batch"]
         assert batches and all(e["sim_energy_j"] > 0 for e in batches)
         assert all(e["sim_idle_power_w"] == 70.0 for e in batches)
-        assert sum(len(o.get("new_token_ids", [])) for o in outputs) == 8
+        assert sum(len(o.get("new_token_ids", [])) for o in outputs) == 8 * n_requests
         decisions = [e["extra_args"] for e in engine._profile_events
                      if e["event_type"] == "beam_decision"]
         if policy == "beam":
-            assert [d["phase"] for d in decisions] == ["s1", "s2", "decode_clock"]
+            assert [d["phase"] for d in decisions][:3] == ["s1", "s2", "decode_clock"]
             assert batches[0]["sim_clock_mhz"] == 1200
         elif policy == "beam_atfc":
             assert {d["phase"] for d in decisions} == {"batch"}
@@ -528,6 +603,64 @@ def test_rr_shard_offset_selects_later_shards():
     assert arrivals == [1.5, 3.5, 5.5]  # original timestamps
     with pytest.raises(ValueError, match="exceeds"):
         _slice_rr_workload(requests, [0.0] * 12, 4, 2, shard_offset=3)
+
+
+def test_session_shards_match_session_round_robin_routing():
+    from motivation.bench_api_server import _slice_rr_workload
+    from SLOsServe.router.api_server_ray import RequestState, RoundRobinRouter
+
+    rng = random.Random(0)
+    sessions = [f"s{rng.randrange(9)}" if rng.random() < 0.8 else None
+                for _ in range(60)]
+
+    def route(session_ids, n_devices):
+        router = RoundRobinRouter(n_devices, {"sticky_sessions": True})
+        devices = []
+        for session_id in session_ids:
+            request = SimpleNamespace(session_id=session_id, admitted=False,
+                                      prefill_device_id=-1, decode_device_id=-1)
+            router.run([request], [])
+            router.note_request_state(request, RequestState.PREFILL_FINISHED)
+            devices.append(request.prefill_device_id)
+        return devices
+
+    requests = [SimpleNamespace(session_id=s) for s in sessions]
+    full = route(sessions, 6)
+    for offset, k in [(0, 4), (4, 2), (2, 1)]:
+        kept, _, indices = _slice_rr_workload(
+            requests, [float(i) for i in range(60)], 6, k, shard_offset=offset,
+            by_session=True)
+        assert indices == [i for i, d in enumerate(full)
+                           if offset <= d < offset + k]
+        # Replayed alone on k GPUs, every request lands on its shard's GPU.
+        assert route([r.session_id for r in kept], k) == [
+            full[i] - offset for i in indices]
+
+
+def test_merge_shard_runs_sums_raw_energy(tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "merge_beam_shard_runs", ROOT / "scripts/merge_beam_shard_runs.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    load_rows, merge = module.load_rows, module.merge
+    base = dict(trace_used="t", scheduling_policy="beam",
+                routing_policy="round_robin_session", requested_n_device=12,
+                ttft_slo_scale=5, slo_tpot=0.05, slo_routing_overhead=0.05,
+                tensor_parallel_size=1, rr_sliced=True)
+    path = tmp_path / "results.jsonl"
+    path.write_text("\n".join(json.dumps(base | row) for row in [
+        # energy as the benchmark reports it: raw x 12 / k
+        dict(n_device=8, effective_n_device=8, rr_shard_offset=0, energy_consumption=800 * 12 / 8,
+             slo_violation_rate=0.1, rr_slice_kept_request_count=300),
+        dict(n_device=4, effective_n_device=4, rr_shard_offset=8, energy_consumption=500 * 12 / 4,
+             slo_violation_rate=0.4, rr_slice_kept_request_count=100),
+    ]))
+    [point] = merge(load_rows([path]))
+    assert point["complete"] and point["offsets"] == "0 8"
+    assert point["energy_consumption"] == pytest.approx(1300)
+    assert point["slo_violation_rate"] == pytest.approx(0.175)
+    with pytest.raises(SystemExit, match="more than one run"):
+        merge(load_rows([path, path]))
 
 
 def test_benchmark_beam_on_real_gpus_keeps_default_slos(profile_path, tmp_path,

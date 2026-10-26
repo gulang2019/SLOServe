@@ -5,8 +5,10 @@ beam_root="$repo_root/3rdparty/BEAM"
 beam_energy="$beam_root/benchmarks/energy"
 container_name="${BEAM_CONTAINER:-vllm_evaluator_env}"
 beam_image="jlee335/beam-volume-260307:latest"
+# BEAM_GPU may list several GPUs (e.g. 6,7) for a TP group of size BEAM_TP.
 beam_gpu="${BEAM_GPU:-0}"
 beam_model="${BEAM_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+beam_tp="${BEAM_TP:-1}"
 beam_port="${BEAM_PORT:-8008}"
 # One BEAM server per GPU, each on its own port, can share the container.
 beam_server_pattern="vllm serve .* --port $beam_port "
@@ -23,6 +25,12 @@ require_docker() {
 require_gpu() {
   if ! nvidia-smi -i "$beam_gpu" >/dev/null 2>&1; then
     echo "BEAM_GPU=$beam_gpu is not an available NVIDIA GPU." >&2
+    exit 1
+  fi
+  local n_gpus
+  n_gpus="$(tr ',' '\n' <<<"$beam_gpu" | grep -c .)"
+  if (( n_gpus != beam_tp )); then
+    echo "BEAM_GPU=$beam_gpu lists $n_gpus GPU(s) but BEAM_TP=$beam_tp." >&2
     exit 1
   fi
 }
@@ -72,5 +80,5 @@ start_container() {
 profile_path() {
   local gpu_name
   gpu_name="$(nvidia-smi -i "$beam_gpu" --query-gpu=name --format=csv,noheader | head -n 1)"
-  echo "$beam_energy/offline_profile_results/dvfs_profile_${gpu_name}_${beam_model//\//_}_tp1_pp1_one.csv"
+  echo "$beam_energy/offline_profile_results/dvfs_profile_${gpu_name}_${beam_model//\//_}_tp${beam_tp}_pp1_one.csv"
 }

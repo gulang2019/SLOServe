@@ -8,6 +8,11 @@ at a time.
 
 Branch: `beam-a100-sxm` (main repo and the `3rdparty/vllm` submodule).
 
+**Update:** BEAM runs made before the fix in
+`docs/beam_a100_sxm_fig7b_handoff.md` over-counted pending prefill (each
+request was counted twice). Redo them with the current code. That
+document also covers the bottom row of Figure 7 on eight GPUs.
+
 ## How a point is measured
 
 With round-robin routing, request *i* goes to GPU *i* mod N and GPUs never

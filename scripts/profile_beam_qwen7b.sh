@@ -5,6 +5,8 @@ set -euo pipefail
 # service. This is intentionally a separate, long-running step;
 # serve_beam_qwen7b.sh runs it automatically when the profile is missing.
 # BEAM_PROFILE_NUM_CLOCKS=N profiles only N evenly spaced clocks (smoke run).
+# Other models: BEAM_MODEL=Qwen/Qwen3-32B BEAM_TP=2 BEAM_GPU=6,7; the
+# profiler locks and meters every GPU of the TP group.
 
 source "$(dirname -- "${BASH_SOURCE[0]}")/beam_common.sh"
 beam_memory_utilization="${BEAM_GPU_MEMORY_UTILIZATION:-0.90}"
@@ -22,7 +24,7 @@ docker exec \
   -e "HF_TOKEN=${HF_TOKEN:-}" \
   -e "BEAM_PROFILE_NUM_CLOCKS=${BEAM_PROFILE_NUM_CLOCKS:-0}" \
   "$container_name" \
-  bash -lc "cd /workspace/benchmarks/energy && ./run_offline_profile.sh --model '$beam_model' --tp 1 --pp 1 --gpu-memory-utilization '$beam_memory_utilization'"
+  bash -lc "cd /workspace/benchmarks/energy && ./run_offline_profile.sh --model '$beam_model' --tp '$beam_tp' --pp 1 --gpu-memory-utilization '$beam_memory_utilization'"
 
 profile="$(profile_path)"
 if [[ ! -s "$profile" ]]; then

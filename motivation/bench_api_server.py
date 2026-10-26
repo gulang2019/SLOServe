@@ -5027,6 +5027,7 @@ async def main(
             requested_n_devices,
             effective_n_devices,
             shard_offset,
+            by_session=problem.routing_policy.startswith("round_robin_session"),
         )
         routing_kwargs = _routing_kwargs_to_dict(problem.routing_kwargs)
         if "group_size" in routing_kwargs:
@@ -6066,8 +6067,14 @@ def _slice_rr_workload(
     requested_n_devices: int,
     effective_n_devices: int,
     shard_offset: int = 0,
+    by_session: bool = False,
 ) -> tuple[list[Any], list[float], list[int]]:
-    """Keep round-robin shards shard_offset .. shard_offset+effective-1."""
+    """Keep round-robin shards shard_offset .. shard_offset+effective-1.
+
+    by_session follows round_robin_session: a session's first request takes
+    the next GPU in turn and its later turns follow it, so whole sessions
+    are dealt out in order of first appearance.
+    """
     assert len(requests) == len(arrival_times), (
         f"{len(requests)=} != {len(arrival_times)=}")
     if effective_n_devices >= requested_n_devices:
@@ -6078,9 +6085,23 @@ def _slice_rr_workload(
             f"shard offset {shard_offset} with {effective_n_devices} devices "
             f"exceeds the {requested_n_devices}-way split")
 
+    turns = list(range(len(requests)))
+    if by_session:
+        session_turn: dict[str, int] = {}
+        next_turn = 0
+        for idx, request in enumerate(requests):
+            session_id = getattr(request, "session_id", None)
+            if not session_id:
+                turns[idx] = next_turn
+                next_turn += 1
+                continue
+            if session_id not in session_turn:
+                session_turn[session_id] = next_turn
+                next_turn += 1
+            turns[idx] = session_turn[session_id]
     kept_indices = [
         idx for idx in range(len(requests))
-        if 0 <= idx % requested_n_devices - shard_offset < effective_n_devices
+        if 0 <= turns[idx] % requested_n_devices - shard_offset < effective_n_devices
     ]
     return (
         [requests[idx] for idx in kept_indices],
@@ -7849,6 +7870,7 @@ def run(
             'requested_n_device': requested_n_device,
             'effective_n_device': effective_n_device,
             'rr_sliced': best_result.results.get('rr_sliced', False),
+            'rr_shard_offset': best_result.results.get('rr_shard_offset', 0),
             'tensor_parallel_size': tensor_parallel_size,
             'total_gpus': effective_n_device * tensor_parallel_size,
             'requested_total_gpus': requested_n_device * tensor_parallel_size,
