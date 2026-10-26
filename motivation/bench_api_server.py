@@ -5021,13 +5021,19 @@ async def main(
     # Replay later shards of the split on few GPUs, one run at a time.
     shard_offset = int(os.getenv('SLOSSERVE_RR_SHARD_OFFSET', '0')) if rr_sliced else 0
     if rr_sliced:
+        # slosserve_K_planner deals requests (sessions) to K-GPU groups.
+        group = _slosserve_group_size(problem.routing_policy) or 1
+        if shard_offset % group:
+            raise ValueError(f"shard offset {shard_offset} must start a "
+                             f"{group}-GPU group")
         requests, arrival_times, _ = _slice_rr_workload(
             requests,
             arrival_times,
-            requested_n_devices,
-            effective_n_devices,
-            shard_offset,
-            by_session=problem.routing_policy.startswith("round_robin_session"),
+            requested_n_devices // group,
+            effective_n_devices // group,
+            shard_offset // group,
+            by_session=(group > 1 or problem.routing_policy.startswith(
+                "round_robin_session")),
         )
         routing_kwargs = _routing_kwargs_to_dict(problem.routing_kwargs)
         if "group_size" in routing_kwargs:
@@ -6031,10 +6037,26 @@ def _routing_kwargs_to_dict(
     return dict(routing_kwargs)
 
 
+def _slosserve_group_size(routing_policy: str) -> int | None:
+    """K of slosserve_K[_lb]_planner, whose K-GPU groups never interact.
+
+    New requests (sessions) are dealt to groups in turn and a group's
+    planner only spills within the group, so groups can be replayed apart,
+    like round-robin shards. None for one pool or PD-disaggregated groups.
+    """
+    tokens = routing_policy.split("_")
+    if (tokens[0] != "slosserve" or len(tokens) < 2 or not tokens[1].isdigit()
+            or "disagg" in tokens or "diagg" in tokens):
+        return None
+    return int(tokens[1])
+
+
 def _supports_rr_workload_slicing(
     routing_policy: str,
     routing_kwargs: dict[str, Any] | str | None,
 ) -> bool:
+    if _slosserve_group_size(routing_policy) is not None:
+        return True
     if routing_policy not in {
         "round_robin",
         "round_robin_retry",
@@ -6058,6 +6080,13 @@ def _resolve_rr_effective_n_devices(
         return requested_n_devices, False
     if available_clients >= requested_n_devices:
         return requested_n_devices, False
+    group = _slosserve_group_size(routing_policy)
+    if group is not None and (requested_n_devices % group
+                              or available_clients % group):
+        raise ValueError(
+            f"{routing_policy} replays whole {group}-GPU groups: n_devices "
+            f"{requested_n_devices} and clients {available_clients} must be "
+            f"multiples of {group}")
     return available_clients, True
 
 

@@ -637,6 +637,27 @@ def test_session_shards_match_session_round_robin_routing():
             full[i] - offset for i in indices]
 
 
+def test_slosserve_groups_are_replayed_whole():
+    from motivation.bench_api_server import (_resolve_rr_effective_n_devices,
+                                             _slosserve_group_size,
+                                             _slice_rr_workload)
+    assert _slosserve_group_size("slosserve_4_planner") == 4
+    assert _slosserve_group_size("slosserve_4_2_planner") == 4
+    assert _slosserve_group_size("slosserve_planner") is None
+    assert _slosserve_group_size("slosserve_4_disagg_planner") is None
+    assert _resolve_rr_effective_n_devices(
+        16, "slosserve_4_planner", None, "0-7") == (8, True)
+    assert _resolve_rr_effective_n_devices(
+        8, "slosserve_planner", None, "0-3") == (8, False)
+    with pytest.raises(ValueError, match="multiples of 4"):
+        _resolve_rr_effective_n_devices(12, "slosserve_4_planner", None, "0-5")
+    # Groups 2 and 3 of 4 (GPUs 8-15 of 16) get every 4th request from 2.
+    requests = [SimpleNamespace(session_id=None) for _ in range(12)]
+    _, _, indices = _slice_rr_workload(requests, [0.0] * 12, 16 // 4, 8 // 4,
+                                       8 // 4, by_session=True)
+    assert indices == [2, 3, 6, 7, 10, 11]
+
+
 def test_merge_shard_runs_sums_raw_energy(tmp_path):
     spec = importlib.util.spec_from_file_location(
         "merge_beam_shard_runs", ROOT / "scripts/merge_beam_shard_runs.py")
