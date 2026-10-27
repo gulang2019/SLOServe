@@ -352,12 +352,19 @@ class BeamScheduler:
 
     def __init__(self, profile: BeamProfile, actuator, *, now: float,
                  initial_chunk: int, use_s1: bool = True, use_s2: bool = True,
-                 use_s1_dvfs_only: bool = False):
+                 use_s1_dvfs_only: bool = False,
+                 fallback_chunk: int | None = None):
         self.profile = profile
         self.actuator = actuator
         self.use_s1 = use_s1
         self.use_s2 = use_s2
         self.use_s1_dvfs_only = use_s1_dvfs_only
+        # Not upstream: when S1 finds no plan, use this chunk size instead of
+        # upstream's 128/256 fallback. None keeps upstream behaviour.
+        if fallback_chunk is not None and fallback_chunk not in profile.chunk_sizes:
+            raise ValueError(f"fallback_chunk {fallback_chunk} is not a profiled "
+                             f"chunk size {profile.chunk_sizes}")
+        self.fallback_chunk = fallback_chunk
         self.max_num_scheduled_tokens = initial_chunk
         self.num_waiting_prefill_tokens = 0
         self.new_request_arrived = False
@@ -442,6 +449,8 @@ class BeamScheduler:
                 chunk = 128
             if not has_ttft_adhering:
                 chunk = 256
+            if self.fallback_chunk is not None:
+                chunk = self.fallback_chunk
             clock = p.default_clock_high
             energy = None
             self.last_prefill_ttft = math.ceil(tokens / chunk) * (

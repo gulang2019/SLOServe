@@ -302,6 +302,18 @@ def test_s1_fallbacks_follow_upstream(profile_path):
     assert neither["chunk_size"] == 256  # TTFT fallback takes precedence
 
 
+def test_s1_fallback_chunk_overrides_upstream_fallback(profile_path):
+    beam = BeamScheduler(BeamProfile(profile_path), Mock(), now=0.0,
+                         initial_chunk=512, fallback_chunk=512)
+    no_tbt = beam.s1(tbt_slo=1e-6, ttft_budget=100, num_waiting_prefill_tokens=4000,
+                     num_running=1, max_queuing_time=0, now=1.0)
+    assert (no_tbt["chunk_size"], no_tbt["clock_mhz"]) == (512, 1200)
+    assert not no_tbt["feasible"]
+    with pytest.raises(ValueError):
+        BeamScheduler(BeamProfile(profile_path), Mock(), now=0.0,
+                      initial_chunk=512, fallback_chunk=1000)
+
+
 def test_s1_keeps_adjacent_chunks_during_a_prefill(profile_path):
     beam = BeamScheduler(BeamProfile(profile_path), Mock(), now=0.0,
                          initial_chunk=128)
